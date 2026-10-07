@@ -1,0 +1,42 @@
+name: Build Windows .exe
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --name anatomy3d-print
+          --collect-all mediapipe
+          --collect-all torch
+          --collect-all smplx
+          desktop_app.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anatomy3d-print-windows
+          path: dist/anatomy3d-print.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/anatomy3d-print.exe
