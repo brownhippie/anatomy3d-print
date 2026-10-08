@@ -120,6 +120,11 @@ def run_pipeline(
         except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
             print(f"Note: hair detection failed ({exc}); the head will stay bare.")
             hair_mask = None
+        # Reuses silhouette_rgb when that step already succeeded (same
+        # photo, same resolution as keypoints) instead of loading the
+        # image a second time; falls back to a fresh load so texture
+        # baking still works when silhouette extraction itself failed.
+        texture_rgb = silhouette_rgb if silhouette_mask is not None else load_image_rgb(paths[0]).rgb
         body = build_body_mesh(
             keypoints,
             target_height_mm=target_height_mm,
@@ -127,6 +132,7 @@ def run_pipeline(
             depth_rgb=depth_rgb,
             face_keypoints=face_keypoints,
             hair_mask=hair_mask,
+            texture_rgb=texture_rgb,
         )
     else:
         if angles_deg is None:

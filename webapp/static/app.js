@@ -194,8 +194,17 @@ function loadModel(objUrl) {
   loader.load(objUrl, (obj) => {
     obj.traverse((child) => {
       if (child.isMesh) {
+        // OBJLoader already parses the extended "v x y z r g b" vertex-color
+        // lines the pipeline now writes (real colors baked from the source
+        // photo — see procedural_body._bake_photo_colors) into
+        // geometry.attributes.color; vertexColors just has to be turned on
+        // to actually use them instead of a flat guessed color. Falls back
+        // to the old flat tint automatically when a mesh has no baked
+        // colors (geometry.attributes.color is then unset).
+        const hasVertexColors = !!child.geometry.attributes.color;
         child.material = new THREE.MeshStandardMaterial({
-          color: 0x9fb3d9,
+          color: hasVertexColors ? 0xffffff : 0x9fb3d9,
+          vertexColors: hasVertexColors,
           roughness: 0.55,
           metalness: 0.05,
         });

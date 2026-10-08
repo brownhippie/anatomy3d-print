@@ -729,6 +729,45 @@ def _sculpt_front_surface_from_depth(
     return verts
 
 
+def _bake_photo_colors(verts: np.ndarray, image_width: int, image_height: int, rgb: np.ndarray) -> np.ndarray:
+    """Per-vertex color sampled from the source photo itself, not a flat
+    material guess. The mesh is built directly in the photo's own
+    pixel-centered coordinate frame (see _to_local_xy), so a camera-facing
+    vertex (z > 0, this module's convention — see build_body_mesh) maps
+    straight back to the exact pixel the photo showed there; no UV
+    unwrapping needed.
+    The back half (z <= 0) was never photographed, so there is no real
+    color to sample. Copying the nearest camera-facing vertex's color is
+    an honest fallback — it reuses real, physically adjacent evidence —
+    instead of either inventing a color or mirroring front-to-back, which
+    would paste a face onto someone's back."""
+    from scipy.spatial import cKDTree
+
+    front = verts[:, 2] > 0
+    colors = np.zeros((len(verts), 3), dtype=np.uint8)
+    if not front.any():
+        colors[:] = (190, 160, 140)  # no photo evidence anywhere on this mesh
+        return colors
+
+    px = verts[front, 0] + image_width / 2.0
+    py = image_height / 2.0 - verts[front, 1]
+    row = np.clip(py, 0, image_height - 1)
+    col = np.clip(px, 0, image_width - 1)
+    sampled = np.stack(
+        [map_coordinates(rgb[..., c].astype(np.float64), [row, col], order=1, mode="nearest") for c in range(3)],
+        axis=-1,
+    )
+    colors[front] = np.clip(sampled, 0, 255).astype(np.uint8)
+
+    back = ~front
+    if back.any():
+        tree = cKDTree(verts[front])
+        _, nearest = tree.query(verts[back])
+        colors[back] = colors[front][nearest]
+
+    return colors
+
+
 def build_body_mesh(
     keypoints: DetectedKeypoints,
     target_height_mm: float = 150.0,
@@ -739,12 +778,22 @@ def build_body_mesh(
     face_keypoints: Optional[FaceKeypoints] = None,
     silhouette_mask: Optional[np.ndarray] = None,
     hair_mask: Optional[np.ndarray] = None,
+    texture_rgb: Optional[np.ndarray] = None,
 ) -> BodyMesh:
     """`depth_rgb`: the same preprocessed photo passed to pose detection.
     When given, sculpts the front surface using real per-pixel depth
     (anatomy3d.depth_source, optional extra) instead of the flat
     symmetric-thickness guess. Leave as None for the default, dependency-
     free behavior.
+
+    `texture_rgb`: the same preprocessed photo, same coordinate system as
+    `keypoints` — same requirement as `silhouette_mask`. When given,
+    colors every camera-facing vertex with that exact pixel's real photo
+    color (see _bake_photo_colors); the un-photographed back is filled
+    from the nearest camera-facing vertex's color. Unlike `depth_rgb`,
+    needs no optional extra — only the hard numpy/scipy dependencies this
+    module already has. Leave as None to keep the mesh a flat material
+    color (the previous, and still the default, behavior).
 
     `face_keypoints`: real detected face landmarks (face_features.py).
     When given and usable, overlays a nose, chin, and eye sockets built
@@ -980,8 +1029,15 @@ def build_body_mesh(
             verts, keypoints.image_width, keypoints.image_height, depth_rgb, depth_strength
         )
 
+    colors = None
+    if texture_rgb is not None:
+        # Before scaling, same reasoning as the depth-sculpt call above:
+        # the pixel<->local-coordinate mapping only holds in this unscaled
+        # space.
+        colors = _bake_photo_colors(verts, keypoints.image_width, keypoints.image_height, texture_rgb)
+
     height = verts[:, 1].max() - verts[:, 1].min()
     scale = target_height_mm / height if height > 1e-6 else 1.0
     verts = verts * scale
 
-    return BodyMesh(vertices=verts, faces=faces)
+    return BodyMesh(vertices=verts, faces=faces, colors=colors)

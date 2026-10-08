@@ -5,7 +5,10 @@ from .mesh_types import BodyMesh
 
 
 def to_trimesh(body: BodyMesh) -> trimesh.Trimesh:
-    return trimesh.Trimesh(vertices=body.vertices, faces=body.faces, process=False)
+    mesh = trimesh.Trimesh(vertices=body.vertices, faces=body.faces, process=False)
+    if body.colors is not None:
+        mesh.visual.vertex_colors = body.colors
+    return mesh
 
 
 def export_obj(body: BodyMesh, path: str) -> None:
