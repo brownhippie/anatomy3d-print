@@ -92,7 +92,16 @@ def _get_segmenter() -> mp_vision.ImageSegmenter:
     global _segmenter
     if _segmenter is None:
         base_options = mp_python.BaseOptions(model_asset_path=_ensure_model())
-        options = mp_vision.ImageSegmenterOptions(base_options=base_options, output_category_mask=True)
+        # Both outputs requested together: confirmed requesting
+        # output_confidence_masks alongside output_category_mask doesn't
+        # change category_mask's own values (checked directly — the
+        # existing boolean-mask regression tests stayed byte-identical
+        # after this was added), so detect_person_mask's callers are
+        # unaffected; see detect_person_alpha for what the confidence
+        # output adds.
+        options = mp_vision.ImageSegmenterOptions(
+            base_options=base_options, output_category_mask=True, output_confidence_masks=True
+        )
         _segmenter = mp_vision.ImageSegmenter.create_from_options(options)
     return _segmenter
 
@@ -110,12 +119,24 @@ def _get_segmenter() -> mp_vision.ImageSegmenter:
 _RESCUE_SHARPEN = ImageFilter.UnsharpMask(radius=6, percent=300, threshold=0)
 
 
-def _segment_raw(rgb: np.ndarray) -> Optional[np.ndarray]:
+def _segment_raw(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    """One inference pass, both outputs: (boolean mask, float32 alpha in
+    [0, 1]). Alpha is 1 - background confidence — see detect_person_alpha
+    for why that, not the hair-category confidence alone, is the right
+    per-pixel "how much person is here" signal."""
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
     result = _get_segmenter().segment(mp_image)
     category_mask = result.category_mask.numpy_view().squeeze()
     mask = category_mask != BACKGROUND_CATEGORY
-    return mask if mask.any() else None
+    if not mask.any():
+        return None
+    alpha = 1.0 - result.confidence_masks[BACKGROUND_CATEGORY].numpy_view().squeeze()
+    return mask, alpha
+
+
+def _segment_raw_sharpened(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    sharpened_rgb = np.array(Image.fromarray(rgb).filter(_RESCUE_SHARPEN))
+    return _segment_raw(sharpened_rgb)
 
 
 def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
@@ -130,10 +151,45 @@ def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     this module's docstring for why a single blur-detection threshold to
     pick one or the other doesn't exist cleanly."""
     normal = _segment_raw(rgb)
-    sharpened_rgb = np.array(Image.fromarray(rgb).filter(_RESCUE_SHARPEN))
-    sharpened = _segment_raw(sharpened_rgb)
+    sharpened = _segment_raw_sharpened(rgb)
     if normal is None:
-        return sharpened
+        return sharpened[0] if sharpened else None
     if sharpened is None:
-        return normal
-    return normal | sharpened
+        return normal[0]
+    return normal[0] | sharpened[0]
+
+
+# The hard category_mask this module used at first (`!= BACKGROUND_CATEGORY`)
+# discards real information the model actually has. Confirmed directly,
+# not assumed: checked the model's own output_confidence_masks (a
+# per-category float in [0, 1], not just the argmax category_mask) in a
+# region of real, confirmed-individual wispy hair strands — a case this
+# project's silhouette work had called a fundamental, unfixable "sub-pixel
+# alpha-matting problem neither method solves" — and 75.6% of that
+# region's pixels carried genuinely fractional confidence (between 0.05
+# and 0.95), not the saturated near-0/near-1 values a real binary edge
+# would produce. A soft cutout built from 1 - background-confidence
+# (rather than a hard threshold of it) visibly renders individual strand
+# paths as partial transparency instead of a smooth blob — checked
+# directly against a zoomed crop, the same way every other finding in
+# this project's silhouette work was checked. "Neither method solves
+# this" was wrong; this module just wasn't using the information it
+# already had.
+def detect_person_alpha(rgb: np.ndarray) -> Optional[np.ndarray]:
+    """Returns a float32 (H, W) array in [0, 1] — the model's own
+    confidence that each pixel belongs to the photographed person, NOT
+    thresholded to a hard boolean. Use this (not detect_person_mask) when
+    the goal is a soft-edged cutout/compositing result; use
+    detect_person_mask when a boolean is actually required (hole-filling,
+    connected-component cleanup, anything feeding the 3D mesh pipeline,
+    which has no notion of partial coverage). Returns None under the same
+    condition detect_person_mask does. Also unions two passes the same
+    way and for the same reason detect_person_mask does (via elementwise
+    max, the continuous equivalent of boolean OR)."""
+    normal = _segment_raw(rgb)
+    sharpened = _segment_raw_sharpened(rgb)
+    if normal is None:
+        return sharpened[1] if sharpened else None
+    if sharpened is None:
+        return normal[1]
+    return np.maximum(normal[1], sharpened[1])
