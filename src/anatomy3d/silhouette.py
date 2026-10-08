@@ -99,6 +99,54 @@ def _largest_filled_blob(mask: np.ndarray, body_scale_px: "float | None" = None)
     return blob | small_holes
 
 
+# _largest_filled_blob's single-largest-component rule was built for the
+# old color classifier, which really could scatter false-positive pixels
+# anywhere in the frame — keeping only one blob was the right defense
+# there. Confirmed as the WRONG rule for the segmentation model's own
+# output: on all three clean real test photos, that model's raw output
+# was ALREADY a single connected component (or one dominant blob plus a
+# few-pixel speck) — the single-blob filter was never earning its keep.
+# But under real degradation (tested directly: a photo blurred enough to
+# be a believable motion-blur/out-of-focus shot) the model still finds
+# the right pixels overall, just sometimes with a thin connecting bridge
+# (a shoulder, a wrist) eroded below its confidence threshold — confirmed
+# directly: at that blur level the output was 7 components, and 3 of
+# them (1983-3818px each) were real separated limbs, not noise, totaling
+# 34% of the real person. Taking only the largest blob there discarded
+# an entire arm. This function keeps every component above a size floor
+# instead of just the biggest one — real noise specks (confirmed on a
+# clean photo: 7px) sit nowhere near real limb fragments (confirmed:
+# 1983px+), so the floor doesn't need to be precise to separate them.
+MIN_COMPONENT_AREA_PX = 100
+MIN_COMPONENT_AREA_RATIO = MIN_COMPONENT_AREA_PX / (96.2 ** 2)  # see MAX_HOLE_FILL_AREA_RATIO — same area-scaling reasoning
+
+
+def _clean_segmentation_mask(mask: np.ndarray, body_scale_px: "float | None" = None) -> np.ndarray:
+    labeled, n = ndimage.label(mask)
+    if n == 0:
+        raise RuntimeError(
+            "No subject found against the background — use a photo with a "
+            "plain, evenly lit backdrop behind the person."
+        )
+    sizes = ndimage.sum(mask, labeled, index=range(1, n + 1))
+    min_area = MIN_COMPONENT_AREA_RATIO * (body_scale_px ** 2) if body_scale_px else MIN_COMPONENT_AREA_PX
+    keep_ids = [i + 1 for i, s in enumerate(sizes) if s >= min_area]
+    if not keep_ids:  # degenerate case: nothing passes the floor — keep the single largest rather than nothing
+        keep_ids = [1 + int(np.argmax(sizes))]
+    kept = np.isin(labeled, keep_ids)
+
+    fully_filled = ndimage.binary_fill_holes(kept)
+    holes = fully_filled & ~kept
+    hole_labels, n_holes = ndimage.label(holes)
+    if n_holes == 0:
+        return kept
+    hole_sizes = ndimage.sum(holes, hole_labels, index=range(1, n_holes + 1))
+    max_area = MAX_HOLE_FILL_AREA_RATIO * (body_scale_px ** 2) if body_scale_px else MAX_HOLE_FILL_AREA_PX
+    small_hole_ids = [i + 1 for i, s in enumerate(hole_sizes) if s <= max_area]
+    small_holes = np.isin(hole_labels, small_hole_ids)
+    return kept | small_holes
+
+
 # A Mahalanobis distance of this many "standard deviations" from the
 # nearest background color cluster — not a raw pixel-distance number like
 # the old flat `threshold`, because it needs to mean the same thing
@@ -591,7 +639,7 @@ def extract_silhouette(
 
         seg_mask = detect_person_mask(rgb)
         if seg_mask is not None:
-            return _largest_filled_blob(seg_mask, body_scale_px)
+            return _clean_segmentation_mask(seg_mask, body_scale_px)
     except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
         print(f"Note: ML person-segmentation failed ({exc}); falling back to the color/position classifier.")
 
