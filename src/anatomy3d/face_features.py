@@ -78,11 +78,21 @@ class FaceKeypoints:
     points: dict
 
 
-def detect_face_landmarks(image_path: str) -> Optional[FaceKeypoints]:
+def detect_face_landmarks(image_path: str, max_dimension: "int | None" = None) -> Optional[FaceKeypoints]:
     """Returns None (does not raise) if no face is detected — face detail
     is an optional refinement on top of the body figure, so a photo where
-    the face isn't usable should fall back gracefully, not fail the run."""
-    prepared = load_image_rgb(image_path)
+    the face isn't usable should fall back gracefully, not fail the run.
+
+    `max_dimension=None` (the default) uses the photo at full resolution,
+    unlike pose detection's 1280px cap in landmarks.py. That cap is fine
+    for pose — MediaPipe's landmark accuracy there doesn't improve past a
+    modest resolution relative to the whole photo — but a face is often a
+    small fraction of a full-body frame to begin with; downscaling it
+    further before it ever reaches the face landmarker throws away
+    exactly the pixels that determine whether a small face is usable at
+    all (see build_body_mesh's adaptive-resolution skip path, which exists
+    for faces that don't have enough pixels to work with)."""
+    prepared = load_image_rgb(image_path, max_dimension=max_dimension)
     width, height = prepared.width, prepared.height
 
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=prepared.rgb)

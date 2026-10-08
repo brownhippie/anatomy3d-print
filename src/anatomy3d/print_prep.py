@@ -83,19 +83,58 @@ def repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return mesh
 
 
+def simplify_for_output(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
+    """Decimates down to roughly `target_faces`, only if the mesh already
+    has more than that — never upsamples. The adaptive grid-resolution
+    fixes in procedural_body.py (sharpening the marching-cubes grid to
+    actually resolve thin limbs and small face features — see that
+    module) can produce meshes with 15-20k+ vertices where a few thousand
+    would look identical to the eye and print identically on an FDM
+    printer; the detail that justified the fine grid is in *where* the
+    surface sits, not in carrying every one of those vertices through to
+    the output file. Quadric decimation preserves overall shape far
+    better than naively dropping vertices — it collapses edges in order
+    of least visual cost, so flat/low-curvature regions (a forearm's
+    shaft) lose far more triangles than high-curvature ones (a nose tip,
+    a joint) for the same target count."""
+    if len(mesh.faces) <= target_faces:
+        return mesh
+    simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
+    simplified.merge_vertices()
+    trimesh.repair.fill_holes(simplified)
+    simplified.fix_normals()
+    if not simplified.is_watertight:
+        # Measured directly: decimation can introduce a handful of
+        # non-manifold edges that the repair pass above doesn't always
+        # close, especially on thin limbs where collapsing edges can
+        # pinch a wall shut. A smaller file isn't worth shipping a mesh
+        # that's worse than the one before decimation — keep the
+        # un-decimated (but still repaired) mesh instead.
+        return mesh
+    return simplified
+
+
 def export_stl(
     mesh: trimesh.Trimesh,
     path: str,
     min_wall_mm: float = 0.8,
     min_wall_margin: float = 0.15,
+    target_faces: "int | None" = 20000,
 ) -> trimesh.Trimesh:
     """`min_wall_mm` is a common rule of thumb for FDM (two 0.4mm-nozzle
     perimeters); tune it for your actual printer/material. The check
     requires the measured thickness (1st percentile of sampled points —
     see `estimate_min_wall_thickness`'s docstring for why not the bare
     minimum) to clear that minimum by at least `min_wall_margin`
-    (MAD-style margin — see safety.py), not just barely touch it."""
+    (MAD-style margin — see safety.py), not just barely touch it.
+
+    `target_faces`: simplifies the mesh down to roughly this many faces
+    after repair (see simplify_for_output) before the wall-thickness
+    check and export, so the file you actually get matches what was
+    measured. Pass None to skip simplification entirely."""
     repaired = repair_mesh(mesh)
+    if target_faces is not None:
+        repaired = simplify_for_output(repaired, target_faces)
     if not repaired.is_watertight:
         print(
             "Warning: mesh is not fully watertight after automatic repair. "

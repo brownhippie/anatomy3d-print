@@ -38,6 +38,14 @@ def main():
         "(Depth Anything V2 Small) instead of the flat symmetric guess. Needs "
         "`pip install -r requirements-depth.txt`.",
     )
+    parser.add_argument(
+        "--target-faces",
+        type=int,
+        default=20000,
+        help="Simplify the output STL to roughly this many faces after repair (default: "
+        "20000). The OBJ is unaffected and stays full-detail. Pass 0 to export at full "
+        "detail with no simplification.",
+    )
     args = parser.parse_args()
 
     run_pipeline(
@@ -46,6 +54,7 @@ def main():
         target_height_mm=args.height_mm,
         angles_deg=args.angles,
         use_depth=args.use_depth,
+        target_faces=args.target_faces or None,
     )
 
 

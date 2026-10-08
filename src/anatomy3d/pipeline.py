@@ -37,6 +37,7 @@ def run_pipeline(
     target_height_mm: float = 150.0,
     angles_deg: Optional[List[float]] = None,
     use_depth: bool = False,
+    target_faces: Optional[int] = 20000,
 ) -> None:
     """One photo -> the capsule/SDF body builder (a geometric guess).
     Two or more photos (different angles around the subject) -> visual hull
@@ -59,7 +60,18 @@ def run_pipeline(
     opt-in flag, since it's the same MediaPipe dependency already
     required for pose detection, not a new one. A missing/unusable face
     or a failed model fetch falls back to the generic head shape rather
-    than failing the run.
+    than failing the run. It also runs face detection at the photo's full
+    resolution (unlike pose detection's 1280px cap) — a face is often a
+    small fraction of a full-body frame, so it benefits from every pixel
+    available, see face_features.py.
+
+    `target_faces`: the STL (not the OBJ, which stays full-detail for
+    render/animation use) is simplified down to roughly this many faces
+    after repair, see print_prep.py's simplify_for_output. The adaptive
+    grid-resolution fixes in procedural_body.py can produce far more
+    detail than an FDM print or a web preview needs to look identical;
+    this trades that unneeded density back down for a smaller, faster
+    file. Pass None to export at full detail.
     """
     os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
 
@@ -103,6 +115,6 @@ def run_pipeline(
     export_obj(body, obj_path)
 
     mesh = to_trimesh(body)
-    export_stl(mesh, out_stl_path)
+    export_stl(mesh, out_stl_path, target_faces=target_faces)
 
     print(f"Wrote {out_stl_path} (printing) and {obj_path} (render/animation).")
