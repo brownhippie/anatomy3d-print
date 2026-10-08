@@ -147,19 +147,46 @@ _RESCUE_SHARPEN = ImageFilter.UnsharpMask(radius=6, percent=300, threshold=0)
 # confirming this is a precision fix, not a different segmentation.
 PERSON_ALPHA_THRESHOLD = 0.5
 
+# A limb the camera frame cuts off (an arm reaching past the photo's own
+# edge, not a real wrist/fingertip boundary) genuinely confuses the
+# model — confirmed directly: a forearm reaching toward a photo's right
+# edge measured a smooth, real gradient from 0.8 down to 0.22-0.3 right
+# at the edge, well above the flat ~0.08-0.12 noise floor measured on
+# plain backgrounds elsewhere in this module, but still under
+# PERSON_ALPHA_THRESHOLD — so the hard cutoff was dropping real arm
+# pixels, visibly "missing some of the hand" in a rendered cutout. This
+# is hysteresis thresholding (the same technique Canny edge detection
+# uses for a confident core with a real, elevated-but-fading boundary):
+# a pixel counts as person if it crosses PERSON_ALPHA_THRESHOLD itself,
+# or is connected through a chain of above-this-floor pixels to one that
+# does. Set comfortably above the measured noise floor so flat
+# background never bridges into a real mask.
+PERSON_ALPHA_LOW_THRESHOLD = 0.2
+
+
+def _hysteresis_mask(alpha: np.ndarray) -> np.ndarray:
+    strong = alpha > PERSON_ALPHA_THRESHOLD
+    weak = alpha > PERSON_ALPHA_LOW_THRESHOLD
+    labeled, n = ndimage.label(weak)
+    if n == 0:
+        return strong
+    strong_labels = np.unique(labeled[strong])
+    strong_labels = strong_labels[strong_labels != 0]
+    return np.isin(labeled, strong_labels)
+
 
 def _segment_raw(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
     """One inference pass, both outputs: (boolean mask, float32 alpha in
     [0, 1]). Alpha is 1 - background confidence — see detect_person_alpha
     for why that, not the hair-category confidence alone, is the right
-    per-pixel "how much person is here" signal. The boolean mask is
-    alpha > PERSON_ALPHA_THRESHOLD, NOT the model's own category_mask —
-    see that constant's docstring for the real, measured bug in trusting
-    category_mask's argmax directly."""
+    per-pixel "how much person is here" signal. The boolean mask is a
+    hysteresis threshold of alpha (see PERSON_ALPHA_LOW_THRESHOLD), NOT
+    the model's own category_mask — see that constant's docstring for
+    the real, measured bug in trusting category_mask's argmax directly."""
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
     result = _get_segmenter().segment(mp_image)
     alpha = 1.0 - result.confidence_masks[BACKGROUND_CATEGORY].numpy_view().squeeze()
-    mask = alpha > PERSON_ALPHA_THRESHOLD
+    mask = _hysteresis_mask(alpha)
     if not mask.any():
         return None
     return mask, alpha
@@ -263,7 +290,7 @@ def _refine_crop(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "tuple
     out_alpha[cy0:cy1, cx0:cx1] = np.where(
         refined_mask, np.maximum(alpha[cy0:cy1, cx0:cx1], refined_alpha), alpha[cy0:cy1, cx0:cx1]
     )
-    return out_alpha > PERSON_ALPHA_THRESHOLD, out_alpha
+    return _hysteresis_mask(out_alpha), out_alpha
 
 
 def _segment_full(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
