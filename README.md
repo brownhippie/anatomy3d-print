@@ -26,6 +26,26 @@ extracts the result with marching cubes. Fast, but it's a stylized guess —
 it doesn't know the actual shape of the person in the photo, only their
 joint proportions.
 
+Within that single-photo mode, the body is modeled **section by section**
+rather than as one tapered torso capsule: head, chest, waist, hips, and
+each limb each get their own capsule, and each cross-section gets its own
+front-to-back/side-to-side depth ratio instead of assuming a round
+cross-section everywhere (people aren't round — a chest is noticeably
+wider than it is deep, hips less so, a head is close to even). These
+ratios (`DEPTH_RATIO_*` in `procedural_body.py`) are generic, widely-cited
+figure-drawing/character-modeling proportions, the same kind of
+unencumbered reference the radius ratios already used — not a licensed
+anthropometric dataset, and still a stylized mannequin, not a medical
+cast. The waist sits narrower than both chest and hips, and each torso
+capsule's depth ratio is itself interpolated end-to-end (chest ratio →
+waist ratio → hip ratio) so the flattening changes smoothly along the
+torso instead of jumping where the chest and hip capsules meet. This adds
+real shape information beyond joint positions alone without pulling in
+any model weights or training data; it does not attempt fine detail (face,
+fingers, clothing folds) — that needs a learned generative model, which
+reopens the exact licensing problem this project exists to avoid, so it's
+deliberately out of scope here.
+
 **Two or more photos, shot from different angles around the subject**
 (front first, then rotating — a phone-selfie "turnaround" or someone else
 walking around you works) → `visual_hull.py`: classical visual hull / space
@@ -166,21 +186,24 @@ where the data disagreed with the original pick.
   still check the result in your slicer.
 - **Keypoint count** (`landmarks.py`, `body_fit.py`) — how many of the
   needed body landmarks MediaPipe actually detected with confidence.
-- **Capsule count** (`procedural_body.py`) — how many of the 10 possible
-  body-part capsules had enough keypoints to place. Calibration surfaced
-  two real structural bugs here, not just a number to retune: (1) the
-  mesh's height-normalization scale was computed *before* discarding
-  debris fragments (see the next section), so a debris sliver sitting
-  beyond the real body's top/bottom silently shrank the final printed
-  height by ~12% in one measured case; (2) missing hips, or legs that
-  don't reach the ankles, meant the mesh's lowest point was the pelvis or
-  a knee instead of a foot — scaling that truncated span to fill the full
-  target height inflated the figure by 2-4x in measured cases, and raw
-  capsule count didn't catch it (5+ capsules could still be present).
-  Both found their own hard gates (hips and full leg chains now required,
-  with a clear error instead of a silently wrong mesh) rather than a
-  margin tweak. With those gates in place, torso+both legs always forms,
-  so the true floor is 5 capsules, not the original guess of 3.
+- **Capsule count** (`procedural_body.py`) — how many of the 11 possible
+  body-part capsules had enough keypoints to place (the torso counts as
+  two — chest and hips either side of the waist — since the section-by-
+  section split, not one). Calibration surfaced two real structural bugs
+  here, not just a number to retune: (1) the mesh's height-normalization
+  scale was computed *before* discarding debris fragments (see the next
+  section), so a debris sliver sitting beyond the real body's top/bottom
+  silently shrank the final printed height by ~12% in one measured case;
+  (2) missing hips, or legs that don't reach the ankles, meant the mesh's
+  lowest point was the pelvis or a knee instead of a foot — scaling that
+  truncated span to fill the full target height inflated the figure by
+  2-4x in measured cases, and raw capsule count didn't catch it (5+
+  capsules could still be present). Both found their own hard gates (hips
+  and full leg chains now required, with a clear error instead of a
+  silently wrong mesh) rather than a margin tweak. With those gates in
+  place, chest+hips+both legs always forms, so the true floor is 6
+  capsules — confirmed directly (dropping every optional joint except the
+  gated ones reaches exactly 6, never fewer), not a guess.
 - **View count** (`visual_hull.py`) — reasoned differently from the
   others: 2 views (front+side) is an intentionally supported mode, not a
   degraded one, so the margin is measured against a 4-view full-turntable

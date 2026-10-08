@@ -27,11 +27,13 @@ from .landmarks import DetectedKeypoints
 from .mesh_types import BodyMesh
 from .safety import mad_margin_above_minimum
 
-# Of 10 possible (head, torso, 2 upper arms, 2 forearms, 2 thighs, 2
-# shins): the hip/knee/ankle gates below guarantee torso+2 thighs+2 shins
-# (5) always form, so 5 is the true floor now, confirmed by calibration —
-# not a guess, and no longer reachable as a failure path below 5.
-MIN_CAPSULES = 5
+# Of 11 possible (head, chest, hips, 2 upper arms, 2 forearms, 2 thighs, 2
+# shins): the hip/knee/ankle gates below guarantee chest+hips+2 thighs+2
+# shins (6) always form — the torso is now two guaranteed segments (chest,
+# hips) instead of one, since neck/waist/pelvis are always computed once
+# shoulders+hips are present — so 6 is the true floor, not a guess, and no
+# longer reachable as a failure path below 6.
+MIN_CAPSULES = 6
 
 # Head radius and limb radii as a fraction of that limb's own measured
 # length — generic figure-proportion ratios, not a licensed anthropometric
@@ -43,10 +45,27 @@ HEAD_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.23
 # up floating outside the torso's own surface with a visible gap.
 TORSO_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.46
 HIP_RADIUS_FRAC_OF_HIP_WIDTH = 0.46
+# Waist sits narrower than both chest and hips — splitting the torso here
+# (instead of one neck-to-pelvis capsule) is what makes "section by
+# section" proportion real rather than a single linear taper.
+WAIST_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.34
+WAIST_HEIGHT_FRAC = 0.55  # fraction of the way from neck to pelvis
 UPPER_ARM_RADIUS_FRAC = 0.14
 FOREARM_RADIUS_FRAC = 0.11
 THIGH_RADIUS_FRAC = 0.17
 SHIN_RADIUS_FRAC = 0.12
+
+# Section-by-section depth:width ratios (front-to-back vs side-to-side) —
+# people are not round in cross-section. These are generic, widely-cited
+# anthropometric proportions (the kind figure-drawing and character-
+# modeling references use), not a licensed dataset, and deliberately
+# approximate: a stylized mannequin's cross-section, not a medical cast.
+# 1.0 = circular (this project's previous, cruder default everywhere).
+DEPTH_RATIO_HEAD = 1.15  # heads measure slightly longer front-to-back than wide
+DEPTH_RATIO_CHEST = 0.62  # chest: markedly wider side-to-side than deep
+DEPTH_RATIO_WAIST = 0.72  # waist: rounder than the chest, still not circular
+DEPTH_RATIO_HIPS = 0.78
+DEPTH_RATIO_LIMB = 0.92  # limbs are closer to round, but still slightly flattened
 
 
 def _to_local_xy(keypoints: DetectedKeypoints) -> dict:
@@ -57,13 +76,42 @@ def _to_local_xy(keypoints: DetectedKeypoints) -> dict:
     return out
 
 
-def _capsule_sdf(points: np.ndarray, a: np.ndarray, b: np.ndarray, ra: float, rb: float) -> np.ndarray:
+def _capsule_sdf(
+    points: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    ra: float,
+    rb: float,
+    depth_ratio_a: float = 1.0,
+    depth_ratio_b: float = 1.0,
+) -> np.ndarray:
+    """`depth_ratio` < 1 flattens the cross-section front-to-back (the
+    global Z axis) relative to side-to-side — every capsule's segment
+    lies in the z=0 plane (see _to_local_xy), so Z is always exactly the
+    "depth" axis here, never a segment-relative direction, which is what
+    makes scaling just the z-offset correct for an arbitrarily-oriented
+    segment: scaling the already-orthogonal offset's z-component shrinks
+    or grows the surface in the depth direction only, independent of the
+    segment's own direction within the XY plane. This is the zero level
+    set of a true ellipse in cross-section; it's not an exact Euclidean
+    SDF away from that surface (the gradient magnitude isn't 1 off-axis),
+    which doesn't matter for marching cubes or smooth-min blending — both
+    only need a correctly-signed, reasonably smooth field near zero.
+
+    `depth_ratio_a`/`depth_ratio_b` interpolate along the segment the same
+    way `ra`/`rb` do for radius, so a capsule can flatten gradually from
+    one end's ratio to the other's instead of jumping at the joint."""
     pa = points - a
     ba = b - a
     ba_dot = np.dot(ba, ba)
     h = np.clip((pa @ ba) / ba_dot, 0.0, 1.0) if ba_dot > 1e-9 else np.zeros(len(points))
     closest = a + h[:, None] * ba
-    dist = np.linalg.norm(points - closest, axis=1)
+    offset = points - closest
+    if depth_ratio_a != 1.0 or depth_ratio_b != 1.0:
+        depth_ratio = depth_ratio_a + h * (depth_ratio_b - depth_ratio_a)
+        offset = offset.copy()
+        offset[:, 2] = offset[:, 2] / depth_ratio
+    dist = np.linalg.norm(offset, axis=1)
     radius = ra + h * (rb - ra)
     return dist - radius
 
@@ -73,10 +121,12 @@ def _smooth_min(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
     return np.minimum(a, b) - hh * hh * k * 0.25
 
 
-def _segment(joints, name_a, name_b, radius_a, radius_b):
+def _segment(joints, name_a, name_b, radius_a, radius_b, depth_ratio_a=1.0, depth_ratio_b=None):
     if name_a not in joints or name_b not in joints:
         return None
-    return (joints[name_a], joints[name_b], radius_a, radius_b)
+    if depth_ratio_b is None:
+        depth_ratio_b = depth_ratio_a
+    return (joints[name_a], joints[name_b], radius_a, radius_b, depth_ratio_a, depth_ratio_b)
 
 
 def _build_capsules(joints: dict) -> list:
@@ -118,6 +168,7 @@ def _build_capsules(joints: dict) -> list:
         joints["pelvis"] = (joints["left_hip"] + joints["right_hip"]) / 2.0
     if "nose" in joints:
         joints["head_top"] = joints["nose"] + (joints["nose"] - neck) * 1.1
+    joints["waist"] = neck + (joints["pelvis"] - neck) * WAIST_HEIGHT_FRAC
 
     # Pull limb attachment points inward from the raw landmark toward the
     # torso centerline. The torso capsule's own radius can't be stretched
@@ -141,23 +192,31 @@ def _build_capsules(joints: dict) -> list:
 
     head_r = HEAD_RADIUS_FRAC_OF_SHOULDER_WIDTH * shoulder_width
     torso_r_top = TORSO_RADIUS_FRAC_OF_SHOULDER_WIDTH * shoulder_width
+    waist_r = WAIST_RADIUS_FRAC_OF_SHOULDER_WIDTH * shoulder_width
     torso_r_bot = HIP_RADIUS_FRAC_OF_HIP_WIDTH * hip_width
 
     capsules = []
+    # Chest and hips get their own depth ratio either side of the narrower
+    # waist, instead of one linear-taper torso capsule — this is the
+    # "section by section" proportion split the figure is built from. Each
+    # torso segment's depth ratio is itself interpolated end-to-end (chest
+    # ratio -> waist ratio -> hip ratio) so the flattening changes smoothly
+    # along the torso instead of jumping where the two segments meet.
     segs = [
-        ("head_top", "neck", head_r, head_r * 0.6),
-        ("neck", "pelvis", torso_r_top, torso_r_bot),
-        ("left_shoulder_attach", "left_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.5, shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.4),
-        ("right_shoulder_attach", "right_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.5, shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.4),
-        ("left_elbow", "left_wrist", shoulder_width * FOREARM_RADIUS_FRAC * 0.4, shoulder_width * FOREARM_RADIUS_FRAC * 0.3),
-        ("right_elbow", "right_wrist", shoulder_width * FOREARM_RADIUS_FRAC * 0.4, shoulder_width * FOREARM_RADIUS_FRAC * 0.3),
-        ("left_hip_attach", "left_knee", hip_width * THIGH_RADIUS_FRAC * 0.6, hip_width * THIGH_RADIUS_FRAC * 0.4),
-        ("right_hip_attach", "right_knee", hip_width * THIGH_RADIUS_FRAC * 0.6, hip_width * THIGH_RADIUS_FRAC * 0.4),
-        ("left_knee", "left_ankle", hip_width * SHIN_RADIUS_FRAC * 0.4, hip_width * SHIN_RADIUS_FRAC * 0.3),
-        ("right_knee", "right_ankle", hip_width * SHIN_RADIUS_FRAC * 0.4, hip_width * SHIN_RADIUS_FRAC * 0.3),
+        ("head_top", "neck", head_r, head_r * 0.6, DEPTH_RATIO_HEAD, DEPTH_RATIO_HEAD),
+        ("neck", "waist", torso_r_top, waist_r, DEPTH_RATIO_CHEST, DEPTH_RATIO_WAIST),
+        ("waist", "pelvis", waist_r, torso_r_bot, DEPTH_RATIO_WAIST, DEPTH_RATIO_HIPS),
+        ("left_shoulder_attach", "left_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.5, shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.4, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("right_shoulder_attach", "right_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.5, shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.4, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("left_elbow", "left_wrist", shoulder_width * FOREARM_RADIUS_FRAC * 0.4, shoulder_width * FOREARM_RADIUS_FRAC * 0.3, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("right_elbow", "right_wrist", shoulder_width * FOREARM_RADIUS_FRAC * 0.4, shoulder_width * FOREARM_RADIUS_FRAC * 0.3, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("left_hip_attach", "left_knee", hip_width * THIGH_RADIUS_FRAC * 0.6, hip_width * THIGH_RADIUS_FRAC * 0.4, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("right_hip_attach", "right_knee", hip_width * THIGH_RADIUS_FRAC * 0.6, hip_width * THIGH_RADIUS_FRAC * 0.4, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("left_knee", "left_ankle", hip_width * SHIN_RADIUS_FRAC * 0.4, hip_width * SHIN_RADIUS_FRAC * 0.3, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("right_knee", "right_ankle", hip_width * SHIN_RADIUS_FRAC * 0.4, hip_width * SHIN_RADIUS_FRAC * 0.3, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
     ]
-    for a, b, ra, rb in segs:
-        seg = _segment(joints, a, b, ra, rb)
+    for a, b, ra, rb, dra, drb in segs:
+        seg = _segment(joints, a, b, ra, rb, dra, drb)
         if seg:
             capsules.append(seg)
 
@@ -271,8 +330,8 @@ def build_body_mesh(
     # limb's own radius distorts and can fragment that limb.
     blend_k = min(all_radii) * blend_k_frac * 5.0
     field = None
-    for a, b, ra, rb in capsules:
-        sdf = _capsule_sdf(points, a, b, ra, rb)
+    for a, b, ra, rb, dra, drb in capsules:
+        sdf = _capsule_sdf(points, a, b, ra, rb, dra, drb)
         field = sdf if field is None else _smooth_min(field, sdf, blend_k)
 
     field = field.reshape(res)
