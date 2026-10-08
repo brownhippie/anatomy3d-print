@@ -248,9 +248,21 @@ def _refine_crop(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "tuple
     refined = _segment_coarse(rgb[cy0:cy1, cx0:cx1])
     if refined is None:
         return mask, alpha
-    _, refined_alpha = refined
+    refined_mask, refined_alpha = refined
+    # Same rule as the sharpened-pass merge above, for the same reason:
+    # the crop pass only gets to raise alpha where IT crosses its own
+    # hard-mask threshold, not everywhere via a raw elementwise max.
+    # Confirmed directly on a photo with a small, distant subject: a
+    # blanket max let a visible rectangular "halo" tint the whole crop
+    # region, because re-cropping tight around a small subject changes
+    # the model's field of view enough to generally nudge up background
+    # confidence across the crop, not just at the subject's own edges —
+    # the same kind of noise the sharpened pass produces, just from a
+    # context shift instead of sharpening artifacts.
     out_alpha = alpha.copy()
-    out_alpha[cy0:cy1, cx0:cx1] = np.maximum(alpha[cy0:cy1, cx0:cx1], refined_alpha)
+    out_alpha[cy0:cy1, cx0:cx1] = np.where(
+        refined_mask, np.maximum(alpha[cy0:cy1, cx0:cx1], refined_alpha), alpha[cy0:cy1, cx0:cx1]
+    )
     return out_alpha > PERSON_ALPHA_THRESHOLD, out_alpha
 
 
