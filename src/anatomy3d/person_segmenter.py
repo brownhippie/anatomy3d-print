@@ -169,6 +169,64 @@ def _segment_raw_sharpened(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.nd
     return _segment_raw(sharpened_rgb)
 
 
+def _segment_coarse(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    """The normal+sharpened union, factored out of detect_person_mask so
+    _refine_crop (and detect_person_alpha) can reuse it on an image crop
+    too, not just the full photo."""
+    normal = _segment_raw(rgb)
+    sharpened = _segment_raw_sharpened(rgb)
+    if normal is None:
+        return sharpened
+    if sharpened is None:
+        return normal
+    return normal[0] | sharpened[0], np.maximum(normal[1], sharpened[1])
+
+
+# The model's own fixed internal processing resolution (the "256x256" in
+# this file's model name) is spent on the whole input frame, not the
+# person in it — confirmed directly: feeding a 2000x1500 image, the
+# returned confidence mask comes back upsampled to that full 2000x1500
+# size, but the actual inference ran at the model's small fixed internal
+# resolution before that upsampling. When the person (and especially
+# something fine like fingers) only fills a fraction of the photo, most
+# of that fixed budget is spent resolving empty background, not finger
+# boundaries. Re-running the same segmenter on a tight crop around the
+# already-detected person spends that same fixed budget on the subject
+# almost exclusively, which is strictly more resolution on the part that
+# needs it. Skipped when the subject already fills most of the frame
+# (_CROP_REFINE_MAX_FRAC) since a crop then buys nothing.
+_CROP_REFINE_MAX_FRAC = 0.6
+_CROP_REFINE_MARGIN_FRAC = 0.2
+
+
+def _refine_crop(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+    h, w = mask.shape
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return mask, alpha
+    y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+    bbox_h, bbox_w = y1 - y0 + 1, x1 - x0 + 1
+    if bbox_h >= _CROP_REFINE_MAX_FRAC * h and bbox_w >= _CROP_REFINE_MAX_FRAC * w:
+        return mask, alpha
+    margin_y, margin_x = int(bbox_h * _CROP_REFINE_MARGIN_FRAC), int(bbox_w * _CROP_REFINE_MARGIN_FRAC)
+    cy0, cy1 = max(0, y0 - margin_y), min(h, y1 + margin_y + 1)
+    cx0, cx1 = max(0, x0 - margin_x), min(w, x1 + margin_x + 1)
+    refined = _segment_coarse(rgb[cy0:cy1, cx0:cx1])
+    if refined is None:
+        return mask, alpha
+    _, refined_alpha = refined
+    out_alpha = alpha.copy()
+    out_alpha[cy0:cy1, cx0:cx1] = np.maximum(alpha[cy0:cy1, cx0:cx1], refined_alpha)
+    return out_alpha > PERSON_ALPHA_THRESHOLD, out_alpha
+
+
+def _segment_full(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    coarse = _segment_coarse(rgb)
+    if coarse is None:
+        return None
+    return _refine_crop(rgb, *coarse)
+
+
 def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     """Returns a boolean (H, W) mask, True where the model reads the
     photographed person (any of hair/body-skin/face-skin/clothes/
@@ -177,16 +235,11 @@ def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     the caller fall back to the color/position pipeline, same as every
     other optional-model step in this project (face/hair detection).
 
-    Internally unions two passes (normal + aggressively sharpened) — see
-    this module's docstring for why a single blur-detection threshold to
-    pick one or the other doesn't exist cleanly."""
-    normal = _segment_raw(rgb)
-    sharpened = _segment_raw_sharpened(rgb)
-    if normal is None:
-        return sharpened[0] if sharpened else None
-    if sharpened is None:
-        return normal[0]
-    return normal[0] | sharpened[0]
+    Internally unions two full-frame passes (normal + aggressively
+    sharpened) and then a crop-refine pass — see this module's docstring
+    for the sharpening and _refine_crop's docstring for the crop step."""
+    full = _segment_full(rgb)
+    return full[0] if full else None
 
 
 # The hard category_mask this module used at first (`!= BACKGROUND_CATEGORY`)
@@ -213,13 +266,8 @@ def detect_person_alpha(rgb: np.ndarray) -> Optional[np.ndarray]:
     detect_person_mask when a boolean is actually required (hole-filling,
     connected-component cleanup, anything feeding the 3D mesh pipeline,
     which has no notion of partial coverage). Returns None under the same
-    condition detect_person_mask does. Also unions two passes the same
-    way and for the same reason detect_person_mask does (via elementwise
-    max, the continuous equivalent of boolean OR)."""
-    normal = _segment_raw(rgb)
-    sharpened = _segment_raw_sharpened(rgb)
-    if normal is None:
-        return sharpened[1] if sharpened else None
-    if sharpened is None:
-        return normal[1]
-    return np.maximum(normal[1], sharpened[1])
+    condition detect_person_mask does. Also goes through the same
+    full-frame-union-plus-crop-refine pipeline detect_person_mask does —
+    see _segment_full."""
+    full = _segment_full(rgb)
+    return full[1] if full else None
