@@ -179,7 +179,18 @@ def _segment_coarse(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]
         return sharpened
     if sharpened is None:
         return normal
-    return normal[0] | sharpened[0], np.maximum(normal[1], sharpened[1])
+    normal_mask, normal_alpha = normal
+    sharp_mask, sharp_alpha = sharpened
+    # The sharpened pass only gets to raise alpha where IT crosses its own
+    # hard-mask threshold, not everywhere via a raw elementwise max.
+    # Confirmed directly: the aggressive sharpen amplifies texture/shadow
+    # noise in a flat background wall into weak partial "person"
+    # confidence (0.08 -> up to 0.29) — never enough to cross the hard
+    # mask's 0.5 threshold, but enough to show up as visible background
+    # smudging in the soft-alpha cutout, since that output isn't
+    # thresholded at all.
+    alpha = np.where(sharp_mask, np.maximum(normal_alpha, sharp_alpha), normal_alpha)
+    return normal_mask | sharp_mask, alpha
 
 
 # The model's own fixed internal processing resolution (the "256x256" in
