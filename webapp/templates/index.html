@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>anatomy3d-print</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><circle cx=%2216%22 cy=%2216%22 r=%2214%22 fill=%22%236ea8ff%22/></svg>" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/static/vendor/three/three.module.min.js",
+        "three/addons/": "/static/vendor/three/addons/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="dot"></span> anatomy3d-print</div>
+      <div class="tagline">photo &rarr; 3D-printable figure, built from scratch, no licensed model</div>
+    </header>
+
+    <main>
+      <section class="panel">
+        <h2>1. Photos</h2>
+        <div class="dropzone" id="dropzone">
+          <div class="icon">&#128247;</div>
+          <div class="main-text">Click or drop photos here</div>
+          <div class="sub-text">One photo for a quick guess, or several (turntable order, front first) for a carved reconstruction</div>
+        </div>
+        <input type="file" id="file-input" accept="image/*" multiple hidden />
+        <div class="file-list" id="file-list"></div>
+        <div class="mode-banner" id="mode-banner">Add a photo to begin.</div>
+
+        <h2 style="margin-top:26px">2. Settings</h2>
+        <div class="field">
+          <label for="height-mm">Target height (mm)</label>
+          <input type="number" id="height-mm" value="150" min="20" max="1000" />
+        </div>
+        <div class="checkbox-row">
+          <input type="checkbox" id="use-depth" />
+          <label for="use-depth" style="margin:0">Use real depth estimation (single photo, needs the server's optional depth extras)</label>
+        </div>
+
+        <button class="primary" id="generate-btn">Generate model</button>
+        <button class="secondary" id="reset-btn">Start over</button>
+
+        <div class="status-box" id="status-box"></div>
+        <div class="messages" id="messages"></div>
+      </section>
+
+      <section class="stage" id="stage">
+        <canvas id="viewer-canvas"></canvas>
+
+        <div class="empty-state" id="empty-state">
+          <div class="big">&#129517;</div>
+          <div class="t1">No model yet</div>
+          <div class="t2">Add photos on the left and generate a model to see it rendered here, on the print bed, before you export anything.</div>
+        </div>
+
+        <div class="viewer-toolbar">
+          <button id="reset-view-btn">Reset view</button>
+        </div>
+
+        <div class="stats-bar" id="stats-bar" style="display:none"></div>
+        <div class="download-bar" id="download-bar"></div>
+
+        <div class="loading-overlay" id="loading-overlay">
+          <div class="spinner"></div>
+          <div class="msg" id="loading-msg">Working&hellip;</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
