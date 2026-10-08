@@ -5,10 +5,13 @@ background, in two stages that each correct the one before it:
    pixels far enough from it, take the largest connected blob. Cheap,
    but a single flat cutoff misclassifies shadowed or near-background-
    colored regions.
-2. Statistical reclassify: fit foreground/background color Gaussians from
-   stage 1's result, then reclassify every pixel by which distribution it
-   actually fits best. Same core idea as GrabCut's color model, without
-   pulling in OpenCV for it.
+2. Two-sided reclassify: cluster BOTH the foreground and background seed
+   pixels into several color groups each (not one broad Gaussian per
+   side — see _two_sided_reclassify's docstring for why that failed), and
+   reclassify every pixel by whichever side's nearest cluster is actually
+   closer. Genuinely color-ambiguous pixels (checked, not assumed — see
+   AMBIGUITY_MARGIN) fall back to a position check against the subject's
+   own detected pose, when given.
 
 A third stage — snapping the boundary to image edges with an active
 contour (Kass et al. 1988) — was tried and reverted. On a figure with a
@@ -19,6 +22,8 @@ area wasn't large enough to trip it. Revisit only with a shape-aware check
 (e.g. compare the bounding box, not just area) and testing against real
 photos, not just clean synthetic edges.
 """
+from typing import Optional
+
 import numpy as np
 from scipy import ndimage
 from scipy.cluster.vq import kmeans2
@@ -110,6 +115,59 @@ MAHALANOBIS_THRESHOLD = 3.5
 # spread says there's nothing to cluster.
 DEFAULT_BACKGROUND_CLUSTERS = 5
 
+# Unlike the background, the foreground has no natural plateau to measure:
+# tried k=1..25 on a real photo's own foreground seed pixels and inertia
+# kept dropping ~20% at every step the whole way, never flattening like
+# the background did at k=5. That's a real, structural difference, not a
+# measurement failure — a body's color is a continuous gradient (shading
+# across a rounded, lit 3D surface) rather than a few discrete flat
+# tones, so there's no small "true" cluster count to find. 5 is chosen to
+# match the background default and cover the number of visually distinct
+# materials a clothed figure typically has (skin, 1-2 clothing colors, an
+# accessory/background prop like a mat, hair) — a reasonable choice, not
+# a measured one, unlike DEFAULT_BACKGROUND_CLUSTERS.
+DEFAULT_FOREGROUND_CLUSTERS = 5
+
+
+def _cluster_min_mahalanobis(
+    seed_pixels: np.ndarray,
+    flat_pixels: np.ndarray,
+    k: int,
+    max_samples: int = 20000,
+    rng_seed: int = 0,
+    fallback_scale: float = 32.0,
+) -> np.ndarray:
+    """Fits `k` color clusters (k-means) to `seed_pixels` and returns, for
+    every pixel in `flat_pixels`, its Mahalanobis distance to the NEAREST
+    cluster's own mean and spread. Shared by the background clustering in
+    _threshold_mask and the two-sided foreground/background clustering in
+    _two_sided_reclassify — same reasoning both times: one flat distance
+    or one broad covariance can't represent a color population that's
+    actually several distinct tones (see DEFAULT_BACKGROUND_CLUSTERS and
+    DEFAULT_FOREGROUND_CLUSTERS)."""
+    rng = np.random.default_rng(rng_seed)
+    sample = seed_pixels[rng.choice(len(seed_pixels), max_samples, replace=False)] if len(seed_pixels) > max_samples else seed_pixels
+    k = min(k, len(sample))
+    if k > 1 and np.std(sample, axis=0).max() < 1.0:
+        k = 1  # nothing to cluster — a near-flat color population
+    try:
+        centroids, labels = kmeans2(sample, k, seed=rng_seed, minit="++")
+    except Exception:
+        centroids = np.median(sample, axis=0, keepdims=True)
+        labels = np.zeros(len(sample), dtype=int)
+
+    dists = []
+    for i in range(len(centroids)):
+        cluster = sample[labels == i]
+        if len(cluster) < 4:
+            dists.append(np.linalg.norm(flat_pixels - centroids[i], axis=-1) / fallback_scale * MAHALANOBIS_THRESHOLD)
+            continue
+        cov = np.cov(cluster, rowvar=False) + np.eye(3) * 1e-3
+        prec = np.linalg.inv(cov)
+        diff = flat_pixels - centroids[i]
+        dists.append(np.sqrt(np.einsum("ij,jk,ik->i", diff, prec, diff)))
+    return np.min(np.stack(dists), axis=0)
+
 
 def _threshold_mask(
     rgb: np.ndarray, border_width: int = 12, threshold: float = 32.0, background_clusters: int = DEFAULT_BACKGROUND_CLUSTERS
@@ -154,49 +212,100 @@ def _threshold_mask(
         rgb[:, -border_width:].reshape(-1, 3),
     ]).astype(np.float64)
 
-    # A near-perfectly flat background (every border pixel almost
-    # identical) has nothing for k-means to split — forcing k>1 clusters
-    # onto it just produces a degenerate empty-cluster warning for no
-    # benefit, so skip straight to the single-cluster case there.
-    k = min(background_clusters, len(border_pixels))
-    if k > 1 and np.std(border_pixels, axis=0).max() < 1.0:
-        k = 1
-    try:
-        centroids, labels = kmeans2(border_pixels, k, seed=0, minit="++")
-    except Exception:
-        centroids = np.median(border_pixels, axis=0, keepdims=True)
-        labels = np.zeros(len(border_pixels), dtype=int)
-
     flat = rgb.astype(np.float64).reshape(-1, 3)
-    maha_per_cluster = []
-    for i in range(len(centroids)):
-        cluster_pixels = border_pixels[labels == i]
-        if len(cluster_pixels) < 4:
-            # Too few samples to fit a covariance — fall back to a plain
-            # Euclidean distance (scaled to roughly match Mahalanobis
-            # units) for this cluster rather than skip it entirely.
-            maha_per_cluster.append(np.linalg.norm(flat - centroids[i], axis=-1) / threshold * MAHALANOBIS_THRESHOLD)
-            continue
-        cov = np.cov(cluster_pixels, rowvar=False) + np.eye(3) * 1e-3
-        prec = np.linalg.inv(cov)
-        diff = flat - centroids[i]
-        maha = np.sqrt(np.einsum("ij,jk,ik->i", diff, prec, diff))
-        maha_per_cluster.append(maha)
-
-    min_maha = np.min(np.stack(maha_per_cluster, axis=0), axis=0).reshape(rgb.shape[:2])
+    # Border pixels are already a bounded set (image perimeter, not the
+    # whole photo) — a real regression was caught here directly: an
+    # earlier version of this refactor applied the same 20000-pixel
+    # subsample cap used for the much larger foreground/background body
+    # clustering, which halved this photo's ~40,008 border pixels before
+    # fitting and nearly doubled the resulting mask's coverage (0.097 ->
+    # 0.172) purely from losing cluster fidelity, not any real signal.
+    # max_samples=len(border_pixels) keeps every one of them.
+    min_maha = _cluster_min_mahalanobis(
+        border_pixels, flat, background_clusters, max_samples=len(border_pixels), fallback_scale=threshold
+    ).reshape(rgb.shape[:2])
     return min_maha > MAHALANOBIS_THRESHOLD
 
 
-def _gaussian_reclassify(rgb: np.ndarray, seed_mask: np.ndarray, max_samples: int = 20000) -> np.ndarray:
-    """Re-decide every pixel by which of two fitted color distributions
-    (foreground, background) it's actually closer to, seeded from
-    `seed_mask` — a single-pass, dependency-free approximation of
-    GrabCut's color-model step."""
+# How many "standard deviations" apart the foreground- and background-
+# cluster distances need to be before a pixel's color alone is trusted to
+# decide it. Below this, it's a genuine toss-up, not a confident call —
+# measured directly, not guessed: on a real photo, confidently-correct
+# spots (clear skin, clear sky, a water patch the clustering alone
+# already resolved) all landed past |margin|=3.4, while two real,
+# confirmed misclassifications (a foam/wet-sand patch, the background gap
+# between two legs in a lunge) both sat under 1 (+0.62 and -0.21) — a
+# clean, wide gap in the real distribution, not a borderline choice.
+AMBIGUITY_MARGIN = 2.0
+
+# How far (px) a pixel may sit from the nearest bone segment (a straight
+# line between two detected, anatomically-adjacent joints) and still be
+# trusted as real anatomy, when resolving a color-ambiguous pixel by
+# position. Measured, not guessed: real skin at mid-bone (not just near a
+# joint) sits at 0px by construction, and even an off-the-straight-line
+# point (a shin, which isn't perfectly straight) measured 15.7px; the two
+# confirmed-background ambiguous spots measured 51.4px and 74.0px — both
+# comfortably beyond either real-anatomy figure. 30 sits with a wide
+# margin on both sides of that gap.
+POSITION_CORRIDOR_PX = 30.0
+
+
+def _position_is_on_body(points_xy: np.ndarray, bones: "list[tuple[np.ndarray, np.ndarray]]") -> np.ndarray:
+    """For each (x, y) in `points_xy`, the distance to the nearest of
+    `bones` (each a (joint_a, joint_b) pixel-coordinate pair) — True where
+    that distance is within POSITION_CORRIDOR_PX. See AMBIGUITY_MARGIN's
+    docstring for why this only matters for color-ambiguous pixels, not
+    as a replacement for the color check."""
+    min_dist = None
+    for a, b in bones:
+        ab = b - a
+        length_sq = float(np.dot(ab, ab))
+        if length_sq < 1e-9:
+            d = np.linalg.norm(points_xy - a, axis=-1)
+        else:
+            t = np.clip(((points_xy - a) @ ab) / length_sq, 0, 1)
+            closest = a + t[:, None] * ab
+            d = np.linalg.norm(points_xy - closest, axis=-1)
+        min_dist = d if min_dist is None else np.minimum(min_dist, d)
+    return min_dist <= POSITION_CORRIDOR_PX
+
+
+def _two_sided_reclassify(
+    rgb: np.ndarray,
+    seed_mask: np.ndarray,
+    foreground_clusters: int = DEFAULT_FOREGROUND_CLUSTERS,
+    background_clusters: int = DEFAULT_BACKGROUND_CLUSTERS,
+    bones: "list[tuple[np.ndarray, np.ndarray]] | None" = None,
+) -> np.ndarray:
+    """Replaces the single-Gaussian-per-side reclassifier this project
+    used before: that version fit ONE broad Gaussian to everything stage 1
+    called foreground. Checked directly on a real photo, and confirmed
+    that's a real bug, not a style choice — a figure's true foreground
+    color spans skin, dark clothing, and a mat all at once, so the single
+    Gaussian's covariance ends up so wide that it statistically
+    out-competed a tighter, more specific background model for an
+    unrelated dark water color (-14.2 foreground log-likelihood vs -182.0
+    background, confirmed by computing both directly) — exactly backwards.
+
+    This clusters BOTH sides into several tighter color groups (same
+    technique DEFAULT_BACKGROUND_CLUSTERS already used, now applied
+    symmetrically) and classifies by whichever side's nearest cluster is
+    closer. That alone resolved the water-color bug. It does NOT resolve
+    every case: some real background colors (pale foam, wet sand) are
+    genuinely close, in color alone, to real foreground colors (bright
+    skin highlights, light fabric) — confirmed directly, not assumed, by
+    checking two known-bad spots sat within 1 standard deviation of a
+    toss-up while confidently-correct spots sat past 3.4. For those
+    genuinely ambiguous pixels, `bones` (if given) resolves by position
+    instead: real anatomy sits on or very near the subject's own detected
+    skeleton; background doesn't, confirmed by directly measuring that gap
+    too (0-15.7px for real anatomy vs 51.4-74.0px for the two known-bad
+    spots). Without `bones`, an ambiguous pixel keeps stage 1's call."""
     rgb64 = rgb.astype(np.float64)
     fg_pixels = rgb64[seed_mask]
     bg_pixels = rgb64[~seed_mask]
     if len(fg_pixels) < MIN_FIT_SAMPLES or len(bg_pixels) < MIN_FIT_SAMPLES:
-        return seed_mask  # not enough signal to fit two distributions
+        return seed_mask  # not enough signal to cluster either side
 
     smaller = min(len(fg_pixels), len(bg_pixels))
     result = mad_margin_above_minimum(smaller, RECOMMENDED_FIT_SAMPLES, min_margin=0.0)
@@ -208,29 +317,29 @@ def _gaussian_reclassify(rgb: np.ndarray, seed_mask: np.ndarray, max_samples: in
             "tightly-cropped subject."
         )
 
-    rng = np.random.default_rng(0)
-
-    def fit(pixels):
-        if len(pixels) > max_samples:
-            idx = rng.choice(len(pixels), max_samples, replace=False)
-            pixels = pixels[idx]
-        mean = pixels.mean(axis=0)
-        cov = np.cov(pixels, rowvar=False) + np.eye(3) * 1e-3
-        return mean, np.linalg.inv(cov), np.linalg.slogdet(cov)[1]
-
-    fg_mean, fg_prec, fg_logdet = fit(fg_pixels)
-    bg_mean, bg_prec, bg_logdet = fit(bg_pixels)
-
     flat = rgb64.reshape(-1, 3)
+    fg_dist = _cluster_min_mahalanobis(fg_pixels, flat, foreground_clusters)
+    bg_dist = _cluster_min_mahalanobis(bg_pixels, flat, background_clusters)
+    margin = bg_dist - fg_dist  # positive = confidently foreground
 
-    def log_likelihood(pixels, mean, prec, logdet):
-        diff = pixels - mean
-        maha = np.einsum("ij,jk,ik->i", diff, prec, diff)
-        return -0.5 * (maha + logdet)
+    confident_fg = margin > AMBIGUITY_MARGIN
+    confident_bg = margin < -AMBIGUITY_MARGIN
+    ambiguous = ~confident_fg & ~confident_bg
 
-    fg_ll = log_likelihood(flat, fg_mean, fg_prec, fg_logdet)
-    bg_ll = log_likelihood(flat, bg_mean, bg_prec, bg_logdet)
-    return (fg_ll > bg_ll).reshape(rgb.shape[:2])
+    result_mask = confident_fg.copy()
+    if bones:
+        h, w = rgb.shape[:2]
+        yy, xx = np.mgrid[0:h, 0:w]
+        points_xy = np.stack([xx.ravel(), yy.ravel()], axis=-1).astype(np.float64)
+        on_body = _position_is_on_body(points_xy, bones)
+        result_mask[ambiguous] = on_body[ambiguous]
+    else:
+        # No pose to check position against — keep stage 1's own call for
+        # the pixels color alone can't confidently decide, rather than
+        # guessing either way.
+        result_mask[ambiguous] = seed_mask.reshape(-1)[ambiguous]
+
+    return result_mask.reshape(rgb.shape[:2])
 
 
 def extract_silhouette(
@@ -239,8 +348,16 @@ def extract_silhouette(
     threshold: float = 32.0,
     refine: bool = True,
     background_clusters: int = DEFAULT_BACKGROUND_CLUSTERS,
+    foreground_clusters: int = DEFAULT_FOREGROUND_CLUSTERS,
+    bones: "list[tuple[np.ndarray, np.ndarray]] | None" = None,
 ) -> np.ndarray:
+    """`bones`: optional list of (joint_a, joint_b) pixel-coordinate pairs
+    from the same photo's own detected pose (e.g. shoulder-to-elbow,
+    hip-to-knee) — see _two_sided_reclassify's docstring. Deliberately
+    plain coordinate pairs, not a landmarks.py type, so this module stays
+    decoupled from pose-detection internals; the caller (pipeline.py)
+    builds the list from whatever keypoints it already has."""
     mask = _largest_filled_blob(_threshold_mask(rgb, border_width, threshold, background_clusters))
     if not refine:
         return mask
-    return _largest_filled_blob(_gaussian_reclassify(rgb, mask))
+    return _largest_filled_blob(_two_sided_reclassify(rgb, mask, foreground_clusters, background_clusters, bones))

@@ -14,6 +14,31 @@ from .silhouette import extract_silhouette
 from .visual_hull import SilhouetteView, carve_visual_hull
 
 
+# Anatomically-adjacent joint pairs — the straight-line bone segments
+# silhouette.py's two-sided reclassify checks a color-ambiguous pixel's
+# position against (see its `bones` param and POSITION_CORRIDOR_PX).
+# Plain coordinate pairs, not landmark names, cross that module boundary,
+# keeping silhouette.py itself free of any pose-detection-specific types.
+_BONE_JOINT_PAIRS = [
+    ("left_shoulder", "left_elbow"), ("left_elbow", "left_wrist"),
+    ("right_shoulder", "right_elbow"), ("right_elbow", "right_wrist"),
+    ("left_hip", "left_knee"), ("left_knee", "left_ankle"),
+    ("right_hip", "right_knee"), ("right_knee", "right_ankle"),
+    ("left_shoulder", "right_shoulder"), ("left_hip", "right_hip"),
+    ("left_shoulder", "left_hip"), ("right_shoulder", "right_hip"),
+    ("nose", "left_shoulder"), ("nose", "right_shoulder"),
+]
+
+
+def _bone_list(keypoints) -> List[tuple]:
+    joints = keypoints.joints
+    return [
+        (np.array(joints[a][:2]), np.array(joints[b][:2]))
+        for a, b in _BONE_JOINT_PAIRS
+        if a in joints and b in joints
+    ]
+
+
 def _default_angles(n: int) -> List[float]:
     """Calibrated against an analytic ellipsoid with known ground-truth
     volume (depth axis deliberately the shape's short axis, so depth
@@ -99,7 +124,7 @@ def run_pipeline(
             # — required for the silhouette mask and the joint positions
             # to share one coordinate system (see build_body_mesh).
             silhouette_rgb = load_image_rgb(paths[0]).rgb
-            silhouette_mask = extract_silhouette(silhouette_rgb)
+            silhouette_mask = extract_silhouette(silhouette_rgb, bones=_bone_list(keypoints))
         except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
             print(f"Note: silhouette-based shape refinement failed ({exc}); using generic proportions.")
             silhouette_mask = None
