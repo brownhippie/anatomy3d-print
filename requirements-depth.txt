@@ -1,0 +1,6 @@
+# Optional extras for depth_source.py's real per-pixel depth sculpting
+# (procedural_body.py's depth_rgb / pipeline.py's use_depth). NOT needed
+# for the default pipeline — see README.md.
+-r requirements.txt
+torch>=2.0
+transformers>=4.40

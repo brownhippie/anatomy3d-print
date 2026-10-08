@@ -16,8 +16,11 @@ This trades realism for being entirely free of third-party model weights
 or training data licensing — everything here is either measured directly
 from the input photo or a well-known, unencumbered formula.
 """
+from typing import Optional
+
 import numpy as np
 import trimesh
+from scipy.ndimage import map_coordinates
 from skimage.measure import marching_cubes
 
 from .landmarks import DetectedKeypoints
@@ -176,12 +179,71 @@ def _build_capsules(joints: dict) -> list:
     return capsules
 
 
+def _sculpt_front_surface_from_depth(
+    verts: np.ndarray, image_width: int, image_height: int, rgb: np.ndarray, strength: float
+) -> np.ndarray:
+    """Optional refinement: push the front half-surface (z > 0, in this
+    module's convention — see build_body_mesh) in or out based on a real
+    per-pixel depth estimate, instead of leaving it at the capsule's flat
+    symmetric guess. The back half (z < 0) is left untouched — we have no
+    photo information about it either way.
+
+    Requires `anatomy3d.depth_source` (optional extra, see
+    requirements-depth.txt); raises a clear error if it's not installed
+    rather than silently no-op'ing, since a caller that explicitly asked
+    for depth sculpting should know it didn't happen.
+    """
+    from .depth_source import estimate_relative_depth
+
+    depth = estimate_relative_depth(rgb)
+    depth_h, depth_w = depth.shape
+
+    front = verts[:, 2] > 0
+    if not front.any():
+        return verts
+
+    px = verts[front, 0] + image_width / 2.0
+    py = image_height / 2.0 - verts[front, 1]
+    # map_coordinates wants (row, col) = (py, px), scaled to the depth
+    # map's own resolution if it differs from the source photo's.
+    row = np.clip(py * (depth_h / image_height), 0, depth_h - 1)
+    col = np.clip(px * (depth_w / image_width), 0, depth_w - 1)
+    sampled = map_coordinates(depth, [row, col], order=1, mode="nearest")
+
+    mean, std = sampled.mean(), sampled.std()
+    if std < 1e-9:
+        return verts  # flat/uninformative depth map — leave the guess alone
+    d_norm = (sampled - mean) / std
+
+    # Displacement scales with each vertex's own distance from the
+    # centerline (a proxy for local body-part radius): a thin forearm
+    # shifts subtly, a thick torso can shift more, and the effect tapers
+    # to ~0 at the silhouette edge (z near 0) instead of cutting off
+    # sharply. ASSUMES higher depth value = closer to camera — not yet
+    # checked against a real photo in this project (torch wasn't
+    # available to test with at the time this was written). If sculpted
+    # figures come out concave where they should be convex (e.g. a nose
+    # pushed in instead of out), this sign is inverted; flip it here.
+    verts = verts.copy()
+    disp = d_norm * strength * verts[front, 2]
+    new_z = verts[front, 2] + disp
+    verts[front, 2] = np.maximum(new_z, verts[front, 2] * 0.15)  # never cross the centerline
+    return verts
+
+
 def build_body_mesh(
     keypoints: DetectedKeypoints,
     target_height_mm: float = 150.0,
     grid_resolution: int = 190,
     blend_k_frac: float = 0.35,
+    depth_rgb: Optional[np.ndarray] = None,
+    depth_strength: float = 0.5,
 ) -> BodyMesh:
+    """`depth_rgb`: the same preprocessed photo passed to pose detection.
+    When given, sculpts the front surface using real per-pixel depth
+    (anatomy3d.depth_source, optional extra) instead of the flat
+    symmetric-thickness guess. Leave as None for the default, dependency-
+    free behavior."""
     joints = _to_local_xy(keypoints)
     capsules = _build_capsules(joints)
 
@@ -238,6 +300,13 @@ def build_body_mesh(
     if len(components) > 1:
         mesh = max(components, key=lambda c: c.vertices.shape[0])
     verts, faces = mesh.vertices, mesh.faces
+
+    if depth_rgb is not None:
+        # Before scaling: the pixel<->local-coordinate mapping this uses
+        # is only valid in this unscaled space (see _to_local_xy).
+        verts = _sculpt_front_surface_from_depth(
+            verts, keypoints.image_width, keypoints.image_height, depth_rgb, depth_strength
+        )
 
     height = verts[:, 1].max() - verts[:, 1].min()
     scale = target_height_mm / height if height > 1e-6 else 1.0

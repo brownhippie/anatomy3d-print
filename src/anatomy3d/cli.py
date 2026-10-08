@@ -31,6 +31,13 @@ def main():
         default=150.0,
         help="Target print height in millimeters (default: 150).",
     )
+    parser.add_argument(
+        "--use-depth",
+        action="store_true",
+        help="Single-photo mode only: sculpt the front surface with real per-pixel depth "
+        "(Depth Anything V2 Small) instead of the flat symmetric guess. Needs "
+        "`pip install -r requirements-depth.txt`.",
+    )
     args = parser.parse_args()
 
     run_pipeline(
@@ -38,6 +45,7 @@ def main():
         out_stl_path=args.out,
         target_height_mm=args.height_mm,
         angles_deg=args.angles,
+        use_depth=args.use_depth,
     )
 
 

@@ -35,6 +35,7 @@ def run_pipeline(
     out_stl_path: str,
     target_height_mm: float = 150.0,
     angles_deg: Optional[List[float]] = None,
+    use_depth: bool = False,
 ) -> None:
     """One photo -> the capsule/SDF body builder (a geometric guess).
     Two or more photos (different angles around the subject) -> visual hull
@@ -43,6 +44,14 @@ def run_pipeline(
     angles in the order the photos are given (front first), matching a
     turntable-style capture; pass explicit angles if you shot something
     else.
+
+    `use_depth`: single-photo mode only. Sculpts the front surface using
+    real per-pixel depth (Depth Anything V2 Small, see depth_source.py)
+    instead of the flat symmetric-thickness guess. Opt-in and off by
+    default, same as the SMPL-X path — it's a real, sizeable extra
+    dependency (torch + transformers), not something that should change
+    behavior just because it happens to be installed in a given
+    environment. Requires `pip install -r requirements-depth.txt`.
     """
     os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
 
@@ -52,7 +61,10 @@ def run_pipeline(
 
     if len(paths) == 1:
         keypoints = detect_pose_landmarks(paths[0])
-        body = build_body_mesh(keypoints, target_height_mm=target_height_mm)
+        depth_rgb = None
+        if use_depth:
+            depth_rgb = load_image_rgb(paths[0], max_dimension=None).rgb
+        body = build_body_mesh(keypoints, target_height_mm=target_height_mm, depth_rgb=depth_rgb)
     else:
         if angles_deg is None:
             angles_deg = _default_angles(len(paths))

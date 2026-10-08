@@ -23,6 +23,8 @@ INDEX_HTML = """
   <form action="/fit" method="post" enctype="multipart/form-data">
     <input type="file" name="images" accept="image/*" required multiple><br><br>
     <label>Height (mm): <input type="number" name="height_mm" value="150" min="20" max="1000"></label><br><br>
+    <label><input type="checkbox" name="use_depth" value="true"> Use real depth estimation
+    (single photo only — needs the server's optional depth extras installed)</label><br><br>
     <button type="submit">Generate model</button>
   </form>
 </body>
@@ -41,7 +43,11 @@ def health():
 
 
 @app.post("/fit")
-async def fit(images: List[UploadFile] = File(...), height_mm: float = Form(150.0)):
+async def fit(
+    images: List[UploadFile] = File(...),
+    height_mm: float = Form(150.0),
+    use_depth: bool = Form(False),
+):
     with tempfile.TemporaryDirectory() as tmp:
         image_paths = []
         for i, image in enumerate(images):
@@ -52,7 +58,7 @@ async def fit(images: List[UploadFile] = File(...), height_mm: float = Form(150.
 
         out_stl = os.path.join(tmp, "figure.stl")
         try:
-            run_pipeline(image_paths, out_stl, target_height_mm=height_mm)
+            run_pipeline(image_paths, out_stl, target_height_mm=height_mm, use_depth=use_depth)
         except Exception as exc:
             raise HTTPException(400, str(exc)) from exc
 

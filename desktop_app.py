@@ -20,6 +20,7 @@ class App(tk.Tk):
         self.images_label = tk.StringVar(value="(none selected)")
         self.height_mm = tk.StringVar(value="150")
         self.out_path = tk.StringVar(value="output/figure.stl")
+        self.use_depth = tk.BooleanVar(value=False)
         self.log_queue = queue.Queue()
 
         self._build_ui()
@@ -46,6 +47,10 @@ class App(tk.Tk):
         row.pack(fill="x", **pad)
         ttk.Label(row, text="Height (mm):", width=12).pack(side="left")
         ttk.Entry(row, textvariable=self.height_mm, width=10).pack(side="left")
+        ttk.Checkbutton(
+            row, text="Use real depth (single photo, needs requirements-depth.txt)",
+            variable=self.use_depth,
+        ).pack(side="left", padx=10)
 
         row = ttk.Frame(self)
         row.pack(fill="x", **pad)
@@ -95,7 +100,12 @@ class App(tk.Tk):
     def _run_pipeline_thread(self):
         try:
             height = float(self.height_mm.get() or 150.0)
-            run_pipeline(self.image_paths, self.out_path.get(), target_height_mm=height)
+            run_pipeline(
+                self.image_paths,
+                self.out_path.get(),
+                target_height_mm=height,
+                use_depth=self.use_depth.get(),
+            )
             self.log_queue.put(f"Done. Wrote {self.out_path.get()}")
         except Exception as exc:  # noqa: BLE001 - surface any failure to the GUI log
             self.log_queue.put(f"Error: {exc}")
