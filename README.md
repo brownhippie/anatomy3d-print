@@ -102,6 +102,26 @@ normalization, and unsharp-mask sharpening — a soft/dim phone photo feeds
 MediaPipe and the silhouette extractor much worse edges than a crisp one,
 and this costs nothing to fix before detection runs.
 
+## Printability check (MAD margin)
+
+Every export runs a wall-thickness check before writing the STL:
+`print_prep.estimate_min_wall_thickness` samples points across the mesh
+surface and casts a ray inward from each to measure local thickness there,
+then reports the thinnest point found. That gets compared against a
+minimum printable thickness (0.8mm by default — two perimeters at a
+typical 0.4mm nozzle; tune it for your printer/material) using a MAD-style
+margin: `(actual - minimum) / minimum`, requiring at least 15% of headroom
+past the minimum, not just barely clearing it. This convention is carried
+over from unrelated research of mine on a different project (a physical
+safety margin for a laser display), adapted here — there, higher was
+dangerous (a limit not to exceed); here, lower is dangerous (a floor not
+to go under), so the margin direction is mirrored (see `safety.py`).
+
+This is a sampling-based estimate, not an exhaustive check — with a few
+thousand samples it reliably catches a broadly thin region (a whole limb),
+but could miss one single pin-thin spot the samples didn't land near.
+Still check the result in your slicer.
+
 ## Desktop app (.exe)
 
 `desktop_app.py` is a Tkinter GUI over the same pipeline — pick a photo,
@@ -193,8 +213,9 @@ src/anatomy3d/
   body_fit.py                optional: SMPL-X fitting (non-commercial license)
   mesh_types.py        shared BodyMesh type
   mesh_export.py        OBJ export
-  print_prep.py          mesh repair + STL export
-  pipeline.py              orchestration (picks capsule vs. hull by photo count)
+  safety.py              generic MAD-style margin checks
+  print_prep.py            mesh repair + wall-thickness check (safety.py) + STL export
+  pipeline.py                orchestration (picks capsule vs. hull by photo count)
   cli.py                    command-line entry point
 webapp/app.py        FastAPI web front end
 desktop_app.py       Tkinter desktop GUI (-> .exe via PyInstaller)
