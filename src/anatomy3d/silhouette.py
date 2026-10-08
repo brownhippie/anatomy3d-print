@@ -251,6 +251,33 @@ POSITION_CORRIDOR_SCALE = 2.0  # multiple of a bone's own measured half-width �
 POSITION_CORRIDOR_MIN_PX = 10.0  # floor for a degenerate/zero thickness reading (e.g. a bone sampled off the confident mask)
 POSITION_CORRIDOR_MAX_PX = 45.0  # ceiling — stays comfortably under the 51.4-74.0px the two known-bad spots measured
 
+# A real, confirmed gap the per-bone corridor above doesn't cover: it only
+# resolves color-AMBIGUOUS pixels (see AMBIGUITY_MARGIN), but a real bug was
+# found where bright wave-foam color near the subject's feet was
+# CONFIDENTLY matched to a foreground cluster (margin 2.6-6.3, i.e. not even
+# close to ambiguous) because no background cluster fit from the image
+# border represented that specific bright tone. Confirmed by distance, not
+# guessed: the foam streak's own pixels measured 60-150+ px from the
+# nearest bone segment, while every real anatomy pixel on the same photo
+# (checked across the whole subject, hair tips included) measured at most
+# 60.6px. This ceiling is a position-only sanity check — independent of
+# color — applied to EVERY foreground pixel (not just ambiguous ones):
+# anything farther than this from every bone segment is rejected regardless
+# of how confident the color match was. Deliberately much larger than
+# POSITION_CORRIDOR_MAX_PX (45px) so it only catches gross outliers like
+# this streak, never real but corridor-exceeding anatomy (hair, loose
+# clothing) — 90px was tested directly against the same real photo: zero
+# landmarks or real-subject regions lost, while a confirmed 1534px chunk of
+# the foam-streak bug was correctly removed. (An alternative fix — enriching
+# the background color-cluster fit with distant pixels instead of this flat
+# geometric check — was tried first and reverted: it also killed the foam
+# streak, but it pulled unrelated dark background tones into the same
+# k-means fit, which then started matching real dark shirt fabric too,
+# wrongly excluding 3135px of real torso that was correct before. A
+# position-only check can't have that failure mode, since it never touches
+# the color model.)
+FAR_FOREGROUND_CEILING_PX = 90.0
+
 
 def _bone_corridor_radii(
     bones: "list[tuple[np.ndarray, np.ndarray]]", dist_map: np.ndarray, n_samples: int = 5
@@ -367,6 +394,14 @@ def _two_sided_reclassify(
         points_xy = np.stack([xx.ravel(), yy.ravel()], axis=-1).astype(np.float64)
         on_body = _position_is_on_body(points_xy, bones, radii)
         result_mask[ambiguous] = on_body[ambiguous]
+        # Sanity ceiling, not a replacement for the corridor above — see
+        # FAR_FOREGROUND_CEILING_PX's docstring. Applied to every foreground
+        # pixel, confident or not, since the bug it catches (wave foam
+        # confidently matched as foreground) never even reaches `ambiguous`.
+        within_ceiling = _position_is_on_body(
+            points_xy, bones, [FAR_FOREGROUND_CEILING_PX] * len(bones)
+        )
+        result_mask &= within_ceiling
     else:
         # No pose to check position against — keep stage 1's own call for
         # the pixels color alone can't confidently decide, rather than
