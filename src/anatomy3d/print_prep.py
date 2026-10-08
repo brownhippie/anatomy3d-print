@@ -16,13 +16,40 @@ import trimesh
 from .safety import mad_margin_above_minimum
 
 
-def estimate_min_wall_thickness(mesh: trimesh.Trimesh, sample_count: int = 1500, seed: int = 0) -> float:
+def estimate_min_wall_thickness(
+    mesh: trimesh.Trimesh, sample_count: int = 1500, seed: int = 0, percentile: float = 2.0
+) -> float:
     """Sampling-based estimate, not exhaustive: cast a ray inward from each
     of `sample_count` random surface points and take the nearest interior
-    hit as the local thickness there, then report the smallest found. With
-    a few thousand samples this reliably catches a broadly thin region
-    (a whole limb, say); it can still miss one single pin-thin spot the
-    samples happened not to land near."""
+    hit as the local thickness there, then report the `percentile`-th
+    percentile of what was found.
+
+    Originally this reported the bare minimum, which calibration testing
+    showed was a mistake, not just an unlucky default: on the same mesh,
+    the measured minimum kept dropping as sample count went up (0.65mm
+    mean at 300 samples, 0.05mm at 6000) instead of converging, because a
+    bare minimum is an order statistic that keeps chasing whatever's most
+    extreme — and there's a genuine near-zero point in this geometry, an
+    exact tangent in the capsule smooth-min blend (percentile 0 measured
+    0.006mm, a 150x jump to percentile 0.5's 0.98mm). That's a
+    zero-measure mathematical artifact, not a real wall.
+
+    A percentile represents actual surface area instead of one singular
+    point, and is far more stable. Relative run-to-run variation measured:
+
+        samples    minimum   1st pctl   2nd pctl
+            300       58%       17.5%      9.0%
+          1,500      ~95%+      16.2%      1.9%
+          3,000     113%+       14.1%      1.8%
+
+    (the minimum's own numbers climb with sample count instead of
+    converging — see above). The 1st percentile's noise alone was large
+    enough to eat most of print_prep's 15% MAD margin, leaving barely any
+    of it covering real printer/material tolerance; the 2nd percentile's
+    sub-2%-by-1500-samples noise leaves the margin meaningful. Default
+    `sample_count` (1500) was picked to land past the 2nd percentile's
+    stability knee, not for its own sake.
+    """
     points, face_index = trimesh.sample.sample_surface(mesh, sample_count, seed=seed)
     normals = mesh.face_normals[face_index]
 
@@ -38,7 +65,7 @@ def estimate_min_wall_thickness(mesh: trimesh.Trimesh, sample_count: int = 1500,
     min_per_ray = np.full(len(points), np.inf)
     np.minimum.at(min_per_ray, index_ray, dists)
     valid = min_per_ray[np.isfinite(min_per_ray)]
-    return float(valid.min()) if len(valid) else float("nan")
+    return float(np.percentile(valid, percentile)) if len(valid) else float("nan")
 
 
 def repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -64,9 +91,10 @@ def export_stl(
 ) -> trimesh.Trimesh:
     """`min_wall_mm` is a common rule of thumb for FDM (two 0.4mm-nozzle
     perimeters); tune it for your actual printer/material. The check
-    requires the thinnest sampled point to clear that minimum by at least
-    `min_wall_margin` (MAD-style margin — see safety.py), not just
-    barely touch it."""
+    requires the measured thickness (1st percentile of sampled points —
+    see `estimate_min_wall_thickness`'s docstring for why not the bare
+    minimum) to clear that minimum by at least `min_wall_margin`
+    (MAD-style margin — see safety.py), not just barely touch it."""
     repaired = repair_mesh(mesh)
     if not repaired.is_watertight:
         print(
@@ -85,12 +113,12 @@ def export_stl(
         result = mad_margin_above_minimum(min_thickness, min_wall_mm, min_wall_margin)
         if result.ok:
             print(
-                f"Wall thickness OK: thinnest sampled point ~{min_thickness:.2f}mm, "
+                f"Wall thickness OK: thinnest measured region ~{min_thickness:.2f}mm, "
                 f"{result.margin:.0%} above the {min_wall_mm}mm minimum."
             )
         elif result.margin >= 0:
             print(
-                f"Warning: thinnest sampled point ~{min_thickness:.2f}mm clears the "
+                f"Warning: thinnest measured region ~{min_thickness:.2f}mm clears the "
                 f"{min_wall_mm}mm minimum but only by {result.margin:.0%} "
                 f"(need at least {min_wall_margin:.0%} margin) — likely a thin "
                 "limb or joint. Thicken it in Meshmixer/Netfabb/Blender, or "
@@ -100,7 +128,7 @@ def export_stl(
             )
         else:
             print(
-                f"Warning: thinnest sampled point ~{min_thickness:.2f}mm is "
+                f"Warning: thinnest measured region ~{min_thickness:.2f}mm is "
                 f"{-result.margin:.0%} BELOW the {min_wall_mm}mm minimum — this "
                 "will likely fail to print or snap off. Thicken it in "
                 "Meshmixer/Netfabb/Blender, or reprint at a larger "

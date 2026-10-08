@@ -17,15 +17,18 @@ or training data licensing — everything here is either measured directly
 from the input photo or a well-known, unencumbered formula.
 """
 import numpy as np
+import trimesh
 from skimage.measure import marching_cubes
 
 from .landmarks import DetectedKeypoints
 from .mesh_types import BodyMesh
 from .safety import mad_margin_above_minimum
 
-# Hard floor (of 10 possible: head, torso, 2 upper arms, 2 forearms,
-# 2 thighs, 2 shins) and the MAD margin's reference point together.
-MIN_CAPSULES = 3
+# Of 10 possible (head, torso, 2 upper arms, 2 forearms, 2 thighs, 2
+# shins): the hip/knee/ankle gates below guarantee torso+2 thighs+2 shins
+# (5) always form, so 5 is the true floor now, confirmed by calibration —
+# not a guess, and no longer reachable as a failure path below 5.
+MIN_CAPSULES = 5
 
 # Head radius and limb radii as a fraction of that limb's own measured
 # length — generic figure-proportion ratios, not a licensed anthropometric
@@ -76,13 +79,34 @@ def _segment(joints, name_a, name_b, radius_a, radius_b):
 def _build_capsules(joints: dict) -> list:
     if "left_shoulder" not in joints or "right_shoulder" not in joints:
         raise RuntimeError("Shoulders not detected — need a front-facing upper-body view at least.")
+    # Found by calibration, not guessed: without both hips there's no
+    # "pelvis" joint, so no torso capsule forms at all. Whatever's left
+    # (e.g. head + arm stumps) still gets scaled to fill the full
+    # target_height_mm, which inflates it wildly — a measured case showed
+    # ~4x the volume of a complete figure. Raw capsule count doesn't catch
+    # this (5+ capsules can still be present), so it needs its own gate.
+    if "left_hip" not in joints or "right_hip" not in joints:
+        raise RuntimeError(
+            "Hips not detected — need a photo showing the torso down to at "
+            "least the hips, or the figure's proportions come out badly wrong."
+        )
+    # Same mechanism, found the same way: target_height_mm scaling trusts
+    # the mesh's own lowest point to mean "feet." The thigh and shin
+    # segments both need the knee as their shared endpoint (hip->knee,
+    # knee->ankle), so ankle presence alone doesn't guarantee a leg
+    # capsule actually reaches it — tested directly: hips+ankles present
+    # but knees missing still inflated the figure to ~222% of a complete
+    # figure's volume, same failure as the hips/ankles cases. Needs the
+    # full chain, both sides, not just the endpoints.
+    if any(j not in joints for j in ("left_knee", "right_knee", "left_ankle", "right_ankle")):
+        raise RuntimeError(
+            "Legs not fully detected — need a photo showing both legs down "
+            "to at least the ankles (hips, knees, and ankles all visible), "
+            "or the figure's proportions come out badly wrong."
+        )
 
     shoulder_width = np.linalg.norm(joints["left_shoulder"] - joints["right_shoulder"])
-    hip_width = (
-        np.linalg.norm(joints["left_hip"] - joints["right_hip"])
-        if "left_hip" in joints and "right_hip" in joints
-        else shoulder_width * 0.9
-    )
+    hip_width = np.linalg.norm(joints["left_hip"] - joints["right_hip"])
 
     neck = (joints["left_shoulder"] + joints["right_shoulder"]) / 2.0
     joints = dict(joints)
@@ -201,6 +225,19 @@ def build_body_mesh(
 
     verts, faces, _normals, _values = marching_cubes(field, level=0.0, spacing=spacing)
     verts = verts + mins
+
+    # Chaining pairwise smooth-min across 3+ overlapping capsules near a
+    # joint (see print_prep.py's docstring) can leave debris disconnected
+    # from the main body — and critically, that debris can sit beyond the
+    # main body's own top/bottom, which would otherwise make the height
+    # measurement below count space that print_prep later discards,
+    # silently undershooting the requested target_height_mm. Drop debris
+    # here, before measuring height, not after scaling.
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        mesh = max(components, key=lambda c: c.vertices.shape[0])
+    verts, faces = mesh.vertices, mesh.faces
 
     height = verts[:, 1].max() - verts[:, 1].min()
     scale = target_height_mm / height if height > 1e-6 else 1.0

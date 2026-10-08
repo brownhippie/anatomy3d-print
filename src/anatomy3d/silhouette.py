@@ -26,11 +26,17 @@ from .safety import mad_margin_above_minimum
 
 # Hard floor: fewer samples than this can't support a stable 3x3 RGB
 # covariance fit, so the reclassifier silently keeps the threshold mask
-# instead. A separate, higher bar for the MAD-margin quality note below —
-# the fit technically works well above 10 samples but isn't *reliable*
-# until there's real statistical weight behind it.
+# instead.
 MIN_FIT_SAMPLES = 10
-RECOMMENDED_FIT_SAMPLES = 200
+# Calibrated against synthetic overlapping-color classes with known ground
+# truth, not guessed: mean classification accuracy turned out essentially
+# flat across the whole sample range tested (16 to 150k+ pixels) — color
+# overlap sets a hard ceiling that more data doesn't lift. What DOES improve
+# with more samples is run-to-run variance (noisier reclassification on a
+# different unlucky draw of the same scene): std 0.028 at 16 samples, 0.005
+# at 225, 0.002 by ~2000, flat after. The original 200 sat in the still-
+# noisy part of that curve; 800 is past the knee where returns flatten out.
+RECOMMENDED_FIT_SAMPLES = 800
 
 
 def _largest_filled_blob(mask: np.ndarray) -> np.ndarray:

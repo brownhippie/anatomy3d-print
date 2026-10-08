@@ -21,7 +21,8 @@ def main():
         nargs="+",
         default=None,
         help="Rotation angle in degrees for each --image, same order. Only used with 2+ images. "
-        "Defaults to front+side (0, 90) for two images, evenly spaced for three or more.",
+        "Defaults to front+side (0, 90) for two images, front+both sides (0, 90, 270) "
+        "for three, evenly spaced for four or more.",
     )
     parser.add_argument("--out", required=True, help="Output STL path.")
     parser.add_argument(

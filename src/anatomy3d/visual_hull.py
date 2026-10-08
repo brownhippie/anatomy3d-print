@@ -13,6 +13,7 @@ intersection.
 from dataclasses import dataclass
 
 import numpy as np
+import trimesh
 from scipy import ndimage
 from skimage.measure import marching_cubes
 
@@ -121,6 +122,15 @@ def carve_visual_hull(
     spacing = (grid_extent / (n - 1),) * 3
     verts, faces, _normals, _values = marching_cubes(field, level=0.5, spacing=spacing)
     verts = verts - (1.0 + margin)  # back to world coordinates
+
+    # Same reasoning as procedural_body.py: drop debris before measuring
+    # height, so a stray fragment beyond the main body's real extent can't
+    # silently undershoot target_height_mm once print_prep discards it.
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        mesh = max(components, key=lambda c: c.vertices.shape[0])
+    verts, faces = mesh.vertices, mesh.faces
 
     height = verts[:, 1].max() - verts[:, 1].min()
     scale = target_height_mm / height if height > 1e-6 else 1.0
