@@ -324,12 +324,26 @@ the release if triggered by a tag.
 
 ## Web app / Railway deployment
 
-`webapp/app.py` is a small FastAPI front end: upload a photo, get back an
-STL. Run it locally with:
+`webapp/app.py` is a FastAPI front end: upload photos, and it generates
+the model server-side, then shows the *actual result* in an interactive
+3D preview (three.js, the model sitting on a ground plane with orbit
+controls) before you download anything — not just a bare file handoff.
+The pipeline's own messages (wall-thickness checks, face-detail warnings)
+show up as readable cards in the page instead of only ever reaching a
+server log. Run it locally with:
 
 ```bash
 uvicorn app:app --app-dir webapp --reload
 ```
+
+Then open `http://localhost:8000`. `webapp/static/vendor/three/` vendors
+three.js directly (MIT licensed, fetched via npm and version-pinned)
+rather than loading it from a CDN at runtime, so the deployment has no
+external JS dependency to go down.
+
+`/api/generate` (used by the preview UI) returns JSON with a preview URL
+and mesh stats; `/fit` is still there as a direct-download endpoint for
+scripting/curl use, same as before.
 
 The included `Dockerfile` and `railway.toml` deploy as-is on Railway —
 no license-gated files to host or inject, since the default pipeline
