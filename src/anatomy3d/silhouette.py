@@ -169,6 +169,51 @@ def _cluster_min_mahalanobis(
     return np.min(np.stack(dists), axis=0)
 
 
+# How many MADs (median absolute deviations) a border strip's own median
+# color may sit from the other three strips' consensus before it's treated
+# as contaminated by the subject rather than real background. A real,
+# confirmed failure mode, not hypothetical: on a tightly-cropped portrait
+# where the subject's dark blazer extends to the bottom edge of the frame,
+# the bottom border strip measured 53% dark pixels (vs 0% on the other
+# three sides) and its median sat 58-63 MADs from the other strips'
+# consensus — nowhere near a real background's natural side-to-side
+# variation (the same photo's three honest strips sat within 1.3 MADs of
+# each other). That contaminated strip, left in, fit one of the background
+# k-means clusters to the subject's own clothing color, which then
+# wrongly matched that same clothing color everywhere else in the photo
+# too. 4.0 MADs comfortably separates the two: nowhere near the 1.3 a
+# clean strip measured, nowhere near the 58+ a contaminated one did.
+BORDER_STRIP_CONTAMINATION_MADS = 4.0
+
+
+def _clean_border_pixels(rgb: np.ndarray, border_width: int) -> np.ndarray:
+    """The border-strip background sample assumes all four image edges
+    show only background — true for a subject comfortably inside the
+    frame, false whenever a photo is cropped tight enough that the
+    subject itself touches an edge (common for headshots/portraits). Each
+    of the 4 strips is checked against the other three's consensus median
+    (robust to one bad strip, since at most 1 of 4 being contaminated
+    still leaves a majority); a strip whose own median is a gross outlier
+    gets dropped entirely rather than letting it corrupt the shared
+    k-means fit. See BORDER_STRIP_CONTAMINATION_MADS for the real
+    measurement behind the cutoff."""
+    strips = {
+        "top": rgb[:border_width].reshape(-1, 3),
+        "bottom": rgb[-border_width:].reshape(-1, 3),
+        "left": rgb[:, :border_width].reshape(-1, 3),
+        "right": rgb[:, -border_width:].reshape(-1, 3),
+    }
+    medians = {k: np.median(v, axis=0) for k, v in strips.items()}
+    all_medians = np.stack(list(medians.values()))
+    consensus = np.median(all_medians, axis=0)
+    mad = np.median(np.abs(all_medians - consensus), axis=0) + 1e-6
+    kept = [v for k, v in strips.items() if not (np.abs(medians[k] - consensus) / mad > BORDER_STRIP_CONTAMINATION_MADS).any()]
+    # If 2+ strips disagree this sharply, the border itself isn't a
+    # trustworthy background sample at all (not just one contaminated
+    # side) — fall back to using all of it rather than guessing further.
+    return np.concatenate(kept) if len(kept) >= 2 else np.concatenate(list(strips.values()))
+
+
 def _threshold_mask(
     rgb: np.ndarray, border_width: int = 12, threshold: float = 32.0, background_clusters: int = DEFAULT_BACKGROUND_CLUSTERS
 ) -> np.ndarray:
@@ -205,12 +250,7 @@ def _threshold_mask(
     distinct background tones just subdivides a tone that's already
     well-fit, not a number picked by feel), not a guess. See
     DEFAULT_BACKGROUND_CLUSTERS."""
-    border_pixels = np.concatenate([
-        rgb[:border_width].reshape(-1, 3),
-        rgb[-border_width:].reshape(-1, 3),
-        rgb[:, :border_width].reshape(-1, 3),
-        rgb[:, -border_width:].reshape(-1, 3),
-    ]).astype(np.float64)
+    border_pixels = _clean_border_pixels(rgb, border_width).astype(np.float64)
 
     flat = rgb.astype(np.float64).reshape(-1, 3)
     # Border pixels are already a bounded set (image perimeter, not the
