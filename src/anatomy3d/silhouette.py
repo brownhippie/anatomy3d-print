@@ -633,7 +633,63 @@ def extract_silhouette(
     unavailable (no network on first run to fetch it, or an unreadable
     photo), same as every other optional-model step in this project
     (detect_hair_mask, detect_face_landmarks): a failed bonus feature
-    degrades, it doesn't fail the run."""
+    degrades, it doesn't fail the run.
+
+    Every path through this function ends with a sanity check
+    (MIN_SUBJECT_BBOX_HEIGHT_FRAC) before returning — see that constant's
+    docstring for why: a subject too small in frame breaks ALL of this
+    module's methods, not just one, and the single-photo pipeline
+    (pipeline.py) already fails loudly before reaching this function in
+    that case via detect_pose_landmarks' own "No person detected" check —
+    but the multi-photo visual-hull path calls this directly with no such
+    guard, and was confirmed to silently return a near-empty, wrong mask
+    rather than an honest error."""
+    mask = _extract_silhouette_unchecked(
+        rgb, border_width, threshold, refine, background_clusters, foreground_clusters, bones, body_scale_px
+    )
+    ys, xs = np.where(mask)
+    bbox_h_frac = (ys.max() - ys.min()) / rgb.shape[0] if len(ys) else 0.0
+    if bbox_h_frac < MIN_SUBJECT_BBOX_HEIGHT_FRAC:
+        raise RuntimeError(
+            f"No usable subject found — the detected region spans only {bbox_h_frac:.1%} of the "
+            f"photo's height, well under every real photo this was checked against (all measured "
+            f"60%+). The subject is likely too small/far away in this frame for any of this "
+            "module's methods to segment reliably; use a photo where the person fills more of "
+            "the frame."
+        )
+    return mask
+
+
+# Confirmed as a real, separate failure mode, not a hypothetical: a photo
+# where the real person occupies a small fraction of the frame (built by
+# padding a real photo's own edges outward, not a synthetic crop — the
+# person's actual pixel footprint shrinks the same way a genuinely
+# far-away subject's would) broke BOTH the segmentation model (most of
+# the person's own limbs never got flagged as foreground at all, not a
+# connectivity problem _clean_segmentation_mask could fix) AND pose
+# detection outright ("No person detected"). For the single-photo
+# pipeline that pose failure is already an honest, loud error — but the
+# multi-photo visual-hull path (silhouette.py is called directly, no pose
+# detection in that path at all) was confirmed to silently return a
+# 0.04%-coverage, bounding-box-height-6.9%-of-frame mask instead. Every
+# real photo this project's silhouette work has been checked against
+# measured bbox height 60%+ of frame (the 3 structurally different real
+# photos, plus a downscaled and a torso-cropped variant) — 0.15 sits with
+# wide margin under all of those and wide margin over the confirmed-broken
+# 6.9%, not a borderline split.
+MIN_SUBJECT_BBOX_HEIGHT_FRAC = 0.15
+
+
+def _extract_silhouette_unchecked(
+    rgb: np.ndarray,
+    border_width: int,
+    threshold: float,
+    refine: bool,
+    background_clusters: int,
+    foreground_clusters: int,
+    bones: "list[tuple[np.ndarray, np.ndarray]] | None",
+    body_scale_px: "float | None",
+) -> np.ndarray:
     try:
         from .person_segmenter import detect_person_mask
 
