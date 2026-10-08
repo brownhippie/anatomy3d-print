@@ -4,6 +4,12 @@ from dataclasses import dataclass
 import mediapipe as mp
 
 from .preprocess import load_image_rgb
+from .safety import mad_margin_above_minimum
+
+# Hard floor: fitting falls apart below this. Also doubles as the MAD
+# margin's reference point, so "just barely enough" (margin 0) and "not
+# enough" (raise) share one number instead of two unrelated constants.
+MIN_KEYPOINTS = 6
 
 # MediaPipe BlazePose landmark indices for the joints we fit against.
 MEDIAPIPE_JOINT_INDEX = {
@@ -51,10 +57,19 @@ def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5) -> Detec
             continue
         joints[name] = (lm.x * width, lm.y * height, lm.visibility)
 
-    if len(joints) < 6:
+    if len(joints) < MIN_KEYPOINTS:
         raise RuntimeError(
-            "Too few confident keypoints detected — use a photo where the full body "
-            "(shoulders, hips, knees) is visible and unobstructed."
+            f"Too few confident keypoints detected ({len(joints)}, need at least "
+            f"{MIN_KEYPOINTS}) — use a photo where the full body (shoulders, hips, "
+            "knees) is visible and unobstructed."
+        )
+
+    result = mad_margin_above_minimum(len(joints), MIN_KEYPOINTS, min_margin=0.3)
+    if not result.ok:
+        print(
+            f"Warning: only {len(joints)} keypoints detected, {result.margin:.0%} "
+            f"above the {MIN_KEYPOINTS}-keypoint minimum — pose estimation may be "
+            "unreliable. A clearer full-body photo will give a better result."
         )
 
     return DetectedKeypoints(image_width=width, image_height=height, joints=joints)

@@ -22,6 +22,16 @@ photos, not just clean synthetic edges.
 import numpy as np
 from scipy import ndimage
 
+from .safety import mad_margin_above_minimum
+
+# Hard floor: fewer samples than this can't support a stable 3x3 RGB
+# covariance fit, so the reclassifier silently keeps the threshold mask
+# instead. A separate, higher bar for the MAD-margin quality note below —
+# the fit technically works well above 10 samples but isn't *reliable*
+# until there's real statistical weight behind it.
+MIN_FIT_SAMPLES = 10
+RECOMMENDED_FIT_SAMPLES = 200
+
 
 def _largest_filled_blob(mask: np.ndarray) -> np.ndarray:
     labeled, n = ndimage.label(mask)
@@ -55,8 +65,18 @@ def _gaussian_reclassify(rgb: np.ndarray, seed_mask: np.ndarray, max_samples: in
     rgb64 = rgb.astype(np.float64)
     fg_pixels = rgb64[seed_mask]
     bg_pixels = rgb64[~seed_mask]
-    if len(fg_pixels) < 10 or len(bg_pixels) < 10:
+    if len(fg_pixels) < MIN_FIT_SAMPLES or len(bg_pixels) < MIN_FIT_SAMPLES:
         return seed_mask  # not enough signal to fit two distributions
+
+    smaller = min(len(fg_pixels), len(bg_pixels))
+    result = mad_margin_above_minimum(smaller, RECOMMENDED_FIT_SAMPLES, min_margin=0.0)
+    if not result.ok:
+        print(
+            f"Note: color model fit from only {smaller} pixels of the smaller "
+            f"class, {-result.margin:.0%} below the {RECOMMENDED_FIT_SAMPLES}-pixel "
+            "comfort level — reclassification may be noisy on a small or "
+            "tightly-cropped subject."
+        )
 
     rng = np.random.default_rng(0)
 

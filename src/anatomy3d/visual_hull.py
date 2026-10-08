@@ -17,6 +17,16 @@ from scipy import ndimage
 from skimage.measure import marching_cubes
 
 from .mesh_types import BodyMesh
+from .safety import mad_margin_above_minimum
+
+# Hard mathematical floor: carving is undefined below 2 views.
+MIN_VIEWS = 2
+# A full turntable (front/side/back/other-side) is the point where more
+# views mostly add diminishing returns. Unlike the keypoint/capsule
+# checks, this is deliberately a *different*, higher number than the hard
+# floor — 2 views (front+side) is an intentionally supported mode, not a
+# degraded one, so it shouldn't trip a "barely passing" warning.
+RECOMMENDED_VIEWS = 4
 
 
 @dataclass
@@ -39,8 +49,16 @@ def carve_visual_hull(
     voxel_resolution: int = 110,
     smooth_sigma: float = 0.8,
 ) -> BodyMesh:
-    if len(views) < 2:
-        raise ValueError("Visual hull carving needs at least 2 views.")
+    if len(views) < MIN_VIEWS:
+        raise ValueError(f"Visual hull carving needs at least {MIN_VIEWS} views, got {len(views)}.")
+
+    result = mad_margin_above_minimum(len(views), RECOMMENDED_VIEWS, min_margin=0.0)
+    if not result.ok:
+        print(
+            f"Note: carving from {len(views)} view(s), {-result.margin:.0%} below the "
+            f"{RECOMMENDED_VIEWS}-view full-turntable recommendation — accuracy will "
+            "improve with more angles, especially for concave areas like armpits."
+        )
 
     bboxes = [_view_bbox(v.mask) for v in views]
 

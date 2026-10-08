@@ -21,6 +21,11 @@ from skimage.measure import marching_cubes
 
 from .landmarks import DetectedKeypoints
 from .mesh_types import BodyMesh
+from .safety import mad_margin_above_minimum
+
+# Hard floor (of 10 possible: head, torso, 2 upper arms, 2 forearms,
+# 2 thighs, 2 shins) and the MAD margin's reference point together.
+MIN_CAPSULES = 3
 
 # Head radius and limb radii as a fraction of that limb's own measured
 # length — generic figure-proportion ratios, not a licensed anthropometric
@@ -129,11 +134,21 @@ def _build_capsules(joints: dict) -> list:
         if seg:
             capsules.append(seg)
 
-    if len(capsules) < 3:
+    if len(capsules) < MIN_CAPSULES:
         raise RuntimeError(
-            "Not enough body parts detected to build a figure — use a clear, "
-            "front-facing photo showing most of the body."
+            f"Not enough body parts detected to build a figure ({len(capsules)}, "
+            f"need at least {MIN_CAPSULES}) — use a clear, front-facing photo "
+            "showing most of the body."
         )
+
+    result = mad_margin_above_minimum(len(capsules), MIN_CAPSULES, min_margin=0.3)
+    if not result.ok:
+        print(
+            f"Warning: only {len(capsules)} body parts detected, {result.margin:.0%} "
+            f"above the {MIN_CAPSULES}-part minimum — the figure will be missing "
+            "limbs or look rough. A clearer full-body photo will give a better result."
+        )
+
     return capsules
 
 

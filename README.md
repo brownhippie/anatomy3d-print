@@ -102,25 +102,40 @@ normalization, and unsharp-mask sharpening — a soft/dim phone photo feeds
 MediaPipe and the silhouette extractor much worse edges than a crisp one,
 and this costs nothing to fix before detection runs.
 
-## Printability check (MAD margin)
+## MAD margins throughout
 
-Every export runs a wall-thickness check before writing the STL:
-`print_prep.estimate_min_wall_thickness` samples points across the mesh
-surface and casts a ray inward from each to measure local thickness there,
-then reports the thinnest point found. That gets compared against a
-minimum printable thickness (0.8mm by default — two perimeters at a
-typical 0.4mm nozzle; tune it for your printer/material) using a MAD-style
-margin: `(actual - minimum) / minimum`, requiring at least 15% of headroom
-past the minimum, not just barely clearing it. This convention is carried
-over from unrelated research of mine on a different project (a physical
-safety margin for a laser display), adapted here — there, higher was
-dangerous (a limit not to exceed); here, lower is dangerous (a floor not
-to go under), so the margin direction is mirrored (see `safety.py`).
+`safety.py` holds a small MAD-style margin utility — `(actual - minimum) /
+minimum`, requiring real headroom past a limit rather than a bare pass/fail
+at the edge — carried over from unrelated research of mine on a different
+project (a physical safety margin for a laser display). There, higher was
+dangerous (a ceiling not to exceed); most limits in this pipeline are
+floors (a minimum not to go under), so `mad_margin_above_minimum` mirrors
+the formula direction; `mad_margin_below_maximum` keeps the original one.
 
-This is a sampling-based estimate, not an exhaustive check — with a few
-thousand samples it reliably catches a broadly thin region (a whole limb),
-but could miss one single pin-thin spot the samples didn't land near.
-Still check the result in your slicer.
+Every place this pipeline used to do a bare `if count < minimum: raise`
+now reports the real margin instead, warning when a hard requirement is
+only barely met even though it technically passed:
+
+- **Wall thickness** (`print_prep.py`) — `estimate_min_wall_thickness`
+  samples points across the mesh surface, casts a ray inward from each to
+  measure local thickness, and reports the thinnest point found, checked
+  against a minimum printable thickness (0.8mm default — two perimeters at
+  a typical 0.4mm nozzle). Sampling-based, not exhaustive: reliably catches
+  a broadly thin region (a whole limb) but could miss one single pin-thin
+  spot the samples didn't land near. Still check the result in your slicer.
+- **Keypoint count** (`landmarks.py`, `body_fit.py`) — how many of the
+  needed body landmarks MediaPipe actually detected with confidence.
+- **Capsule count** (`procedural_body.py`) — how many of the 10 possible
+  body-part capsules had enough keypoints to place.
+- **View count** (`visual_hull.py`) — reasoned differently from the
+  others: 2 views (front+side) is an intentionally supported mode, not a
+  degraded one, so the margin is measured against a 4-view full-turntable
+  *recommendation*, not the hard 2-view mathematical floor — otherwise
+  every 2-view run would trip a "barely passing" warning for using the
+  pipeline as designed.
+- **Color-fit sample count** (`silhouette.py`) — how many foreground/
+  background pixels the statistical reclassifier had to fit its color
+  model from.
 
 ## Desktop app (.exe)
 

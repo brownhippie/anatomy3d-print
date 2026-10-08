@@ -24,6 +24,9 @@ import torch
 
 from .landmarks import DetectedKeypoints
 from .mesh_types import BodyMesh as FittedBody
+from .safety import mad_margin_above_minimum
+
+MIN_FIT_KEYPOINTS = 6
 
 # Standard SMPL/SMPL-X body joint order (first 22 joints of the model output).
 SMPLX_JOINT_INDEX = {
@@ -46,8 +49,19 @@ SMPLX_JOINT_INDEX = {
 
 def _build_targets(keypoints: DetectedKeypoints, device: torch.device):
     names = [n for n in SMPLX_JOINT_INDEX if n in keypoints.joints]
-    if len(names) < 6:
-        raise RuntimeError("Not enough overlapping keypoints to fit a body model.")
+    if len(names) < MIN_FIT_KEYPOINTS:
+        raise RuntimeError(
+            f"Not enough overlapping keypoints to fit a body model ({len(names)}, "
+            f"need at least {MIN_FIT_KEYPOINTS})."
+        )
+
+    result = mad_margin_above_minimum(len(names), MIN_FIT_KEYPOINTS, min_margin=0.3)
+    if not result.ok:
+        print(
+            f"Warning: only {len(names)} overlapping keypoints, {result.margin:.0%} "
+            f"above the {MIN_FIT_KEYPOINTS}-keypoint minimum — the SMPL-X fit may "
+            "be unreliable."
+        )
 
     smplx_idx = torch.tensor([SMPLX_JOINT_INDEX[n] for n in names], device=device)
 
