@@ -103,6 +103,16 @@ def run_pipeline(
         except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
             print(f"Note: silhouette-based shape refinement failed ({exc}); using generic proportions.")
             silhouette_mask = None
+        if silhouette_mask is not None:
+            # Diagnostic only — not used to change the mesh yet. Measures
+            # whether this photo's own silhouette supports a symmetry-based
+            # shortcut at all (see anatomy3d.symmetry's docstring for what
+            # the IoU score means and how it was validated) and surfaces
+            # that finding instead of leaving it implicit.
+            from .symmetry import describe_symmetry_finding, find_symmetry_axis
+
+            symmetry_result = find_symmetry_axis(silhouette_mask)
+            print(describe_symmetry_finding(symmetry_result, keypoints.image_width))
         try:
             # Detected at full resolution (same reasoning as face
             # detection — hair is a small, fine-detailed region), then
