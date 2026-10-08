@@ -574,7 +574,27 @@ def extract_silhouette(
     instead of a flat pixel count to generalize across photo resolutions.
     None falls back to the flat pixel constants this was originally
     calibrated with, and also skips the COLOR_FAILURE_RATIO fallback
-    below (no scale to build a position-only mask from)."""
+    below (no scale to build a position-only mask from).
+
+    Tries a real trained person-segmentation model first (see
+    person_segmenter.py's module docstring for why: measured as strictly
+    better than everything below it on every real photo tested, including
+    the two this color/position pipeline could not handle correctly). The
+    entire rest of this function — color clustering, position corridors,
+    the COLOR_FAILURE_RATIO fallback — only runs if that model is
+    unavailable (no network on first run to fetch it, or an unreadable
+    photo), same as every other optional-model step in this project
+    (detect_hair_mask, detect_face_landmarks): a failed bonus feature
+    degrades, it doesn't fail the run."""
+    try:
+        from .person_segmenter import detect_person_mask
+
+        seg_mask = detect_person_mask(rgb)
+        if seg_mask is not None:
+            return _largest_filled_blob(seg_mask, body_scale_px)
+    except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
+        print(f"Note: ML person-segmentation failed ({exc}); falling back to the color/position classifier.")
+
     mask = _largest_filled_blob(_threshold_mask(rgb, border_width, threshold, background_clusters), body_scale_px)
 
     if bones and body_scale_px:
