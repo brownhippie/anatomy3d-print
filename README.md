@@ -65,7 +65,25 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-No model downloads, no license gate, no registration needed.
+No license gate, no registration needed — but pose detection does fetch a
+~9MB model file automatically on first run (`landmarks.py`, cached at
+`~/.cache/anatomy3d-print/`). This is MediaPipe's own official model,
+Apache-2.0 licensed like the rest of MediaPipe, from Google's model
+bucket, not something you need to register for or accept a license for —
+unlike SMPL-X, downloading it is just normal setup, not a legal step.
+
+MediaPipe's native library also needs a few system packages even for
+CPU-only use — `libgl1`, `libglib2.0-0`, `libgles2`, `libegl1` (already in
+the Dockerfile; install them yourself if running outside a container,
+e.g. `apt install libgl1 libglib2.0-0 libgles2 libegl1` on
+Debian/Ubuntu). Found by actually running real pose detection end-to-end
+in this project's dev environment, not assumed from documentation — every
+earlier test in this project had mocked MediaPipe out entirely, which is
+exactly why this was still broken: `landmarks.py` originally called
+`mediapipe.solutions.pose.Pose(...)`, an older API that plain doesn't
+exist in any current pip-installable MediaPipe build (confirmed on
+0.10.30 through 1.1.0) — only `mediapipe.tasks.python.vision`, the
+current API, which is what this module now uses.
 
 ## Usage
 
