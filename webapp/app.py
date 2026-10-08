@@ -88,6 +88,7 @@ async def api_generate(
 
     out_stl = job_dir / "model.stl"
     out_obj = job_dir / "model.obj"
+    out_glb = job_dir / "model.glb"
 
     captured = io.StringIO()
     try:
@@ -107,6 +108,7 @@ async def api_generate(
         "job_id": job_id,
         "obj_url": f"/jobs/{job_id}/model.obj",
         "stl_url": f"/jobs/{job_id}/model.stl",
+        "glb_url": f"/jobs/{job_id}/model.glb",
         "messages": messages,
         "stats": {
             "faces": int(len(mesh.faces)),
@@ -131,6 +133,14 @@ def get_stl(job_id: str):
     if not path.exists():
         raise HTTPException(404, "Not found.")
     return FileResponse(path, media_type="model/stl", filename="figure.stl")
+
+
+@app.get("/jobs/{job_id}/model.glb")
+def get_glb(job_id: str):
+    path = _job_dir(job_id) / "model.glb"
+    if not path.exists():
+        raise HTTPException(404, "Not found.")
+    return FileResponse(path, media_type="model/gltf-binary", filename="figure.glb")
 
 
 @app.post("/fit")

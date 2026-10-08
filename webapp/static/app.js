@@ -107,6 +107,10 @@ function renderMessages(messages) {
 // ---------------- three.js viewer ----------------
 
 let scene, camera, renderer, controls, currentModel, groundPlane;
+// The GLB download link (see loadModel's OBJ-based preview below) — a
+// general-purpose colored-mesh export other tools can consume, not tied
+// to any particular viewer or display feature.
+let currentGlbUrl = null;
 
 function initViewer() {
   const canvas = document.getElementById("viewer-canvas");
@@ -262,6 +266,7 @@ async function generate() {
     setStatus("ok", "Model generated.");
     renderMessages(data.messages);
     loadModel(data.obj_url);
+    currentGlbUrl = data.glb_url;
 
     statsBar.style.display = "flex";
     statsBar.innerHTML = `
@@ -272,6 +277,7 @@ async function generate() {
     downloadBar.innerHTML = `
       <a href="${data.stl_url}" download>Download STL</a>
       <a class="secondary" href="${data.obj_url}" download>Download OBJ</a>
+      <a class="secondary" href="${data.glb_url}" download>Download GLB</a>
     `;
   } catch (err) {
     setStatus("error", "Network error: " + err.message);
@@ -293,6 +299,7 @@ resetBtn.addEventListener("click", () => {
     scene.remove(currentModel);
     currentModel = null;
   }
+  currentGlbUrl = null;
   emptyState.style.display = "flex";
 });
 

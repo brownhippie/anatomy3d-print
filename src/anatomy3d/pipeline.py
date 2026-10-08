@@ -6,7 +6,7 @@ import numpy as np
 from .face_features import detect_face_landmarks
 from .hair_features import detect_hair_mask
 from .landmarks import detect_pose_landmarks
-from .mesh_export import export_obj, to_trimesh
+from .mesh_export import export_glb, export_obj, to_trimesh
 from .preprocess import load_image_rgb
 from .print_prep import export_stl
 from .procedural_body import build_body_mesh
@@ -153,7 +153,13 @@ def run_pipeline(
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
 
+    # glTF binary: a standard interchange format other tools/engines can
+    # consume, carrying the same photo-baked per-vertex colors as the OBJ
+    # (which the STL has no room for at all).
+    glb_path = os.path.splitext(out_stl_path)[0] + ".glb"
+    export_glb(body, glb_path)
+
     mesh = to_trimesh(body)
     export_stl(mesh, out_stl_path, target_faces=target_faces)
 
-    print(f"Wrote {out_stl_path} (printing) and {obj_path} (render/animation).")
+    print(f"Wrote {out_stl_path} (printing), {obj_path} (render/animation), and {glb_path} (glTF, for other tools).")
