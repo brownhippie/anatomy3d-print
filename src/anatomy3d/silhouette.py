@@ -40,6 +40,23 @@ MIN_FIT_SAMPLES = 10
 RECOMMENDED_FIT_SAMPLES = 800
 
 
+# binary_fill_holes fills every fully-enclosed background region inside
+# the blob, no matter its size — which is right for real noise (a few
+# misclassified pixels from a highlight or JPEG artifact) but wrong for a
+# real, large enclosed background region, like the triangular gap a lunge
+# or a hand-on-hip pose leaves between a limb and the torso: confirmed
+# directly on a real photo that the per-pixel color classification
+# already correctly read that gap as ~85% background (13-15% foreground,
+# matching its color sitting well within 2.4 standard deviations of a
+# real background cluster) BEFORE fill_holes ran, and blind filling then
+# overwrote that correct reading to 98.6% foreground. Real noise holes on
+# that same photo topped out at 70px; the real gap was 27,189px — a 388x
+# gap in the size distribution, not a borderline case. This fills only
+# holes at or below that size, leaving a real enclosed background region
+# alone.
+MAX_HOLE_FILL_AREA_PX = 1000
+
+
 def _largest_filled_blob(mask: np.ndarray) -> np.ndarray:
     labeled, n = ndimage.label(mask)
     if n == 0:
@@ -49,7 +66,17 @@ def _largest_filled_blob(mask: np.ndarray) -> np.ndarray:
         )
     sizes = ndimage.sum(mask, labeled, index=range(1, n + 1))
     largest = 1 + int(np.argmax(sizes))
-    return ndimage.binary_fill_holes(labeled == largest)
+    blob = labeled == largest
+
+    fully_filled = ndimage.binary_fill_holes(blob)
+    holes = fully_filled & ~blob
+    hole_labels, n_holes = ndimage.label(holes)
+    if n_holes == 0:
+        return blob
+    hole_sizes = ndimage.sum(holes, hole_labels, index=range(1, n_holes + 1))
+    small_hole_ids = [i + 1 for i, s in enumerate(hole_sizes) if s <= MAX_HOLE_FILL_AREA_PX]
+    small_holes = np.isin(hole_labels, small_hole_ids)
+    return blob | small_holes
 
 
 # A Mahalanobis distance of this many "standard deviations" from the
