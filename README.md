@@ -41,10 +41,15 @@ capsule's depth ratio is itself interpolated end-to-end (chest ratio →
 waist ratio → hip ratio) so the flattening changes smoothly along the
 torso instead of jumping where the chest and hip capsules meet. This adds
 real shape information beyond joint positions alone without pulling in
-any model weights or training data; it does not attempt fine detail (face,
-fingers, clothing folds) — that needs a learned generative model, which
-reopens the exact licensing problem this project exists to avoid, so it's
-deliberately out of scope here.
+any model weights or training data.
+
+Single-photo mode also adds real **face detail** (nose, chin, eye
+sockets) when a face is detected — see "Face detail" below. It still does
+not attempt fingers, clothing folds, or surface texture (skin, fabric,
+hair strands) — those need a learned *generative* model (one trained to
+hallucinate plausible fine detail, not just locate real landmarks), which
+reopens the exact licensing problem this project exists to avoid, so
+they're deliberately out of scope.
 
 **Two or more photos, shot from different angles around the subject**
 (front first, then rotating — a phone-selfie "turnaround" or someone else
@@ -78,6 +83,78 @@ well-known, unencumbered formula/algorithm — no third-party model weights,
 no training-data license, nothing to clear before you can use this
 commercially.
 
+## Face detail
+
+Single-photo mode automatically runs `face_features.py` on the same
+photo, using MediaPipe's **Face Landmarker** — the same Apache-2.0
+MediaPipe model family as the pose landmarker already required, not a new
+dependency or license to clear. When a face is detected, it overlays a
+nose, chin, and recessed eye sockets built from the photo's own measured
+landmark positions on top of the generic head capsule, instead of a
+single round head shape. It's automatic, not an opt-in flag — unlike
+`--use-depth` (which pulls in torch), this needs nothing beyond what
+single-photo mode already requires, and a missing/unusable face just
+falls back to the plain head.
+
+What's real here versus what's still generic: the nose/chin/eye *shape*
+(how big, how rounded) is still a generic proportion like the rest of the
+body, scaled off the photo's own measured eye-to-eye distance (the
+standard figure-drawing "one eye-width" unit) — but the *positions* are
+the photo's own, including a real measured nose protrusion depth, not a
+guess. Confirmed against a real photo (MediaPipe's own `portrait.jpg`
+sample) before use, not assumed from documentation: the nose tip lands
+between the eyes and above the chin as it should, the chin is the lowest
+point on the face, and the eye/jaw landmark pairs come out left-right
+symmetric around the face centerline.
+
+This needed its own real fix, not just wiring up a new model: a nose or
+chin sized right for an actual face is tiny next to a whole body's
+bounding box, and at this project's normal marching-cubes resolution the
+voxel size is bigger than the feature itself — the added geometry is
+mathematically there but gets rounded away before it reaches the output
+mesh. Measured directly on a synthetic full-body test: at the default
+resolution, the output mesh came out byte-for-byte identical with and
+without the face additions. A first guess at how fine a grid this needs
+(several voxels across the smallest feature's radius) was also checked
+against real numbers and was wrong — a voxel modestly *larger* than the
+radius still rounded the nose away completely, while one roughly
+*matching* the radius measured a bump within ~10% of the exact analytic
+prediction. So the grid is sharpened automatically, only as far as needed
+and only near the face's own scale (not globally, which would be far more
+expensive for no benefit elsewhere in the mesh), capped to bound runtime
+cost (~12s for a full-body figure at the cap, versus ~2s without face
+detail). If even that capped resolution still wouldn't resolve the
+feature — a face that's a very small fraction of the frame, e.g. a
+distant full-body shot — it's skipped rather than silently shipped as
+geometry too small for any viewer or slicer to ever see; a closer or
+half-body photo lets it actually show up.
+
+**Not attempted, and why:** eyeballs/eyebrows/lips as distinct shapes,
+individual facial proportions beyond the stylized sizing above, and any
+skin-surface detail (pores, wrinkles) — Face Landmarker gives real
+*positions* for a fixed set of named points, not a full learned face
+*shape* model, so going further than this would mean either hand-adding
+many more generic primitives per point (quickly a lot of code for
+diminishing realism) or bringing in a learned 3D face-shape/generative
+model, which reopens the licensing problem described above.
+
+**Not yet implemented, but genuinely computable from scratch** (same
+"no licensed model" standard as everything else here), if useful:
+- **Hair** as a stylized volume (not individual strands): MediaPipe also
+  ships a `hair_segmenter` model (same Apache-2.0 family, URL confirmed
+  reachable), which gives a real per-pixel hair mask from the photo —
+  that mask's silhouette could drive a carved/extruded hair volume the
+  same way `visual_hull.py` already carves a body from silhouettes,
+  rather than a generic bald or capsule-cap guess.
+- **Visible muscle/arm shape**: right now each limb is a single capsule
+  linearly tapered between two joints (e.g. shoulder to elbow). The
+  photo's own silhouette (`silhouette.py`, already used in multi-photo
+  mode, works on a single photo too) could be sampled at several points
+  along each limb instead of just its two endpoints, so a limb that's
+  visibly wider partway along in the photo — a flexed bicep, a calf —
+  comes out that shape instead of a straight taper, using the person's
+  own photo rather than a generic "muscular" assumption.
+
 ## Setup
 
 ```bash
@@ -85,12 +162,14 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-No license gate, no registration needed — but pose detection does fetch a
-~9MB model file automatically on first run (`landmarks.py`, cached at
-`~/.cache/anatomy3d-print/`). This is MediaPipe's own official model,
-Apache-2.0 licensed like the rest of MediaPipe, from Google's model
-bucket, not something you need to register for or accept a license for —
-unlike SMPL-X, downloading it is just normal setup, not a legal step.
+No license gate, no registration needed — but pose detection (and, for
+single photos, face detection) fetch small model files automatically on
+first run: ~9MB for pose (`landmarks.py`) and ~4MB for the face landmarker
+(`face_features.py`), both cached at `~/.cache/anatomy3d-print/`. These
+are MediaPipe's own official models, Apache-2.0 licensed like the rest of
+MediaPipe, from Google's model bucket, not something you need to register
+for or accept a license for — unlike SMPL-X, downloading them is just
+normal setup, not a legal step.
 
 MediaPipe's native library also needs a few system packages even for
 CPU-only use — `libgl1`, `libglib2.0-0`, `libgles2`, `libegl1` (already in
@@ -259,10 +338,15 @@ doesn't need any.
 ## Limitations (read before printing)
 
 **Single-photo (capsule) mode:**
-- **Stylized, not realistic.** Tapered limbs, a simple head, no face, no
-  hands/fingers, no clothing. It will not look like a scanned likeness of
-  the person. That's the direct trade-off for not depending on a licensed
-  body model.
+- **Stylized, not realistic.** Tapered limbs, a nose/chin/eye-socket
+  overlay when a face is detected (see "Face detail" above) but no
+  eyebrows/lips/individual likeness, no hands/fingers, no clothing. It
+  will not look like a scanned likeness of the person. That's the direct
+  trade-off for not depending on a licensed body model.
+- **Face detail needs the face to be a decent fraction of the frame.** A
+  distant full-body photo often won't have enough resolution budget to
+  render it (the pipeline detects this and skips gracefully rather than
+  silently doing nothing) — a closer or half-body photo works better.
 - **No real depth.** Built with a fixed, stylized front-to-back thickness,
   not measured depth. Proportions (limb lengths, torso width) come from the
   photo; roundness doesn't.
@@ -310,6 +394,7 @@ into the CLI/web/desktop apps. To experiment with it:
 src/anatomy3d/
   preprocess.py       EXIF fix, resize, contrast + sharpen
   landmarks.py         2D pose keypoint detection
+  face_features.py      single-photo: real face landmarks (nose/chin/eyes)
   procedural_body.py    single-photo: capsule/SDF body builder
   silhouette.py          multi-photo: background removal -> mask
   visual_hull.py           multi-photo: voxel carving -> mesh

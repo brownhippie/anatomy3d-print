@@ -1,6 +1,7 @@
 import os
 from typing import List, Optional, Union
 
+from .face_features import detect_face_landmarks
 from .landmarks import detect_pose_landmarks
 from .mesh_export import export_obj, to_trimesh
 from .preprocess import load_image_rgb
@@ -52,6 +53,13 @@ def run_pipeline(
     dependency (torch + transformers), not something that should change
     behavior just because it happens to be installed in a given
     environment. Requires `pip install -r requirements-depth.txt`.
+
+    Single-photo mode also tries face detail (nose, chin, eye sockets,
+    face_features.py) automatically — unlike `use_depth`, this needs no
+    opt-in flag, since it's the same MediaPipe dependency already
+    required for pose detection, not a new one. A missing/unusable face
+    or a failed model fetch falls back to the generic head shape rather
+    than failing the run.
     """
     os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
 
@@ -64,7 +72,17 @@ def run_pipeline(
         depth_rgb = None
         if use_depth:
             depth_rgb = load_image_rgb(paths[0], max_dimension=None).rgb
-        body = build_body_mesh(keypoints, target_height_mm=target_height_mm, depth_rgb=depth_rgb)
+        try:
+            face_keypoints = detect_face_landmarks(paths[0])
+        except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
+            print(f"Note: face-detail detection failed ({exc}); using the generic head shape.")
+            face_keypoints = None
+        body = build_body_mesh(
+            keypoints,
+            target_height_mm=target_height_mm,
+            depth_rgb=depth_rgb,
+            face_keypoints=face_keypoints,
+        )
     else:
         if angles_deg is None:
             angles_deg = _default_angles(len(paths))

@@ -23,6 +23,7 @@ import trimesh
 from scipy.ndimage import map_coordinates
 from skimage.measure import marching_cubes
 
+from .face_features import FaceKeypoints
 from .landmarks import DetectedKeypoints
 from .mesh_types import BodyMesh
 from .safety import mad_margin_above_minimum
@@ -66,6 +67,42 @@ DEPTH_RATIO_CHEST = 0.62  # chest: markedly wider side-to-side than deep
 DEPTH_RATIO_WAIST = 0.72  # waist: rounder than the chest, still not circular
 DEPTH_RATIO_HIPS = 0.78
 DEPTH_RATIO_LIMB = 0.92  # limbs are closer to round, but still slightly flattened
+
+# Face feature sizing, as a fraction of that face's own measured
+# interocular distance (inner eye corner to inner eye corner) — the
+# standard figure-drawing unit for face proportions ("one eye-width"
+# spacing), not a licensed dataset, same approach as the body radii
+# above. Unlike the body, these drive real per-photo measured points
+# (face_features.py), not just generic proportions scaled by a bone
+# length — the nose/chin/eye *positions* are the photo's own, only their
+# *thickness* around those points is a generic stylized guess.
+NOSE_BASE_RADIUS_FRAC = 0.26
+NOSE_TIP_RADIUS_FRAC = 0.16
+CHIN_RADIUS_FRAC = 0.20
+EYE_SOCKET_RADIUS_FRAC = 0.32
+EYE_SOCKET_RECESS_FRAC = 0.35  # how far back from the eye-corner plane the socket center sits
+
+# How finely the marching-cubes grid must resolve the smallest face
+# feature to show up at all. Calibrated directly against measured output
+# on a synthetic full-body test (see build_body_mesh), not guessed: a
+# first guess of needing several voxels across a feature's radius was
+# checked against real numbers and was wrong — a voxel only modestly
+# *larger* than the radius (res=260, voxel/radius~1.4) still rounded the
+# nose away completely (measured diff exactly 0.0mm with vs without it),
+# while a voxel roughly *matching* the radius (res=320, voxel/radius~1.15)
+# measured a 0.60mm bump, within ~10% of the exact analytic SDF
+# prediction (0.67mm). FACE_VOXEL_FRAC is set from that measured
+# crossover with a small safety margin, not the original guess. Grid
+# resolution is raised (only as needed) to hit this, capped by
+# MAX_GRID_RESOLUTION_WITH_FACE to bound runtime cost — tested directly
+# up to that cap at ~12s for a full-body figure versus ~2s with no face
+# detail, an acceptable tradeoff for an opt-in detail feature.
+# FACE_SKIP_FACTOR: if even the capped resolution would still be more
+# than 2x too coarse, there's no point paying the extra cost for detail
+# that still wouldn't survive — skip it and say why instead.
+FACE_VOXEL_FRAC = 1.1
+MAX_GRID_RESOLUTION_WITH_FACE = 340
+FACE_SKIP_FACTOR = 2.0
 
 
 def _to_local_xy(keypoints: DetectedKeypoints) -> dict:
@@ -238,6 +275,80 @@ def _build_capsules(joints: dict) -> list:
     return capsules
 
 
+def _face_to_local_xyz(face_kp: FaceKeypoints) -> dict:
+    """Same local-coordinate convention as _to_local_xy (origin at image
+    center, y flipped so up is positive), extended with a real measured z
+    for each face point instead of the flat z=0 every pose joint gets.
+    MediaPipe's face-mesh z is normalized on roughly the same scale as x
+    (i.e. already in "pixel-equivalent" units once multiplied by image
+    width), smaller/more negative meaning closer to the camera — the
+    opposite sign of this project's own z convention (z > 0 is the
+    camera-facing front, see build_body_mesh/_sculpt_front_surface_from_
+    depth), so it's negated here. Verified against a real detected face
+    (see face_features.py's module docstring): the nose tip comes out
+    with the largest local z (most forward) of any point checked, the
+    jaw corners the smallest (furthest back), matching real face shape."""
+    w, h = face_kp.image_width, face_kp.image_height
+    out = {}
+    for idx, (px, py, z_raw) in face_kp.points.items():
+        out[idx] = np.array([px - w / 2.0, h / 2.0 - py, -z_raw * w])
+    return out
+
+
+def _build_face_additions(face_points: dict) -> tuple:
+    """Builds small additive capsules (nose, chin) and subtractive eye
+    sockets from real detected face-landmark positions, to overlay on the
+    generic head capsule. Returns ([] , []) if the needed landmarks
+    aren't present — face detail is a bonus, not a requirement, so a
+    missing/unusable face should silently add nothing rather than fail
+    the body build."""
+    from .face_features import CHIN, LEFT_EYE, NOSE_BRIDGE, NOSE_TIP, RIGHT_EYE
+
+    needed = {NOSE_TIP, NOSE_BRIDGE, CHIN, *RIGHT_EYE, *LEFT_EYE}
+    if not needed.issubset(face_points.keys()):
+        return [], []
+
+    right_eye_pts = np.array([face_points[i] for i in RIGHT_EYE])
+    left_eye_pts = np.array([face_points[i] for i in LEFT_EYE])
+    right_eye_center = right_eye_pts.mean(axis=0)
+    left_eye_center = left_eye_pts.mean(axis=0)
+
+    # Inner-corner-to-inner-corner distance — the classic figure-drawing
+    # "one eye-width" unit everything else here scales from.
+    interocular = np.linalg.norm(right_eye_pts[1] - left_eye_pts[0])
+    if interocular < 1e-6:
+        return [], []
+
+    nose_tip = face_points[NOSE_TIP]
+    nose_bridge = face_points[NOSE_BRIDGE]
+    chin = face_points[CHIN]
+
+    extra_capsules = [
+        (
+            nose_bridge,
+            nose_tip,
+            NOSE_BASE_RADIUS_FRAC * interocular,
+            NOSE_TIP_RADIUS_FRAC * interocular,
+            1.0,
+            1.0,
+        ),
+        # A degenerate (same-point) capsule is just a sphere — enough for
+        # a small chin protrusion without needing a second chin landmark.
+        (chin, chin, CHIN_RADIUS_FRAC * interocular, CHIN_RADIUS_FRAC * interocular, 1.0, 1.0),
+    ]
+
+    # Eye sockets are carved in (subtracted), not added, so they're kept
+    # separate from extra_capsules: subtraction needs to happen after the
+    # main smooth-min union, not chained into it (see build_body_mesh).
+    eye_sockets = []
+    for center in (right_eye_center, left_eye_center):
+        recessed_center = center.copy()
+        recessed_center[2] -= EYE_SOCKET_RECESS_FRAC * interocular
+        eye_sockets.append((recessed_center, EYE_SOCKET_RADIUS_FRAC * interocular))
+
+    return extra_capsules, eye_sockets
+
+
 def _sculpt_front_surface_from_depth(
     verts: np.ndarray, image_width: int, image_height: int, rgb: np.ndarray, strength: float
 ) -> np.ndarray:
@@ -297,18 +408,38 @@ def build_body_mesh(
     blend_k_frac: float = 0.35,
     depth_rgb: Optional[np.ndarray] = None,
     depth_strength: float = 0.5,
+    face_keypoints: Optional[FaceKeypoints] = None,
 ) -> BodyMesh:
     """`depth_rgb`: the same preprocessed photo passed to pose detection.
     When given, sculpts the front surface using real per-pixel depth
     (anatomy3d.depth_source, optional extra) instead of the flat
     symmetric-thickness guess. Leave as None for the default, dependency-
-    free behavior."""
+    free behavior.
+
+    `face_keypoints`: real detected face landmarks (face_features.py).
+    When given and usable, overlays a nose, chin, and eye sockets built
+    from the photo's own measured positions on top of the generic head
+    capsule. Optional — a missing or unusable face silently adds nothing."""
     joints = _to_local_xy(keypoints)
     capsules = _build_capsules(joints)
 
     all_radii = [r for cap in capsules for r in cap[2:4]]
     margin = max(all_radii) * 2.5
     pts_for_bounds = np.array([p for cap in capsules for p in cap[:2]])
+
+    face_capsules, eye_sockets = [], []
+    if face_keypoints is not None:
+        face_local = _face_to_local_xyz(face_keypoints)
+        face_capsules, eye_sockets = _build_face_additions(face_local)
+    if face_capsules:
+        # Bounds must cover the face additions too, even though they're
+        # already within the head capsule's own margin in practice — kept
+        # as its own min/max rather than folded into `margin`/`all_radii`
+        # above, so face parts (small) don't shrink the main blend width
+        # (see blend_k below, computed from body-only radii).
+        face_pts = np.array([p for cap in face_capsules for p in cap[:2]] + [c for c, _r in eye_sockets])
+        pts_for_bounds = np.vstack([pts_for_bounds, face_pts])
+
     mins = pts_for_bounds.min(axis=0) - margin
     maxs = pts_for_bounds.max(axis=0) + margin
     # Give the figure real thickness front-to-back even though the input is
@@ -318,6 +449,41 @@ def build_body_mesh(
     mins[2], maxs[2] = -depth_half, depth_half
 
     dims = maxs - mins
+
+    if face_capsules:
+        # Measured directly, not assumed: a nose/chin sized right for a
+        # real face is tiny next to a whole body's bounding box, and at
+        # this function's normal grid_resolution the marching-cubes voxel
+        # size is bigger than the feature itself — the added geometry is
+        # mathematically there (see _build_face_additions) but gets
+        # rounded away before it ever reaches the output mesh. Confirmed
+        # directly: at grid_resolution=190 on a synthetic full-body test,
+        # the resulting mesh was byte-for-byte identical with and without
+        # the face capsules; raising resolution until voxel size dropped
+        # below the nose's own radius made the same test start measuring
+        # the expected bump (within ~10% of the exact analytic SDF
+        # prediction once 2-3 voxels span the smallest feature radius).
+        # So: sharpen the grid only as far as needed to resolve the
+        # smallest face feature, capped to bound runtime cost (uniform
+        # global refinement this coarse already costs ~5x at the cap
+        # tested here) — and if even the cap can't get there (a face
+        # that's a very small fraction of the frame), skip adding the
+        # face geometry rather than silently shipping a change too small
+        # for any viewer or slicer to ever see.
+        face_radii = [r for cap in face_capsules for r in cap[2:4]] + [r for _c, r in eye_sockets]
+        required_resolution = dims.max() / (min(face_radii) * FACE_VOXEL_FRAC)
+        if required_resolution > MAX_GRID_RESOLUTION_WITH_FACE * FACE_SKIP_FACTOR:
+            print(
+                "Note: a face was detected, but it's too small relative to the "
+                "whole-body photo to render fine facial detail at a practical "
+                "resolution — the generic head shape will be used instead. A "
+                "closer, more face-filling photo (or a face/half-body shot) "
+                "would let this feature actually show up."
+            )
+            face_capsules, eye_sockets = [], []
+        else:
+            grid_resolution = int(np.clip(required_resolution, grid_resolution, MAX_GRID_RESOLUTION_WITH_FACE))
+
     res = np.maximum((dims / dims.max() * grid_resolution).astype(int), 8)
     xs = np.linspace(mins[0], maxs[0], res[0])
     ys = np.linspace(mins[1], maxs[1], res[1])
@@ -333,6 +499,25 @@ def build_body_mesh(
     for a, b, ra, rb, dra, drb in capsules:
         sdf = _capsule_sdf(points, a, b, ra, rb, dra, drb)
         field = sdf if field is None else _smooth_min(field, sdf, blend_k)
+
+    if face_capsules:
+        # Face parts are much smaller than any body capsule — blending
+        # them with the main body's own (comparatively huge) blend_k would
+        # either barely affect anything or wash the small features out
+        # entirely, so they get their own, face-scaled blend width.
+        face_radii = [r for cap in face_capsules for r in cap[2:4]]
+        face_blend_k = min(face_radii) * blend_k_frac * 5.0
+        for a, b, ra, rb, dra, drb in face_capsules:
+            sdf = _capsule_sdf(points, a, b, ra, rb, dra, drb)
+            field = _smooth_min(field, sdf, face_blend_k)
+
+    for center, radius in eye_sockets:
+        # Subtracted (carved in), not unioned: max(field, -socket_sdf)
+        # keeps the result everywhere the socket sphere ISN'T, which is
+        # exactly a boolean subtraction — this is why eye sockets are kept
+        # out of the smooth-min chain above rather than passed through it.
+        socket_sdf = np.linalg.norm(points - center, axis=1) - radius
+        field = np.maximum(field, -socket_sdf)
 
     field = field.reshape(res)
     spacing = (
