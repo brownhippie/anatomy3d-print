@@ -1,7 +1,10 @@
 import os
 from typing import List, Optional, Union
 
+import numpy as np
+
 from .face_features import detect_face_landmarks
+from .hair_features import detect_hair_mask
 from .landmarks import detect_pose_landmarks
 from .mesh_export import export_obj, to_trimesh
 from .preprocess import load_image_rgb
@@ -89,11 +92,41 @@ def run_pipeline(
         except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
             print(f"Note: face-detail detection failed ({exc}); using the generic head shape.")
             face_keypoints = None
+        try:
+            # Same default params detect_pose_landmarks uses internally
+            # (load_image_rgb(path), no overrides) so this array is
+            # pixel-identical to the one `keypoints` was measured against
+            # — required for the silhouette mask and the joint positions
+            # to share one coordinate system (see build_body_mesh).
+            silhouette_rgb = load_image_rgb(paths[0]).rgb
+            silhouette_mask = extract_silhouette(silhouette_rgb)
+        except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
+            print(f"Note: silhouette-based shape refinement failed ({exc}); using generic proportions.")
+            silhouette_mask = None
+        try:
+            # Detected at full resolution (same reasoning as face
+            # detection — hair is a small, fine-detailed region), then
+            # resized back down to match keypoints' own resolution so
+            # pixel coordinates line up (see the same fix applied to face
+            # landmarks in procedural_body.py's _face_to_local_xyz).
+            hair_mask = detect_hair_mask(paths[0])
+            if hair_mask is not None and hair_mask.shape != (keypoints.image_height, keypoints.image_width):
+                from PIL import Image
+
+                resized = Image.fromarray((hair_mask * 255).astype(np.uint8)).resize(
+                    (keypoints.image_width, keypoints.image_height), Image.NEAREST
+                )
+                hair_mask = np.asarray(resized) > 127
+        except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
+            print(f"Note: hair detection failed ({exc}); the head will stay bare.")
+            hair_mask = None
         body = build_body_mesh(
             keypoints,
             target_height_mm=target_height_mm,
+            silhouette_mask=silhouette_mask,
             depth_rgb=depth_rgb,
             face_keypoints=face_keypoints,
+            hair_mask=hair_mask,
         )
     else:
         if angles_deg is None:

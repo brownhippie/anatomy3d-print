@@ -17,14 +17,16 @@ higher fidelity under that license.
 
 ## Two reconstruction modes
 
-**One photo** → `procedural_body.py`: a geometric guess. Places a skeleton
-from MediaPipe keypoints, wraps each bone in a tapered capsule sized from
-generic figure-proportion ratios (figure-drawing references, not a
-licensed dataset) scaled by that bone's own measured length, blends
-overlapping capsules with a smooth-minimum of their signed distance fields,
-extracts the result with marching cubes. Fast, but it's a stylized guess —
-it doesn't know the actual shape of the person in the photo, only their
-joint proportions.
+**One photo** → `procedural_body.py`: places a skeleton from MediaPipe
+keypoints, wraps each bone in a tapered capsule, blends overlapping
+capsules with a smooth-minimum of their signed distance fields, extracts
+the result with marching cubes. Capsule radii start from generic
+figure-proportion ratios (figure-drawing references, not a licensed
+dataset) scaled by that bone's own measured length, but are then refined
+against the photo's own silhouette where one is available — see "Real
+body shape, not generic capsules" below — so the output isn't just joint
+proportions wrapped in a generic mannequin shape, though it's still a
+single 2D photo's worth of information, not a scan.
 
 Within that single-photo mode, the body is modeled **section by section**
 rather than as one tapered torso capsule: head, chest, waist, hips, and
@@ -96,6 +98,19 @@ single round head shape. It's automatic, not an opt-in flag — unlike
 single-photo mode already requires, and a missing/unusable face just
 falls back to the plain head.
 
+Face detection runs at the photo's full resolution rather than inheriting
+pose detection's 1280px cap — a face is often small in a full-body frame
+and benefits from the extra pixels — which means face landmarks and the
+body skeleton usually come from two differently-scaled copies of the same
+photo. Missed in initial testing (every synthetic photo used happened to
+already be under 1280px, where this made no difference) and only caught
+by testing against an artificially large (3000px) real photo: without
+correcting for it, face geometry would land at the wrong size and
+position relative to the body on any real phone photo above that
+resolution. Fixed by rescaling face-local coordinates into the body
+skeleton's own coordinate space before combining them — both describe the
+same photo, just sampled at different pixel densities.
+
 What's real here versus what's still generic: the nose/chin/eye *shape*
 (how big, how rounded) is still a generic proportion like the rest of the
 body, scaled off the photo's own measured eye-to-eye distance (the
@@ -138,22 +153,94 @@ many more generic primitives per point (quickly a lot of code for
 diminishing realism) or bringing in a learned 3D face-shape/generative
 model, which reopens the licensing problem described above.
 
-**Not yet implemented, but genuinely computable from scratch** (same
-"no licensed model" standard as everything else here), if useful:
-- **Hair** as a stylized volume (not individual strands): MediaPipe also
-  ships a `hair_segmenter` model (same Apache-2.0 family, URL confirmed
-  reachable), which gives a real per-pixel hair mask from the photo —
-  that mask's silhouette could drive a carved/extruded hair volume the
-  same way `visual_hull.py` already carves a body from silhouettes,
-  rather than a generic bald or capsule-cap guess.
-- **Visible muscle/arm shape**: right now each limb is a single capsule
-  linearly tapered between two joints (e.g. shoulder to elbow). The
-  photo's own silhouette (`silhouette.py`, already used in multi-photo
-  mode, works on a single photo too) could be sampled at several points
-  along each limb instead of just its two endpoints, so a limb that's
-  visibly wider partway along in the photo — a flexed bicep, a calf —
-  comes out that shape instead of a straight taper, using the person's
-  own photo rather than a generic "muscular" assumption.
+## Real body shape, not generic capsules
+
+Everything above still describes a figure built from *generic* proportion
+formulas — real joint positions, but a formula-driven shape in between
+them. Single-photo mode now also measures the photo's own silhouette
+(`silhouette.py`, reused from multi-photo mode — works on one photo too)
+at several points along each torso and limb segment, instead of a single
+straight taper between two joints: an actually narrower waist, a visibly
+wider chest, a flexed arm, come from the photo's own outline rather than
+a generic human-average shape. Each segment becomes a short chain of
+mini-capsules (default 6 per segment), each one's radius read from the
+silhouette at that point and clamped to a sane range around the generic
+estimate (see below for why that clamp matters), rather than one capsule
+linearly interpolated end to end.
+
+This needed a real structural fix to actually work, not just wiring up
+the measurement: chaining many short capsules through the same
+smooth-minimum blending the rest of this project uses adds a small
+"fillet" bulge at every joint between them (correct behavior for blending
+two genuinely separate parts, but these chain pieces already meet
+exactly at a shared point with matching radius — no gap to smooth over).
+Across 6 pieces per segment that compounded into visibly fatter,
+blobbier limbs than any individual measurement called for — caught by
+rendering a real photo's output and comparing it to the source, not
+assumed correct from the math. Fixed by hard-unioning a chain's own
+pieces (they already meet seamlessly) and reserving smooth-min for where
+a chain joins a genuinely different part (the torso, another limb).
+
+The safety clamp earned its keep against a real failure, not a
+hypothetical one: `silhouette.py`'s background-removal assumes a roughly
+uniform background color, and a real test photo with a complex one (sand
+and sky, not a studio backdrop) got the person correctly separated from
+the sky but merged with the sand near the legs. A naive clamp still let
+that corruption through at 1.8x the generic estimate on *every single
+sample* down the whole thigh — not an occasional outlier a generous bound
+could absorb, but a search that never found a real edge at all. Fixed by
+telling those two cases apart explicitly: if the silhouette search
+exhausts itself without the mask ever ending, that's not a measurement,
+and the point falls back to the plain generic radius instead of a
+clamped-but-still-wrong one.
+
+## Hair
+
+Single-photo mode also runs MediaPipe's **Hair Segmenter** (same
+Apache-2.0 model family, no new license) automatically, giving a real
+per-pixel hair mask from the photo. A stylized hair volume — not
+individual strands — is built by sampling that mask radially around the
+head: in each of 24 directions around the head center, if the photo's
+hair extends meaningfully past the head's own surface there, a small
+sphere is added reaching out to roughly that point; directions with no
+hair (or where the segmenter found nothing worth trusting) get nothing.
+A short, close-cropped cut produces a thin halo close to the head; a
+fuller or side-swept style produces a bigger, more asymmetric one —
+verified directly: rendering just a head against a real detected
+hairstyle produced a visibly asymmetric shape matching that photo's own
+side part, not a generic symmetric cap.
+
+Two failure modes surfaced from running this against real, imperfect
+photos, not caught by the geometry alone:
+- A direction pointing down toward the neck can find "hair" that's
+  really the mask misreading dark clothing or a shadow, and even when
+  real, hair sampled in that direction geometrically plunges into the
+  already-dense neck/torso capsules and changes nothing — confirmed
+  directly (the body's own field was far deeper there than the hair
+  bump's), a wasted, correct-but-invisible sample. Downward-pointing
+  directions are now skipped — anatomically hair doesn't grow pointing
+  down through the neck anyway, so nothing legitimate is lost.
+- Several directions on a real adversarial photo (a busy beach
+  background, a dark wetsuit) had the mask stay "true" in that direction
+  all the way out to the search limit without a real edge ever
+  appearing — four separate directions landing on the *exact same*
+  radius, which is what a large contiguous misdetection looks like, not
+  four coincidentally identical real measurements. Same fix as the
+  silhouette case above: a search that never finds its own edge is
+  discarded rather than trusted as a giant hairstyle.
+
+Net result: on a clean, well-lit photo with a clear hairstyle, this adds
+a real, photo-matched hair volume. On a photo where the hair signal is
+genuinely too unreliable (the adversarial case above), it now correctly
+adds nothing rather than guessing wrong — the same standard the rest of
+this project holds its MAD-margin checks to.
+
+**Still not attempted, and why:** individual strands, flyaways, and any
+other fine hair texture — a stylized volume is the ceiling for a
+segmentation-mask-driven approach; strand-level detail would need a
+generative hair model, which reopens the licensing problem described
+above. Muscle definition beyond what the silhouette's own outline shows
+(visible striation, not just overall limb width) has the same ceiling.
 
 ## Setup
 
@@ -409,6 +496,7 @@ src/anatomy3d/
   preprocess.py       EXIF fix, resize, contrast + sharpen
   landmarks.py         2D pose keypoint detection
   face_features.py      single-photo: real face landmarks (nose/chin/eyes)
+  hair_features.py       single-photo: real hair mask -> stylized hair volume
   procedural_body.py    single-photo: capsule/SDF body builder
   silhouette.py          multi-photo: background removal -> mask
   visual_hull.py           multi-photo: voxel carving -> mesh

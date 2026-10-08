@@ -69,6 +69,25 @@ SHIN_RADIUS_FRAC = 0.21
 ARM_TAPER = 0.85  # tip radius = base radius * this
 LEG_TAPER = 0.75  # legs narrow more from hip/knee to knee/ankle than arms do
 
+# Hair: a radial profile of small bumps around the head, sized from the
+# photo's own hair mask (hair_features.py) instead of a generic cap —
+# stylized (a volume, not individual strands), same "deliberately
+# approximate" standard as everything else here.
+HAIR_SAMPLES = 24  # angular samples around the head
+HAIR_MAX_RADIUS_FRAC = 2.5  # how far out from the head center to search, as a multiple of head_r
+HAIR_MIN_RADIUS_FRAC = 0.15  # ignore a direction whose hair barely pokes past the head surface — noise, not a real bump
+HAIR_DEPTH_RATIO = 0.95  # close to round; a single front photo gives no real front-to-back hair shape to measure
+# How tightly hair bumps blend into the head and each other. Checked
+# visually, not left at the body's own blend_k_frac (0.35): rendered side
+# by side, 0.35 produced a blend_k comparable to the bumps' own radius,
+# which smoothed the hairstyle's actual shape (an asymmetric side-swept
+# cut in the test photo) down to a barely-visible shading difference from
+# a bare head. 0.08 kept the same bumps distinct enough to actually read
+# as a hairstyle while still blending seamlessly (still watertight, no
+# separate shells) — tight blending reads as "volume with some shape to
+# it", the loose default read as "almost nothing changed".
+HAIR_BLEND_FRAC = 0.08
+
 # Section-by-section depth:width ratios (front-to-back vs side-to-side) —
 # people are not round in cross-section. These are generic, widely-cited
 # anthropometric proportions (the kind figure-drawing and character-
@@ -122,6 +141,35 @@ FACE_SKIP_FACTOR = 2.0
 # path can trigger on any pose with limbs spread wide, not just when a
 # face happens to be detected, so it needs to stay cheap more often.
 MAX_GRID_RESOLUTION_BODY = 300
+
+# Single-photo mode used to size every limb/torso segment purely from
+# generic proportions (shoulder/hip-width fractions) — it never actually
+# looked at the photo's own body outline the way multi-photo visual-hull
+# mode does, which is why it always came out as a generic mannequin no
+# matter whose photo went in. This measures the photo's own silhouette
+# (silhouette.py — already built for multi-photo mode, works on a single
+# photo too) at several points along each segment instead of trusting a
+# straight-line taper between two joints, so an actual narrower waist, a
+# visibly flexed arm, etc. come from the photo rather than a formula.
+SILHOUETTE_SAMPLES_PER_SEGMENT = 6
+# How far the clamp allows a measured radius to move from the generic
+# one it would otherwise have been. Checked against a real adversarial
+# case, not picked blind: on a real test photo with a complex (non-studio)
+# background, the silhouette extractor correctly separated the person
+# from the sky but misclassified a visually similar foreground (sand) as
+# part of the body near the legs, which would otherwise balloon those
+# segments' measured width to several times the real figure. This clamp
+# catches exactly that: a corrupted sample gets pulled back to within a
+# sane multiple of the generic estimate instead of propagating a torn
+# silhouette into the mesh, while a real, plausible measurement (the
+# usual case on a clean background) passes through close to unchanged.
+SILHOUETTE_RADIUS_MIN_FRAC = 0.6
+SILHOUETTE_RADIUS_MAX_FRAC = 1.35
+# How far outward (as a multiple of the generic radius) to search for the
+# silhouette's edge before giving up and treating the point as unmeasured
+# (falls back to the generic radius for that sample only, not the whole
+# segment).
+SILHOUETTE_SEARCH_RADIUS_FRAC = 6.0
 
 
 def _to_local_xy(keypoints: DetectedKeypoints) -> dict:
@@ -177,15 +225,183 @@ def _smooth_min(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
     return np.minimum(a, b) - hh * hh * k * 0.25
 
 
-def _segment(joints, name_a, name_b, radius_a, radius_b, depth_ratio_a=1.0, depth_ratio_b=None):
+def _segment(joints, name_a, name_b, radius_a, radius_b, depth_ratio_a=1.0, depth_ratio_b=None, group=0):
     if name_a not in joints or name_b not in joints:
         return None
     if depth_ratio_b is None:
         depth_ratio_b = depth_ratio_a
-    return (joints[name_a], joints[name_b], radius_a, radius_b, depth_ratio_a, depth_ratio_b)
+    return (joints[name_a], joints[name_b], radius_a, radius_b, depth_ratio_a, depth_ratio_b, group)
 
 
-def _build_capsules(joints: dict) -> list:
+def _measure_half_widths(mask, px, py, perp_dx, perp_dy, max_search_px):
+    """Marches outward from (px, py) along +/-(perp_dx, perp_dy) (pixel
+    space) until stepping off the silhouette mask, returning the two
+    distances (positive side, negative side). Returns None if the center
+    point itself isn't inside the mask (a torn/offset silhouette at that
+    exact point) OR if either march never finds an edge within
+    `max_search_px` — checked against a real failure, not a hypothetical:
+    on a real test photo, a leg crossing in front of sand (misclassified
+    as foreground by silhouette.py's background-color threshold, a known
+    limitation documented there) produced a "measurement" on EVERY single
+    sample down the whole thigh, each one landing almost exactly at the
+    clamp ceiling that used to apply here — not an occasional outlier a
+    generous clamp could absorb, but the search exhausting itself against
+    a large connected blob that isn't the limb at all. A search that
+    never finds an edge is a sign the measurement is meaningless, not
+    that the limb is merely wide, so this now reports that honestly
+    (None) and the caller falls back to the pure generic radius instead
+    of a clamped-but-still-wrong one."""
+    h, w = mask.shape
+    cx, cy = int(round(px)), int(round(py))
+    if not (0 <= cx < w and 0 <= cy < h) or not mask[cy, cx]:
+        return None
+
+    def march(sign):
+        dist = 0.0
+        while dist < max_search_px:
+            x = int(round(px + sign * perp_dx * dist))
+            y = int(round(py + sign * perp_dy * dist))
+            if not (0 <= x < w and 0 <= y < h) or not mask[y, x]:
+                return dist
+            dist += 1.0
+        return None  # never found an edge — not a measurement, a search failure
+
+    d_pos, d_neg = march(1.0), march(-1.0)
+    if d_pos is None or d_neg is None:
+        return None
+    return d_pos, d_neg
+
+
+def _chain_from_silhouette(
+    mask, image_width, image_height, a, b, ra, rb, dra, drb, n_samples, group
+):
+    """Replaces one straight-taper capsule with a chain of `n_samples`
+    shorter ones, each sized from the photo's own silhouette width at
+    that point instead of a pure a-to-b interpolation. See
+    SILHOUETTE_SAMPLES_PER_SEGMENT's comment for why, and
+    SILHOUETTE_RADIUS_MIN_FRAC/MAX_FRAC's for the safety clamp on each
+    measurement. Every piece shares `group` so build_body_mesh's SDF
+    accumulation hard-unions them together (they already meet exactly at
+    shared endpoints with matching radius — no seam to smooth over) instead
+    of smooth-min'ing each of the n_samples joints, which would otherwise
+    compound a small fillet-bulge at every one of them into a visibly
+    fatter limb than any individual measurement called for."""
+    ba = b - a
+    length = np.linalg.norm(ba)
+    if length < 1e-6:
+        return None
+    direction = ba / length
+    # Perpendicular within the local XY plane (joints have z=0 — see
+    # _to_local_xy); local x maps directly to pixel x, but local y is
+    # pixel-flipped (h/2 - py), so the pixel-space step for a local
+    # perpendicular move has its y component negated.
+    perp_local = np.array([-direction[1], direction[0], 0.0])
+    perp_px = np.array([perp_local[0], -perp_local[1]])
+
+    points, radii = [], []
+    for i in range(n_samples + 1):
+        t = i / n_samples
+        pt = a + ba * t
+        generic_r = ra + (rb - ra) * t
+        px = pt[0] + image_width / 2.0
+        py = image_height / 2.0 - pt[1]
+        half = _measure_half_widths(
+            mask, px, py, perp_px[0], perp_px[1], generic_r * SILHOUETTE_SEARCH_RADIUS_FRAC
+        )
+        if half is None:
+            measured_r = generic_r
+        else:
+            d_pos, d_neg = half
+            measured_r = (d_pos + d_neg) / 2.0
+            lo, hi = generic_r * SILHOUETTE_RADIUS_MIN_FRAC, generic_r * SILHOUETTE_RADIUS_MAX_FRAC
+            measured_r = float(np.clip(measured_r, lo, hi))
+        points.append(pt)
+        radii.append(measured_r)
+
+    chain = []
+    for i in range(n_samples):
+        t0, t1 = i / n_samples, (i + 1) / n_samples
+        dra_i = dra + (drb - dra) * t0
+        drb_i = dra + (drb - dra) * t1
+        chain.append((points[i], points[i + 1], radii[i], radii[i + 1], dra_i, drb_i, group))
+    return chain
+
+
+def _hair_bumps(hair_mask, image_width, image_height, head_center, head_r, group_start):
+    """Samples the photo's hair mask radially around the head center,
+    placing a small sphere wherever hair extends meaningfully past the
+    head surface in that direction — a short, close-cropped cut produces
+    a thin halo close to the head; long or voluminous hair produces a
+    bigger one; a bald direction (or a hat the segmenter doesn't read as
+    hair) produces none. Each bump gets its own group id (continuing from
+    `group_start`) so it blends normally (smooth-min) with the head and
+    its neighbors rather than hard-unioning — these are discrete radial
+    samples, not a connected chain the way a limb's silhouette samples
+    are."""
+    max_r = head_r * HAIR_MAX_RADIUS_FRAC
+    step = max(1.0, head_r * 0.05)
+    bumps = []
+    group = group_start
+    for i in range(HAIR_SAMPLES):
+        angle = 2.0 * np.pi * i / HAIR_SAMPLES
+        dx, dy = np.cos(angle), np.sin(angle)
+        # Skip directions pointing mostly downward (toward the neck/chest,
+        # local y is "up" — see _to_local_xy). Found by running on a real
+        # adversarial photo, not a guess: without this, a radial sample
+        # pointing straight down lands inside the already-dense neck/torso
+        # capsules (verified directly: body field was -21.9 there, far
+        # deeper than the bump's own -7.7, so the bump changed nothing —
+        # a correct but silently wasted sample). Hair doesn't grow pointing
+        # down through the neck, so there's nothing legitimate lost here.
+        if dy < -0.3:
+            continue
+
+        found_any = False
+        hit_cap = False
+        outer = 0.0
+        r = 0.0
+        while r <= max_r:
+            local_pt = head_center + np.array([dx, dy, 0.0]) * r
+            px = local_pt[0] + image_width / 2.0
+            py = image_height / 2.0 - local_pt[1]
+            cx, cy = int(round(px)), int(round(py))
+            inside = 0 <= cx < image_width and 0 <= cy < image_height and hair_mask[cy, cx]
+            if inside:
+                found_any = True
+                outer = r
+            elif found_any:
+                break  # left the mask after having been in it — stop at the last True
+            r += step
+        else:
+            hit_cap = found_any  # loop ran to completion without ever exiting the mask
+
+        if not found_any or hit_cap:
+            # hit_cap: the mask stayed "True" all the way to max_r without
+            # a real edge ever being found — also checked against the
+            # same real photo: four separate directions did exactly this,
+            # all landing on an identical radius (the search cap itself),
+            # which is what a large contiguous mask region unrelated to
+            # hair looks like (there, most likely dark clothing the
+            # segmenter mistook for hair), not four coincidentally
+            # identical real hairstyle measurements. A search that never
+            # finds its own edge isn't a measurement, same principle as
+            # the silhouette width fix above.
+            continue
+        if outer < head_r * (1.0 + HAIR_MIN_RADIUS_FRAC):
+            continue
+
+        inner = head_r * 0.6  # start the bump a bit inside the head surface, for overlap
+        bump_r = max((outer - inner) / 2.0, head_r * 0.08)
+        center_dist = inner + bump_r
+        center = head_center + np.array([dx, dy, 0.0]) * center_dist
+        bumps.append((center, center, bump_r, bump_r, HAIR_DEPTH_RATIO, HAIR_DEPTH_RATIO, group))
+        group -= 1
+    return bumps
+
+
+def _build_capsules(
+    joints: dict, silhouette_mask=None, image_width=None, image_height=None, hair_mask=None
+) -> list:
     if "left_shoulder" not in joints or "right_shoulder" not in joints:
         raise RuntimeError("Shoulders not detected — need a front-facing upper-body view at least.")
     # Found by calibration, not guessed: without both hips there's no
@@ -271,30 +487,59 @@ def _build_capsules(joints: dict) -> list:
         ("left_knee", "left_ankle", hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
         ("right_knee", "right_ankle", hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
     ]
-    for a, b, ra, rb, dra, drb in segs:
-        seg = _segment(joints, a, b, ra, rb, dra, drb)
-        if seg:
-            capsules.append(seg)
+    use_silhouette = silhouette_mask is not None and image_width and image_height
+    logical_count = 0
+    for group_id, (a, b, ra, rb, dra, drb) in enumerate(segs):
+        seg = _segment(joints, a, b, ra, rb, dra, drb, group=group_id)
+        if not seg:
+            continue
+        logical_count += 1
+        # The head keeps its single generic capsule — real shape there
+        # already comes from face_features.py's landmark-driven nose/chin/
+        # eye additions, and a hairline/hat can make a perpendicular
+        # silhouette width at the scalp read as noise rather than signal.
+        if use_silhouette and a != "head_top":
+            ja, jb = seg[0], seg[1]
+            chain = _chain_from_silhouette(
+                silhouette_mask, image_width, image_height, ja, jb, ra, rb, dra, drb,
+                SILHOUETTE_SAMPLES_PER_SEGMENT, group_id,
+            )
+            if chain:
+                capsules.extend(chain)
+                continue
+        capsules.append(seg)
 
-    if len(capsules) < MIN_CAPSULES:
+    if logical_count < MIN_CAPSULES:
         raise RuntimeError(
-            f"Not enough body parts detected to build a figure ({len(capsules)}, "
+            f"Not enough body parts detected to build a figure ({logical_count}, "
             f"need at least {MIN_CAPSULES}) — use a clear, front-facing photo "
             "showing most of the body."
         )
 
-    result = mad_margin_above_minimum(len(capsules), MIN_CAPSULES, min_margin=0.3)
+    result = mad_margin_above_minimum(logical_count, MIN_CAPSULES, min_margin=0.3)
     if not result.ok:
         print(
-            f"Warning: only {len(capsules)} body parts detected, {result.margin:.0%} "
+            f"Warning: only {logical_count} body parts detected, {result.margin:.0%} "
             f"above the {MIN_CAPSULES}-part minimum — the figure will be missing "
             "limbs or look rough. A clearer full-body photo will give a better result."
+        )
+
+    if hair_mask is not None and "head_top" in joints:
+        head_center = (joints["head_top"] + neck) / 2.0
+        # Negative group ids, not continuing the body's own numbering —
+        # a simple, unambiguous marker build_body_mesh can filter on
+        # without needing to know how many body segments there were, to
+        # keep hair bumps (tiny next to any body capsule) out of the
+        # body's own blend-width calculation the same way face parts
+        # already are (see build_body_mesh).
+        capsules.extend(
+            _hair_bumps(hair_mask, image_width, image_height, head_center, head_r, group_start=-1)
         )
 
     return capsules
 
 
-def _face_to_local_xyz(face_kp: FaceKeypoints) -> dict:
+def _face_to_local_xyz(face_kp: FaceKeypoints, target_image_width: Optional[float] = None) -> dict:
     """Same local-coordinate convention as _to_local_xy (origin at image
     center, y flipped so up is positive), extended with a real measured z
     for each face point instead of the flat z=0 every pose joint gets.
@@ -306,11 +551,29 @@ def _face_to_local_xyz(face_kp: FaceKeypoints) -> dict:
     depth), so it's negated here. Verified against a real detected face
     (see face_features.py's module docstring): the nose tip comes out
     with the largest local z (most forward) of any point checked, the
-    jaw corners the smallest (furthest back), matching real face shape."""
+    jaw corners the smallest (furthest back), matching real face shape.
+
+    `target_image_width`: face_features.py deliberately detects at the
+    photo's full resolution rather than inheriting pose detection's
+    1280px cap (a face is often small in a full-body frame and benefits
+    from the extra pixels — see that module). That means `face_kp`'s own
+    image dimensions usually differ from the pose keypoints' — same
+    photo, different pixel density — so local coordinates computed
+    straight from face_kp's own width/height would be a different
+    *scale* than the body's, not just a different origin, and face parts
+    would land at the wrong size/position relative to the body for any
+    photo actually larger than 1280px (untested by every synthetic photo
+    used so far in this project, which all happened to be smaller than
+    that cap, so this a real bug this project would otherwise have
+    shipped). Passing the body's own image_width here rescales face-local
+    coordinates into the same pixel-unit space the body skeleton uses,
+    correcting for that density difference — both describe the same
+    physical photo, just sampled at different resolutions."""
     w, h = face_kp.image_width, face_kp.image_height
+    scale = (target_image_width / w) if target_image_width else 1.0
     out = {}
     for idx, (px, py, z_raw) in face_kp.points.items():
-        out[idx] = np.array([px - w / 2.0, h / 2.0 - py, -z_raw * w])
+        out[idx] = np.array([(px - w / 2.0) * scale, (h / 2.0 - py) * scale, -z_raw * w * scale])
     return out
 
 
@@ -428,6 +691,8 @@ def build_body_mesh(
     depth_rgb: Optional[np.ndarray] = None,
     depth_strength: float = 0.5,
     face_keypoints: Optional[FaceKeypoints] = None,
+    silhouette_mask: Optional[np.ndarray] = None,
+    hair_mask: Optional[np.ndarray] = None,
 ) -> BodyMesh:
     """`depth_rgb`: the same preprocessed photo passed to pose detection.
     When given, sculpts the front surface using real per-pixel depth
@@ -438,9 +703,33 @@ def build_body_mesh(
     `face_keypoints`: real detected face landmarks (face_features.py).
     When given and usable, overlays a nose, chin, and eye sockets built
     from the photo's own measured positions on top of the generic head
-    capsule. Optional — a missing or unusable face silently adds nothing."""
+    capsule. Optional — a missing or unusable face silently adds nothing.
+
+    `silhouette_mask`: the same photo's own silhouette (silhouette.py),
+    in the same pixel coordinate system as `keypoints` (same image
+    dimensions). When given, replaces each torso/limb segment's straight
+    generic taper with a chain measured from the photo's actual outline —
+    see SILHOUETTE_SAMPLES_PER_SEGMENT's comment. Optional — without it,
+    every segment falls back to the previous generic-proportion capsule.
+
+    `hair_mask`: the same photo's hair mask (hair_features.py), same
+    pixel coordinate system as `keypoints`. When given, adds a stylized
+    hair volume shaped from the photo's own hairline (see HAIR_SAMPLES's
+    comment). Optional — without it, the head stays bare."""
     joints = _to_local_xy(keypoints)
-    capsules = _build_capsules(joints)
+    all_capsules = _build_capsules(
+        joints,
+        silhouette_mask=silhouette_mask,
+        image_width=keypoints.image_width,
+        image_height=keypoints.image_height,
+        hair_mask=hair_mask,
+    )
+    # Hair bumps are tagged with negative group ids (see _hair_bumps) so
+    # they can be split out here and given their own blend width, the
+    # same reason face parts already are below — a tiny hair bump's
+    # radius would otherwise shrink the body's own blend_k for no benefit.
+    capsules = [cap for cap in all_capsules if cap[6] >= 0]
+    hair_bumps = [cap for cap in all_capsules if cap[6] < 0]
 
     all_radii = [r for cap in capsules for r in cap[2:4]]
     margin = max(all_radii) * 2.5
@@ -448,7 +737,7 @@ def build_body_mesh(
 
     face_capsules, eye_sockets = [], []
     if face_keypoints is not None:
-        face_local = _face_to_local_xyz(face_keypoints)
+        face_local = _face_to_local_xyz(face_keypoints, target_image_width=keypoints.image_width)
         face_capsules, eye_sockets = _build_face_additions(face_local)
     if face_capsules:
         # Bounds must cover the face additions too, even though they're
@@ -458,6 +747,10 @@ def build_body_mesh(
         # (see blend_k below, computed from body-only radii).
         face_pts = np.array([p for cap in face_capsules for p in cap[:2]] + [c for c, _r in eye_sockets])
         pts_for_bounds = np.vstack([pts_for_bounds, face_pts])
+
+    if hair_bumps:
+        hair_pts = np.array([p for cap in hair_bumps for p in cap[:2]])
+        pts_for_bounds = np.vstack([pts_for_bounds, hair_pts])
 
     mins = pts_for_bounds.min(axis=0) - margin
     maxs = pts_for_bounds.max(axis=0) + margin
@@ -525,6 +818,26 @@ def build_body_mesh(
                 np.clip(required_resolution_face, grid_resolution, MAX_GRID_RESOLUTION_WITH_FACE)
             )
 
+    if hair_bumps:
+        # Same reasoning and same thresholds as the face case just above —
+        # a hair bump can be smaller than the grid can resolve too, and
+        # there's no reason to invent a second set of constants for an
+        # identical problem.
+        hair_radii = [r for cap in hair_bumps for r in cap[2:4]]
+        required_resolution_hair = dims.max() / (min(hair_radii) * FACE_VOXEL_FRAC)
+        if required_resolution_hair > MAX_GRID_RESOLUTION_WITH_FACE * FACE_SKIP_FACTOR:
+            print(
+                "Note: hair was detected, but it's too small relative to the "
+                "whole-body photo to render at a practical resolution — the "
+                "head will stay bare. A closer, more face-filling photo "
+                "would let this feature actually show up."
+            )
+            hair_bumps = []
+        else:
+            grid_resolution = int(
+                np.clip(required_resolution_hair, grid_resolution, MAX_GRID_RESOLUTION_WITH_FACE)
+            )
+
     res = np.maximum((dims / dims.max() * grid_resolution).astype(int), 8)
     xs = np.linspace(mins[0], maxs[0], res[0])
     ys = np.linspace(mins[1], maxs[1], res[1])
@@ -537,9 +850,28 @@ def build_body_mesh(
     # limb's own radius distorts and can fragment that limb.
     blend_k = min(all_radii) * blend_k_frac * 5.0
     field = None
-    for a, b, ra, rb, dra, drb in capsules:
+    group_field = None
+    current_group = None
+    for a, b, ra, rb, dra, drb, grp in capsules:
         sdf = _capsule_sdf(points, a, b, ra, rb, dra, drb)
-        field = sdf if field is None else _smooth_min(field, sdf, blend_k)
+        if grp == current_group:
+            # Same logical segment (a silhouette chain's own pieces, or a
+            # single-capsule segment on its own): these already meet
+            # exactly at a shared endpoint with matching radius, so a
+            # plain hard union is already seamless — smooth-min would only
+            # add an unwanted fillet-bulge at every one of these joints,
+            # which compounds across a 6-piece chain into a visibly fatter
+            # limb than any individual measurement called for (measured
+            # directly: this was the actual cause of limbs ballooning and
+            # fusing into the torso on a real test photo before this fix).
+            group_field = np.minimum(group_field, sdf)
+        else:
+            if group_field is not None:
+                field = group_field if field is None else _smooth_min(field, group_field, blend_k)
+            group_field = sdf
+            current_group = grp
+    if group_field is not None:
+        field = group_field if field is None else _smooth_min(field, group_field, blend_k)
 
     if face_capsules:
         # Face parts are much smaller than any body capsule — blending
@@ -559,6 +891,15 @@ def build_body_mesh(
         # out of the smooth-min chain above rather than passed through it.
         socket_sdf = np.linalg.norm(points - center, axis=1) - radius
         field = np.maximum(field, -socket_sdf)
+
+    if hair_bumps:
+        # Same reasoning as face_blend_k just above: hair bumps need their
+        # own, hair-scaled blend width, not the body's.
+        hair_radii = [r for cap in hair_bumps for r in cap[2:4]]
+        hair_blend_k = min(hair_radii) * HAIR_BLEND_FRAC * 5.0
+        for a, b, ra, rb, dra, drb, _grp in hair_bumps:
+            sdf = _capsule_sdf(points, a, b, ra, rb, dra, drb)
+            field = _smooth_min(field, sdf, hair_blend_k)
 
     field = field.reshape(res)
     spacing = (
