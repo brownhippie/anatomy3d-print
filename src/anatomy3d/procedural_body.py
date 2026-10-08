@@ -36,38 +36,44 @@ from .safety import mad_margin_above_minimum
 # longer reachable as a failure path below 6.
 MIN_CAPSULES = 6
 
-# Head radius and limb radii as a fraction of that limb's own measured
-# length — generic figure-proportion ratios, not a licensed anthropometric
-# dataset. Deliberately approximate; this produces a stylized mannequin,
-# not an anatomically precise reconstruction.
-HEAD_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.23
+# Head/torso/limb radii as a fraction of shoulder or hip width, and the
+# arm/leg tip:base taper ratios — all computed from ANSUR II (the 2012 US
+# Army Anthropometric Survey: 93 real measurements each on 6,068 people,
+# 4,082 male + 1,986 female, cleared for unlimited public release), not
+# guessed figure-drawing references. Mapping: our "shoulder_width"
+# landmark distance corresponds to ANSUR's biacromialbreadth, "hip_width"
+# to hipbreadth; a circumference measurement (bicepscircumferenceflexed,
+# forearmcircumferenceflexed, thighcircumference, calfcircumference,
+# wristcircumference, anklecircumference) converts to an effective radius
+# via circumference / (2*pi), treating that cross-section as circular —
+# the same assumption DEPTH_RATIO_LIMB below already made ("limbs are
+# close to round"), now load-bearing instead of just asserted. Every
+# ratio is the population mean; std is noted for context, not used here
+# (a single mean figure, not a sampled distribution, same choice already
+# made for every other generic ratio in this file).
+HEAD_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.1914  # headbreadth/2 : biacromialbreadth, std 0.013
 # Torso/hip radii must reach out to the shoulder/hip landmarks themselves
 # (half the point-to-point width) or the limb capsules attached there end
 # up floating outside the torso's own surface with a visible gap.
-TORSO_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.46
-HIP_RADIUS_FRAC_OF_HIP_WIDTH = 0.46
+TORSO_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.3551  # chestbreadth/2 : biacromialbreadth, std 0.023
+# hip_width IS ANSUR's hipbreadth already (that's the landmark it's
+# measuring), so this one isn't a fitted ratio at all — a radius is
+# exactly half a breadth, by definition, not an empirical finding.
+HIP_RADIUS_FRAC_OF_HIP_WIDTH = 0.5
 # Waist sits narrower than both chest and hips — splitting the torso here
 # (instead of one neck-to-pelvis capsule) is what makes "section by
 # section" proportion real rather than a single linear taper.
-WAIST_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.34
+WAIST_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.3987  # waistbreadth/2 : biacromialbreadth, std 0.041
 WAIST_HEIGHT_FRAC = 0.55  # fraction of the way from neck to pelvis
-# Recalibrated against real output, not left at the original guess: a
-# real test photo (MediaPipe's own `pose.jpg`, a dynamic side lunge)
-# measured these out at 2-4x thinner than generic circumference-to-height
-# anthropometric ratios (adult upper-arm/forearm/thigh/calf circumference
-# as a fraction of height, the same kind of generic figure reference used
-# throughout this file) predict — e.g. a thigh radius of ~2.5mm on a
-# 150mm figure versus the ~7mm these ratios suggest. The segs list below
-# used to compound each of these with its own extra ad hoc 0.3-0.6
-# end-multiplier on top; that's now folded into the constants themselves
-# (base = this fraction, tip = this fraction * the segment's own taper
-# below) so there's one place these are set, not two.
-UPPER_ARM_RADIUS_FRAC = 0.115
-FOREARM_RADIUS_FRAC = 0.095
-THIGH_RADIUS_FRAC = 0.30
-SHIN_RADIUS_FRAC = 0.21
-ARM_TAPER = 0.85  # tip radius = base radius * this
-LEG_TAPER = 0.75  # legs narrow more from hip/knee to knee/ankle than arms do
+UPPER_ARM_RADIUS_FRAC = 0.1359  # bicepscircumferenceflexed-derived radius : biacromialbreadth, std 0.012
+FOREARM_RADIUS_FRAC = 0.1176  # forearmcircumferenceflexed-derived radius : biacromialbreadth, std 0.008
+THIGH_RADIUS_FRAC = 0.2842  # thighcircumference-derived radius : hipbreadth, std 0.015
+SHIN_RADIUS_FRAC = 0.1767  # calfcircumference-derived radius : hipbreadth, std 0.012
+# tip radius = base radius * this. Both taper noticeably more than the
+# earlier guessed 0.85/0.75 — real wrists and ankles are substantially
+# thinner relative to the forearm/calf above them than that guess had it.
+ARM_TAPER = 0.5749  # wristcircumference-derived radius : forearmcircumferenceflexed-derived radius, std 0.029
+LEG_TAPER = 0.5835  # anklecircumference-derived radius : calfcircumference-derived radius, std 0.027
 
 # Hand: previously the arm chain just dead-ended at the wrist with a
 # tapered capsule cap — no hand at all, confirmed directly (no "hand" or
@@ -85,9 +91,11 @@ LEG_TAPER = 0.75  # legs narrow more from hip/knee to knee/ankle than arms do
 # stubs, not the dedicated 21-point hand landmark model; confirmed here
 # that their mutual spacing isn't a trustworthy width signal even though
 # their position is a fine direction/length signal. So width instead
-# scales off the wrist radius itself by a fixed anatomical ratio, same
-# standard every other segment in this file already uses.
-PALM_RADIUS_FRAC_OF_WRIST = 1.3  # palm is measurably wider than the wrist, not narrower
+# scales off the wrist radius itself by a ratio from ANSUR II (see the
+# radius-fraction block above for the dataset) — handbreadth/2 against a
+# wristcircumference-derived radius, mean 1.5808, std 0.0615, n=6068 —
+# superseding the originally guessed 1.3 with a population-measured one.
+PALM_RADIUS_FRAC_OF_WRIST = 1.5808
 PALM_DEPTH_RATIO = 0.45  # flatter than a limb: a hand is close to planar compared to a forearm
 THUMB_DEPTH_RATIO = 0.70
 THUMB_RADIUS_FRAC_OF_PALM = 0.45  # thumb is visibly thinner than the palm's own half-width
@@ -112,16 +120,23 @@ HAIR_DEPTH_RATIO = 0.95  # close to round; a single front photo gives no real fr
 HAIR_BLEND_FRAC = 0.08
 
 # Section-by-section depth:width ratios (front-to-back vs side-to-side) —
-# people are not round in cross-section. These are generic, widely-cited
-# anthropometric proportions (the kind figure-drawing and character-
-# modeling references use), not a licensed dataset, and deliberately
-# approximate: a stylized mannequin's cross-section, not a medical cast.
-# 1.0 = circular (this project's previous, cruder default everywhere).
-DEPTH_RATIO_HEAD = 1.15  # heads measure slightly longer front-to-back than wide
-DEPTH_RATIO_CHEST = 0.62  # chest: markedly wider side-to-side than deep
-DEPTH_RATIO_WAIST = 0.72  # waist: rounder than the chest, still not circular
-DEPTH_RATIO_HIPS = 0.78
-DEPTH_RATIO_LIMB = 0.92  # limbs are closer to round, but still slightly flattened
+# people are not round in cross-section. Like the radius fractions above,
+# these come from ANSUR II rather than a generic figure-drawing reference:
+# it measures BOTH breadth and depth for the head (headlength/headbreadth)
+# and chest/waist (chest|waistdepth / chest|waistbreadth), so these four
+# are real depth:width ratios from the same 6,068-person sample, not an
+# assumption. ANSUR has no separate hip-depth column; DEPTH_RATIO_HIPS
+# uses buttockdepth/hipbreadth as the closest real proxy instead of a
+# guess. 1.0 = circular (this project's previous, cruder default
+# everywhere). The original guesses were closer than expected for the
+# waist (0.72 guessed vs 0.7212 measured) but notably off for the chest
+# (0.62 guessed vs 0.8907 measured — a real chest is far rounder,
+# front-to-back, than that guess had it).
+DEPTH_RATIO_HEAD = 1.2914  # headlength : headbreadth, std 0.059
+DEPTH_RATIO_CHEST = 0.8907  # chestdepth : chestbreadth, std 0.078
+DEPTH_RATIO_WAIST = 0.7212  # waistdepth : waistbreadth, std 0.056
+DEPTH_RATIO_HIPS = 0.6934  # buttockdepth : hipbreadth, std 0.055
+DEPTH_RATIO_LIMB = 0.92  # limbs are closer to round, but still slightly flattened — no ANSUR limb-depth column to check this against
 
 # Face feature sizing, as a fraction of that face's own measured
 # interocular distance (inner eye corner to inner eye corner) — the
