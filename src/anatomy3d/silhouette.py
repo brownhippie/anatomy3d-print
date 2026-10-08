@@ -59,10 +59,24 @@ RECOMMENDED_FIT_SAMPLES = 800
 # gap in the size distribution, not a borderline case. This fills only
 # holes at or below that size, leaving a real enclosed background region
 # alone.
+#
+# Like POSITION_CORRIDOR_MIN/MAX_PX before it, this was a flat pixel count
+# calibrated from one photo (shoulder width 96.2px) — same disease, caught
+# by audit rather than waiting for a third photo to expose it: a hole-fill
+# AREA scales with the SQUARE of linear resolution, not linearly, so a
+# photo shot at business_person.png's scale (5.5x the beach photo's
+# shoulder width) would see both real noise holes and real anatomical gaps
+# land at roughly 30x (5.5 squared) this photo's own pixel-area numbers —
+# meaning the flat 1000px cutoff could wrongly leave real noise unfilled
+# at higher resolction, or wrongly swallow a real gap at lower resolution.
+# Expressed as a ratio of (shoulder width)^2 so it scales the same way the
+# areas themselves do; see POSITION_CORRIDOR_MIN/MAX_RATIO for the same
+# pattern applied to a linear (not area) measurement.
 MAX_HOLE_FILL_AREA_PX = 1000
+MAX_HOLE_FILL_AREA_RATIO = MAX_HOLE_FILL_AREA_PX / (96.2 ** 2)
 
 
-def _largest_filled_blob(mask: np.ndarray) -> np.ndarray:
+def _largest_filled_blob(mask: np.ndarray, body_scale_px: "float | None" = None) -> np.ndarray:
     labeled, n = ndimage.label(mask)
     if n == 0:
         raise RuntimeError(
@@ -79,7 +93,8 @@ def _largest_filled_blob(mask: np.ndarray) -> np.ndarray:
     if n_holes == 0:
         return blob
     hole_sizes = ndimage.sum(holes, hole_labels, index=range(1, n_holes + 1))
-    small_hole_ids = [i + 1 for i, s in enumerate(hole_sizes) if s <= MAX_HOLE_FILL_AREA_PX]
+    max_area = MAX_HOLE_FILL_AREA_RATIO * (body_scale_px ** 2) if body_scale_px else MAX_HOLE_FILL_AREA_PX
+    small_hole_ids = [i + 1 for i, s in enumerate(hole_sizes) if s <= max_area]
     small_holes = np.isin(hole_labels, small_hole_ids)
     return blob | small_holes
 
@@ -510,9 +525,10 @@ def extract_silhouette(
     instead of a flat pixel count to generalize across photo resolutions.
     None falls back to the flat pixel constants this was originally
     calibrated with."""
-    mask = _largest_filled_blob(_threshold_mask(rgb, border_width, threshold, background_clusters))
+    mask = _largest_filled_blob(_threshold_mask(rgb, border_width, threshold, background_clusters), body_scale_px)
     if not refine:
         return mask
     return _largest_filled_blob(
-        _two_sided_reclassify(rgb, mask, foreground_clusters, background_clusters, bones, body_scale_px)
+        _two_sided_reclassify(rgb, mask, foreground_clusters, background_clusters, bones, body_scale_px),
+        body_scale_px,
     )
