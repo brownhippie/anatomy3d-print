@@ -20,7 +20,7 @@ from typing import Optional
 
 import numpy as np
 import trimesh
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import distance_transform_edt, map_coordinates
 from skimage.measure import marching_cubes
 
 from .face_features import FaceKeypoints
@@ -203,11 +203,6 @@ SILHOUETTE_SAMPLES_PER_SEGMENT = 6
 # usual case on a clean background) passes through close to unchanged.
 SILHOUETTE_RADIUS_MIN_FRAC = 0.6
 SILHOUETTE_RADIUS_MAX_FRAC = 1.35
-# How far outward (as a multiple of the generic radius) to search for the
-# silhouette's edge before giving up and treating the point as unmeasured
-# (falls back to the generic radius for that sample only, not the whole
-# segment).
-SILHOUETTE_SEARCH_RADIUS_FRAC = 6.0
 
 
 def _to_local_xy(keypoints: DetectedKeypoints) -> dict:
@@ -271,70 +266,57 @@ def _segment(joints, name_a, name_b, radius_a, radius_b, depth_ratio_a=1.0, dept
     return (joints[name_a], joints[name_b], radius_a, radius_b, depth_ratio_a, depth_ratio_b, group)
 
 
-def _measure_half_widths(mask, px, py, perp_dx, perp_dy, max_search_px):
-    """Marches outward from (px, py) along +/-(perp_dx, perp_dy) (pixel
-    space) until stepping off the silhouette mask, returning the two
-    distances (positive side, negative side). Returns None if the center
-    point itself isn't inside the mask (a torn/offset silhouette at that
-    exact point) OR if either march never finds an edge within
-    `max_search_px` — checked against a real failure, not a hypothetical:
-    on a real test photo, a leg crossing in front of sand (misclassified
-    as foreground by silhouette.py's background-color threshold, a known
-    limitation documented there) produced a "measurement" on EVERY single
-    sample down the whole thigh, each one landing almost exactly at the
-    clamp ceiling that used to apply here — not an occasional outlier a
-    generous clamp could absorb, but the search exhausting itself against
-    a large connected blob that isn't the limb at all. A search that
-    never finds an edge is a sign the measurement is meaningless, not
-    that the limb is merely wide, so this now reports that honestly
-    (None) and the caller falls back to the pure generic radius instead
-    of a clamped-but-still-wrong one."""
-    h, w = mask.shape
+def _radius_from_distance_map(dist_map, px, py):
+    """The old approach marched a single ray in each of two opposite
+    directions, measured how far each went before leaving the mask, and
+    averaged the two into one symmetric radius. That throws real
+    information away (which side was which) and was proven, by actually
+    rebuilding and measuring it, to let the resulting capsule bulge past
+    the real photographed silhouette in several places — sampling sky
+    instead of skin once colors got baked from the photo. A fix that
+    tried to recover the lost asymmetry as a position offset was tried
+    and reverted: it made the measured bleed worse, not better, so the
+    mechanism behind the bulging wasn't what that fix assumed.
+
+    This replaces both the ray-march and the averaging with one lookup
+    into the mask's own Euclidean distance transform (distance_transform_edt
+    on the mask, computed once per photo — see _chain_from_silhouette):
+    dist_map[y, x] is, by definition, the radius of the LARGEST circle
+    centered at that exact pixel that still fits entirely inside the
+    silhouette. A capsule built from that value cannot extend past the
+    real mask boundary in any direction — that's not a tuned behavior,
+    it's what the distance transform means. Returns None exactly when the
+    point itself sits outside the mask (dist_map is 0 there), same
+    "don't trust a meaningless measurement" fallback the old version had."""
+    h, w = dist_map.shape
     cx, cy = int(round(px)), int(round(py))
-    if not (0 <= cx < w and 0 <= cy < h) or not mask[cy, cx]:
+    if not (0 <= cx < w and 0 <= cy < h):
         return None
-
-    def march(sign):
-        dist = 0.0
-        while dist < max_search_px:
-            x = int(round(px + sign * perp_dx * dist))
-            y = int(round(py + sign * perp_dy * dist))
-            if not (0 <= x < w and 0 <= y < h) or not mask[y, x]:
-                return dist
-            dist += 1.0
-        return None  # never found an edge — not a measurement, a search failure
-
-    d_pos, d_neg = march(1.0), march(-1.0)
-    if d_pos is None or d_neg is None:
-        return None
-    return d_pos, d_neg
+    r = float(dist_map[cy, cx])
+    return r if r > 0 else None
 
 
 def _chain_from_silhouette(
-    mask, image_width, image_height, a, b, ra, rb, dra, drb, n_samples, group
+    dist_map, image_width, image_height, a, b, ra, rb, dra, drb, n_samples, group
 ):
     """Replaces one straight-taper capsule with a chain of `n_samples`
     shorter ones, each sized from the photo's own silhouette width at
-    that point instead of a pure a-to-b interpolation. See
-    SILHOUETTE_SAMPLES_PER_SEGMENT's comment for why, and
-    SILHOUETTE_RADIUS_MIN_FRAC/MAX_FRAC's for the safety clamp on each
-    measurement. Every piece shares `group` so build_body_mesh's SDF
-    accumulation hard-unions them together (they already meet exactly at
-    shared endpoints with matching radius — no seam to smooth over) instead
-    of smooth-min'ing each of the n_samples joints, which would otherwise
-    compound a small fillet-bulge at every one of them into a visibly
-    fatter limb than any individual measurement called for."""
+    that point instead of a pure a-to-b interpolation. `dist_map` is the
+    silhouette mask's own Euclidean distance transform (see
+    _radius_from_distance_map and _build_capsules, which computes it once
+    per photo) — each sample's radius is a direct lookup into it, not a
+    ray-march. See SILHOUETTE_RADIUS_MIN_FRAC/MAX_FRAC's for the safety
+    clamp still applied on top. Every piece shares `group` so
+    build_body_mesh's SDF accumulation hard-unions them together (they
+    already meet exactly at shared endpoints with matching radius — no
+    seam to smooth over) instead of smooth-min'ing each of the n_samples
+    joints, which would otherwise compound a small fillet-bulge at every
+    one of them into a visibly fatter limb than any individual
+    measurement called for."""
     ba = b - a
     length = np.linalg.norm(ba)
     if length < 1e-6:
         return None
-    direction = ba / length
-    # Perpendicular within the local XY plane (joints have z=0 — see
-    # _to_local_xy); local x maps directly to pixel x, but local y is
-    # pixel-flipped (h/2 - py), so the pixel-space step for a local
-    # perpendicular move has its y component negated.
-    perp_local = np.array([-direction[1], direction[0], 0.0])
-    perp_px = np.array([perp_local[0], -perp_local[1]])
 
     points, radii = [], []
     for i in range(n_samples + 1):
@@ -343,14 +325,10 @@ def _chain_from_silhouette(
         generic_r = ra + (rb - ra) * t
         px = pt[0] + image_width / 2.0
         py = image_height / 2.0 - pt[1]
-        half = _measure_half_widths(
-            mask, px, py, perp_px[0], perp_px[1], generic_r * SILHOUETTE_SEARCH_RADIUS_FRAC
-        )
-        if half is None:
+        measured_r = _radius_from_distance_map(dist_map, px, py)
+        if measured_r is None:
             measured_r = generic_r
         else:
-            d_pos, d_neg = half
-            measured_r = (d_pos + d_neg) / 2.0
             lo, hi = generic_r * SILHOUETTE_RADIUS_MIN_FRAC, generic_r * SILHOUETTE_RADIUS_MAX_FRAC
             measured_r = float(np.clip(measured_r, lo, hi))
         points.append(pt)
@@ -549,6 +527,11 @@ def _build_capsules(
             thumb_r = palm_r * THUMB_RADIUS_FRAC_OF_PALM
             segs.append((f"{side}_wrist", thumb_name, wrist_r * 0.6, thumb_r, DEPTH_RATIO_LIMB, THUMB_DEPTH_RATIO))
     use_silhouette = silhouette_mask is not None and image_width and image_height
+    # Computed once per photo, not per segment/sample — distance_transform_edt
+    # over the whole mask is cheap (milliseconds) next to the per-pixel cost
+    # of marching_cubes just below, and every segment's chain reads from the
+    # same one. See _radius_from_distance_map for what this gives each sample.
+    dist_map = distance_transform_edt(silhouette_mask) if use_silhouette else None
     logical_count = 0
     for group_id, (a, b, ra, rb, dra, drb) in enumerate(segs):
         seg = _segment(joints, a, b, ra, rb, dra, drb, group=group_id)
@@ -562,7 +545,7 @@ def _build_capsules(
         if use_silhouette and a != "head_top":
             ja, jb = seg[0], seg[1]
             chain = _chain_from_silhouette(
-                silhouette_mask, image_width, image_height, ja, jb, ra, rb, dra, drb,
+                dist_map, image_width, image_height, ja, jb, ra, rb, dra, drb,
                 SILHOUETTE_SAMPLES_PER_SEGMENT, group_id,
             )
             if chain:
