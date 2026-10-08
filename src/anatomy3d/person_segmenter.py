@@ -59,6 +59,7 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from PIL import Image, ImageFilter
+from scipy import ndimage
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
@@ -181,16 +182,38 @@ def _segment_coarse(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]
         return normal
     normal_mask, normal_alpha = normal
     sharp_mask, sharp_alpha = sharpened
+
+    # Background the clean (unsharpened) pass finds fully enclosed by the
+    # detected person — no path out to the photo's edge — is a real
+    # anatomical gap (between fingers, an "OK" gesture's circle, the open
+    # floor/wall between two separated legs), not photo noise. Confirmed
+    # directly on a real standing-person photo: the clean pass correctly
+    # read the gap between the legs as background (alpha 0.13), but the
+    # aggressive sharpen pass confidently relabeled the whole enclosed
+    # pocket as person (alpha 0.90-0.97) — ringing from radius=6,
+    # percent=300 sharpening right at the gap's edges, not real rescued
+    # detail. So the sharpened pass is only trusted to ADD new person
+    # pixels in background that's still open to the rest of the frame;
+    # an enclosed pocket stays whatever the clean pass called it,
+    # regardless of what the sharpened pass says.
+    labeled_bg, _ = ndimage.label(~normal_mask)
+    border_labels = set(np.unique(labeled_bg[0, :])) | set(np.unique(labeled_bg[-1, :]))
+    border_labels |= set(np.unique(labeled_bg[:, 0])) | set(np.unique(labeled_bg[:, -1]))
+    border_labels.discard(0)
+    enclosed_bg = (labeled_bg != 0) & ~np.isin(labeled_bg, list(border_labels))
+
     # The sharpened pass only gets to raise alpha where IT crosses its own
-    # hard-mask threshold, not everywhere via a raw elementwise max.
-    # Confirmed directly: the aggressive sharpen amplifies texture/shadow
-    # noise in a flat background wall into weak partial "person"
-    # confidence (0.08 -> up to 0.29) — never enough to cross the hard
-    # mask's 0.5 threshold, but enough to show up as visible background
-    # smudging in the soft-alpha cutout, since that output isn't
-    # thresholded at all.
-    alpha = np.where(sharp_mask, np.maximum(normal_alpha, sharp_alpha), normal_alpha)
-    return normal_mask | sharp_mask, alpha
+    # hard-mask threshold AND that pixel isn't in a clean-pass-enclosed
+    # background pocket — not everywhere via a raw elementwise max.
+    # Confirmed directly: the aggressive sharpen also amplifies
+    # texture/shadow noise in a flat (non-enclosed) background wall into
+    # weak partial "person" confidence (0.08 -> up to 0.29) — never
+    # enough to cross the hard mask's 0.5 threshold, but enough to show
+    # up as visible background smudging in the soft-alpha cutout, since
+    # that output isn't thresholded at all.
+    rescue_allowed = sharp_mask & ~enclosed_bg
+    alpha = np.where(rescue_allowed, np.maximum(normal_alpha, sharp_alpha), normal_alpha)
+    return normal_mask | rescue_allowed, alpha
 
 
 # The model's own fixed internal processing resolution (the "256x256" in
