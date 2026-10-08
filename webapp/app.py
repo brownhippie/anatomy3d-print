@@ -1,6 +1,7 @@
 """Minimal web front-end for the photo -> printable-mesh pipeline."""
 import os
 import tempfile
+from typing import List
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
@@ -15,10 +16,12 @@ INDEX_HTML = """
 <head><title>anatomy3d-print</title></head>
 <body style="font-family: sans-serif; max-width: 640px; margin: 40px auto;">
   <h1>anatomy3d-print</h1>
-  <p>Upload a clear, front-facing, full-body photo. You'll get back a
-  3D-printable STL (plus an OBJ for other uses).</p>
+  <p>Upload one clear, front-facing, full-body photo for a quick geometric
+  guess, or several photos shot at different angles around the subject
+  (front first) for a visual-hull reconstruction of the actual shape.
+  You'll get back a 3D-printable STL (plus an OBJ for other uses).</p>
   <form action="/fit" method="post" enctype="multipart/form-data">
-    <input type="file" name="image" accept="image/*" required><br><br>
+    <input type="file" name="images" accept="image/*" required multiple><br><br>
     <label>Height (mm): <input type="number" name="height_mm" value="150" min="20" max="1000"></label><br><br>
     <button type="submit">Generate model</button>
   </form>
@@ -38,15 +41,18 @@ def health():
 
 
 @app.post("/fit")
-async def fit(image: UploadFile = File(...), height_mm: float = Form(150.0)):
+async def fit(images: List[UploadFile] = File(...), height_mm: float = Form(150.0)):
     with tempfile.TemporaryDirectory() as tmp:
-        image_path = os.path.join(tmp, image.filename or "upload.jpg")
-        with open(image_path, "wb") as f:
-            f.write(await image.read())
+        image_paths = []
+        for i, image in enumerate(images):
+            path = os.path.join(tmp, f"{i}_{image.filename or 'upload.jpg'}")
+            with open(path, "wb") as f:
+                f.write(await image.read())
+            image_paths.append(path)
 
         out_stl = os.path.join(tmp, "figure.stl")
         try:
-            run_pipeline(image_path, out_stl, target_height_mm=height_mm)
+            run_pipeline(image_paths, out_stl, target_height_mm=height_mm)
         except Exception as exc:
             raise HTTPException(400, str(exc)) from exc
 

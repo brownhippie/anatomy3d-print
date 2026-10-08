@@ -15,28 +15,40 @@ pipeline no longer depends on it. The SMPL-X path still exists as an
 optional, clearly-marked research mode (see below) for anyone who wants
 higher fidelity under that license.
 
-## How the default pipeline works
+## Two reconstruction modes
 
-1. **`landmarks.py`** — runs MediaPipe Pose (Apache-2.0, commercial-friendly)
-   on the input photo to get 2D body keypoints.
-2. **`procedural_body.py`** — builds a 3D figure with no learned model at
-   all:
-   - places a skeleton from the detected keypoints,
-   - wraps each bone in a tapered capsule, sized from generic,
-     widely-published figure-proportion ratios (the kind used in figure
-     drawing / character-modeling references — not a licensed dataset)
-     scaled by that bone's own measured length from the photo,
-   - blends overlapping capsules with a smooth-minimum of their signed
-     distance fields (a standard, well-known CG technique) so joints merge
-     instead of leaving hard seams,
-   - extracts the result as a closed surface with marching cubes.
-3. **`print_prep.py`** — repairs the mesh (merges vertices, fills holes,
-   fixes normals) and exports STL/OBJ.
-4. **`pipeline.py`** / **`cli.py`** — wires it together.
+**One photo** → `procedural_body.py`: a geometric guess. Places a skeleton
+from MediaPipe keypoints, wraps each bone in a tapered capsule sized from
+generic figure-proportion ratios (figure-drawing references, not a
+licensed dataset) scaled by that bone's own measured length, blends
+overlapping capsules with a smooth-minimum of their signed distance fields,
+extracts the result with marching cubes. Fast, but it's a stylized guess —
+it doesn't know the actual shape of the person in the photo, only their
+joint proportions.
 
-Every piece here is either measured directly from your photo or a
-well-known, unencumbered formula — no third-party model weights, no
-training-data license, nothing to clear before you can use this commercially.
+**Two or more photos, shot from different angles around the subject**
+(front first, then rotating — a phone-selfie "turnaround" or someone else
+walking around you works) → `visual_hull.py`: classical visual hull / space
+carving (Laurentini 1994; Kutulakos & Seitz 2000). `silhouette.py` extracts
+each photo's subject outline (sample the border as background color,
+threshold, keep the largest connected blob — this specific technique is
+carried over from unrelated research of mine on a different project, where
+it was specified for the same background-removal problem). Each silhouette
+rules out everything outside it; carving a voxel grid down to what survives
+every view recovers the subject's *actual* cross-section, not a guess. Two
+photos (front + side) already constrain both width and depth; more photos
+narrow it further. This is strictly more information than one photo can
+ever give — the real tradeoff for better accuracy is taking more photos,
+not a bigger model.
+
+Both paths go through `print_prep.py` (repairs the mesh: merges vertices,
+fills holes, fixes normals, drops stray disconnected debris down to the
+main body) and export STL/OBJ via `pipeline.py` / `cli.py`.
+
+Every piece here is either measured directly from your photos or a
+well-known, unencumbered formula/algorithm — no third-party model weights,
+no training-data license, nothing to clear before you can use this
+commercially.
 
 ## Setup
 
@@ -49,6 +61,8 @@ No model downloads, no license gate, no registration needed.
 
 ## Usage
 
+One photo (capsule guess):
+
 ```bash
 python -m anatomy3d.cli \
   --image path/to/photo.jpg \
@@ -56,11 +70,29 @@ python -m anatomy3d.cli \
   --height-mm 150
 ```
 
+Multiple photos (visual hull — front first, then rotating around the subject):
+
+```bash
+python -m anatomy3d.cli \
+  --image front.jpg side.jpg back.jpg \
+  --out output/figure.stl \
+  --height-mm 150
+```
+
+`--angles` lets you override the assumed rotation angles (degrees) if you
+didn't shoot an even turntable; it defaults to front+side (0°, 90°) for two
+photos, evenly spaced for three or more.
+
 Outputs an STL ready for a slicer, plus an OBJ of the same mesh for
 rendering/animation use elsewhere. `--height-mm` sets the printed figure's
-height (a monocular photo gives no reliable real-world scale, so the whole
-figure is normalized to this target height rather than guessed from the
-photo).
+height (a photo gives no reliable real-world scale, so the whole figure is
+normalized to this target height rather than guessed from the photo).
+
+Every photo (either mode) goes through `preprocess.py` first: EXIF
+rotation correction, downscaling to a sane working resolution, contrast
+normalization, and unsharp-mask sharpening — a soft/dim phone photo feeds
+MediaPipe and the silhouette extractor much worse edges than a crisp one,
+and this costs nothing to fix before detection runs.
 
 ## Desktop app (.exe)
 
@@ -95,14 +127,30 @@ doesn't need any.
 
 ## Limitations (read before printing)
 
-- **Stylized, not realistic.** This is a smooth mannequin-like figure —
-  tapered limbs, a simple head, no face, no hands/fingers, no clothing.
-  It will not look like a scanned likeness of the person in the photo.
-  That's the direct trade-off for not depending on a licensed body model.
-- **Single photo, frontal pose assumed, no depth.** The figure is built
-  with a fixed, stylized front-to-back thickness, not measured depth —
-  there's no way to recover real depth from one photo. Proportions
-  (limb lengths, torso width) come from the photo; roundness doesn't.
+**Single-photo (capsule) mode:**
+- **Stylized, not realistic.** Tapered limbs, a simple head, no face, no
+  hands/fingers, no clothing. It will not look like a scanned likeness of
+  the person. That's the direct trade-off for not depending on a licensed
+  body model.
+- **No real depth.** Built with a fixed, stylized front-to-back thickness,
+  not measured depth. Proportions (limb lengths, torso width) come from the
+  photo; roundness doesn't.
+
+**Multi-photo (visual hull) mode:**
+- **Can't recover concavities.** This is a fundamental property of visual
+  hull, not a bug: the armpit gap between an arm and the torso, for
+  example, won't be recovered unless some view's silhouette actually shows
+  daylight through that gap. Arms held close to the body tend to fuse into
+  the torso in the result.
+- **Assumes consistent framing.** All photos need the subject at roughly
+  the same distance/zoom and centered the same way — the carving shares one
+  pixel-to-world scale across every view (see `visual_hull.py`'s docstring).
+  A photo shot noticeably closer or further than the others will distort
+  the result.
+- **No face/hands/clothing texture**, same as single-photo mode — this
+  recovers shape, not surface detail.
+
+**Both modes:**
 - **Check the STL in your slicer before printing.** The repair step fixes
   common issues (non-manifold edges, small holes) but very thin joints may
   still need manual cleanup in Meshmixer/Netfabb/Blender depending on your
@@ -129,13 +177,16 @@ into the CLI/web/desktop apps. To experiment with it:
 
 ```
 src/anatomy3d/
-  landmarks.py       2D pose keypoint detection
-  procedural_body.py  default: from-scratch capsule/SDF body builder
-  body_fit.py          optional: SMPL-X fitting (non-commercial license)
+  preprocess.py       EXIF fix, resize, contrast + sharpen
+  landmarks.py         2D pose keypoint detection
+  procedural_body.py    single-photo: capsule/SDF body builder
+  silhouette.py          multi-photo: background removal -> mask
+  visual_hull.py           multi-photo: voxel carving -> mesh
+  body_fit.py                optional: SMPL-X fitting (non-commercial license)
   mesh_types.py        shared BodyMesh type
   mesh_export.py        OBJ export
   print_prep.py          mesh repair + STL export
-  pipeline.py              orchestration (uses procedural_body.py)
+  pipeline.py              orchestration (picks capsule vs. hull by photo count)
   cli.py                    command-line entry point
 webapp/app.py        FastAPI web front end
 desktop_app.py       Tkinter desktop GUI (-> .exe via PyInstaller)
