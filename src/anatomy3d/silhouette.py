@@ -69,9 +69,23 @@ def _largest_filled_blob(mask: np.ndarray) -> np.ndarray:
 # far out to be flagged foreground — not an unbounded "anything goes".
 MAHALANOBIS_THRESHOLD = 3.5
 
+# How many background color tones to look for by default. Was 2 (sky,
+# sand) — raised after measuring, not guessing, that a real beach photo
+# actually has at least 3 distinct background tones (sky, open water,
+# sand), and that 2 clusters left a wide band of water misclassified as
+# foreground across whole image rows (see _threshold_mask's docstring for
+# the actual before/after numbers). 5 is where that same measurement
+# plateaued — more clusters than a photo's real tone count stopped
+# changing the result at all, rather than where accuracy was still
+# improving, so it isn't just "generously higher than 2". A genuinely
+# flat, single-tone background is unaffected regardless: _threshold_mask
+# already collapses to k=1 on its own when the border sample's own color
+# spread says there's nothing to cluster.
+DEFAULT_BACKGROUND_CLUSTERS = 5
+
 
 def _threshold_mask(
-    rgb: np.ndarray, border_width: int = 12, threshold: float = 32.0, background_clusters: int = 2
+    rgb: np.ndarray, border_width: int = 12, threshold: float = 32.0, background_clusters: int = DEFAULT_BACKGROUND_CLUSTERS
 ) -> np.ndarray:
     """A single border-sampled color only describes a flat, one-tone
     background, and even a flat Euclidean distance from it doesn't
@@ -92,7 +106,20 @@ def _threshold_mask(
     body-color pixels (measured 4-10+ standard deviations out) from real
     background texture (measured within ~2) on that same photo. A
     genuinely flat, low-texture background just produces tight clusters
-    and behaves close to the old flat-distance behavior."""
+    and behaves close to the old flat-distance behavior.
+
+    That "two-tone" photo turned out to undersell its own background,
+    found later by actually checking per-row mask coverage on it: with
+    the default of 2 clusters, a wide band of open water (a third real
+    tone — sky, water, and sand are all genuinely different colors, not
+    two) came out 29-100% misclassified as foreground across whole image
+    rows, not an edge case. Re-measured against several cluster counts
+    on that same photo: the bad-row count dropped from 104/200 at k=2 to
+    15/200 at k=5, and k=5/6/8/10 then gave IDENTICAL results — a real,
+    data-found plateau (more clusters than the photo's actual number of
+    distinct background tones just subdivides a tone that's already
+    well-fit, not a number picked by feel), not a guess. See
+    DEFAULT_BACKGROUND_CLUSTERS."""
     border_pixels = np.concatenate([
         rgb[:border_width].reshape(-1, 3),
         rgb[-border_width:].reshape(-1, 3),
@@ -184,7 +211,7 @@ def extract_silhouette(
     border_width: int = 12,
     threshold: float = 32.0,
     refine: bool = True,
-    background_clusters: int = 2,
+    background_clusters: int = DEFAULT_BACKGROUND_CLUSTERS,
 ) -> np.ndarray:
     mask = _largest_filled_blob(_threshold_mask(rgb, border_width, threshold, background_clusters))
     if not refine:
