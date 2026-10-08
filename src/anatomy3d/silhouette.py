@@ -121,6 +121,24 @@ MIN_COMPONENT_AREA_PX = 100
 MIN_COMPONENT_AREA_RATIO = MIN_COMPONENT_AREA_PX / (96.2 ** 2)  # see MAX_HOLE_FILL_AREA_RATIO — same area-scaling reasoning
 
 
+# Deliberately does NOT fill enclosed holes the way _largest_filled_blob
+# (the color/position fallback's own cleanup) does. That hole-filling was
+# built for the old color classifier, which really did produce small
+# meaningless noise holes needing cleanup. Confirmed this doesn't carry
+# over to the segmentation model's output: re-checked all three real test
+# photos after the alpha-threshold fix above and every one now has ZERO
+# enclosed holes in its raw mask — there's nothing left for hole-filling
+# to usefully clean up. Worse, confirmed directly that it actively
+# destroys real content on a photo with hand gestures (two people making
+# "OK" signs): the raw mask correctly found the thumb-index circle as a
+# genuine 592px enclosed background hole (plus a second person's at
+# 224px, and finger-separation gaps at 274-1116px) — real gaps, not
+# noise, all of them well under a typical MAX_HOLE_FILL_AREA_PX-style
+# cutoff and so all of them vulnerable to being blindly filled back in as
+# "person". A size-based noise filter is actively dangerous for this
+# model's output specifically because its real failure mode (gaps between
+# fingers, through a gesture's loop) is small by nature — the same size
+# a noise filter is built to erase.
 def _clean_segmentation_mask(mask: np.ndarray, body_scale_px: "float | None" = None) -> np.ndarray:
     labeled, n = ndimage.label(mask)
     if n == 0:
@@ -133,18 +151,7 @@ def _clean_segmentation_mask(mask: np.ndarray, body_scale_px: "float | None" = N
     keep_ids = [i + 1 for i, s in enumerate(sizes) if s >= min_area]
     if not keep_ids:  # degenerate case: nothing passes the floor — keep the single largest rather than nothing
         keep_ids = [1 + int(np.argmax(sizes))]
-    kept = np.isin(labeled, keep_ids)
-
-    fully_filled = ndimage.binary_fill_holes(kept)
-    holes = fully_filled & ~kept
-    hole_labels, n_holes = ndimage.label(holes)
-    if n_holes == 0:
-        return kept
-    hole_sizes = ndimage.sum(holes, hole_labels, index=range(1, n_holes + 1))
-    max_area = MAX_HOLE_FILL_AREA_RATIO * (body_scale_px ** 2) if body_scale_px else MAX_HOLE_FILL_AREA_PX
-    small_hole_ids = [i + 1 for i, s in enumerate(hole_sizes) if s <= max_area]
-    small_holes = np.isin(hole_labels, small_hole_ids)
-    return kept | small_holes
+    return np.isin(labeled, keep_ids)
 
 
 # A Mahalanobis distance of this many "standard deviations" from the
