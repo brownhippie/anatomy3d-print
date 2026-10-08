@@ -51,10 +51,23 @@ HIP_RADIUS_FRAC_OF_HIP_WIDTH = 0.46
 # section" proportion real rather than a single linear taper.
 WAIST_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.34
 WAIST_HEIGHT_FRAC = 0.55  # fraction of the way from neck to pelvis
-UPPER_ARM_RADIUS_FRAC = 0.14
-FOREARM_RADIUS_FRAC = 0.11
-THIGH_RADIUS_FRAC = 0.17
-SHIN_RADIUS_FRAC = 0.12
+# Recalibrated against real output, not left at the original guess: a
+# real test photo (MediaPipe's own `pose.jpg`, a dynamic side lunge)
+# measured these out at 2-4x thinner than generic circumference-to-height
+# anthropometric ratios (adult upper-arm/forearm/thigh/calf circumference
+# as a fraction of height, the same kind of generic figure reference used
+# throughout this file) predict — e.g. a thigh radius of ~2.5mm on a
+# 150mm figure versus the ~7mm these ratios suggest. The segs list below
+# used to compound each of these with its own extra ad hoc 0.3-0.6
+# end-multiplier on top; that's now folded into the constants themselves
+# (base = this fraction, tip = this fraction * the segment's own taper
+# below) so there's one place these are set, not two.
+UPPER_ARM_RADIUS_FRAC = 0.115
+FOREARM_RADIUS_FRAC = 0.095
+THIGH_RADIUS_FRAC = 0.30
+SHIN_RADIUS_FRAC = 0.21
+ARM_TAPER = 0.85  # tip radius = base radius * this
+LEG_TAPER = 0.75  # legs narrow more from hip/knee to knee/ankle than arms do
 
 # Section-by-section depth:width ratios (front-to-back vs side-to-side) —
 # people are not round in cross-section. These are generic, widely-cited
@@ -103,6 +116,12 @@ EYE_SOCKET_RECESS_FRAC = 0.35  # how far back from the eye-corner plane the sock
 FACE_VOXEL_FRAC = 1.1
 MAX_GRID_RESOLUTION_WITH_FACE = 340
 FACE_SKIP_FACTOR = 2.0
+# Same purpose, applied to ordinary body limbs instead of face features —
+# there's no skip option here (a forearm isn't optional the way fine face
+# detail is), only a cost cap. Kept slightly below the face cap since this
+# path can trigger on any pose with limbs spread wide, not just when a
+# face happens to be detected, so it needs to stay cheap more often.
+MAX_GRID_RESOLUTION_BODY = 300
 
 
 def _to_local_xy(keypoints: DetectedKeypoints) -> dict:
@@ -243,14 +262,14 @@ def _build_capsules(joints: dict) -> list:
         ("head_top", "neck", head_r, head_r * 0.6, DEPTH_RATIO_HEAD, DEPTH_RATIO_HEAD),
         ("neck", "waist", torso_r_top, waist_r, DEPTH_RATIO_CHEST, DEPTH_RATIO_WAIST),
         ("waist", "pelvis", waist_r, torso_r_bot, DEPTH_RATIO_WAIST, DEPTH_RATIO_HIPS),
-        ("left_shoulder_attach", "left_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.5, shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.4, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("right_shoulder_attach", "right_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.5, shoulder_width * UPPER_ARM_RADIUS_FRAC * 0.4, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("left_elbow", "left_wrist", shoulder_width * FOREARM_RADIUS_FRAC * 0.4, shoulder_width * FOREARM_RADIUS_FRAC * 0.3, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("right_elbow", "right_wrist", shoulder_width * FOREARM_RADIUS_FRAC * 0.4, shoulder_width * FOREARM_RADIUS_FRAC * 0.3, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("left_hip_attach", "left_knee", hip_width * THIGH_RADIUS_FRAC * 0.6, hip_width * THIGH_RADIUS_FRAC * 0.4, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("right_hip_attach", "right_knee", hip_width * THIGH_RADIUS_FRAC * 0.6, hip_width * THIGH_RADIUS_FRAC * 0.4, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("left_knee", "left_ankle", hip_width * SHIN_RADIUS_FRAC * 0.4, hip_width * SHIN_RADIUS_FRAC * 0.3, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("right_knee", "right_ankle", hip_width * SHIN_RADIUS_FRAC * 0.4, hip_width * SHIN_RADIUS_FRAC * 0.3, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("left_shoulder_attach", "left_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC, shoulder_width * UPPER_ARM_RADIUS_FRAC * ARM_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("right_shoulder_attach", "right_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC, shoulder_width * UPPER_ARM_RADIUS_FRAC * ARM_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("left_elbow", "left_wrist", shoulder_width * FOREARM_RADIUS_FRAC, shoulder_width * FOREARM_RADIUS_FRAC * ARM_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("right_elbow", "right_wrist", shoulder_width * FOREARM_RADIUS_FRAC, shoulder_width * FOREARM_RADIUS_FRAC * ARM_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("left_hip_attach", "left_knee", hip_width * THIGH_RADIUS_FRAC, hip_width * THIGH_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("right_hip_attach", "right_knee", hip_width * THIGH_RADIUS_FRAC, hip_width * THIGH_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("left_knee", "left_ankle", hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("right_knee", "right_ankle", hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
     ]
     for a, b, ra, rb, dra, drb in segs:
         seg = _segment(joints, a, b, ra, rb, dra, drb)
@@ -450,6 +469,25 @@ def build_body_mesh(
 
     dims = maxs - mins
 
+    # Not just a face-detail concern: ANY capsule thinner than the grid's
+    # own voxel size gets rounded away by marching cubes, same failure
+    # mode either way (see the face case below, where this was first
+    # measured and calibrated). It just took a real photo to surface it
+    # for ordinary body limbs — every synthetic test built so far used a
+    # compact standing pose, but a photo with limbs spread wide (arms out,
+    # a lunging leg) blows up dims.max() without the limbs themselves
+    # getting any thicker, which can push the default resolution's voxel
+    # size past even a forearm's or shin's own radius. Measured directly
+    # on MediaPipe's own real `pose.jpg` sample (a side lunge, arms out):
+    # voxel size 3.26 against a thinnest-limb radius of 2.11 (ratio 1.54,
+    # already past the 1.1-ish ratio this project's own calibration below
+    # found insufficient) rendered the forearms and shins as near-invisible
+    # hairlines instead of tapered capsules. Unlike face detail, limbs
+    # aren't optional — there's no "skip it" here, only "resolve it",
+    # capped to bound cost.
+    required_resolution_body = dims.max() / (min(all_radii) * FACE_VOXEL_FRAC)
+    grid_resolution = int(np.clip(required_resolution_body, grid_resolution, MAX_GRID_RESOLUTION_BODY))
+
     if face_capsules:
         # Measured directly, not assumed: a nose/chin sized right for a
         # real face is tiny next to a whole body's bounding box, and at
@@ -462,17 +500,18 @@ def build_body_mesh(
         # the face capsules; raising resolution until voxel size dropped
         # below the nose's own radius made the same test start measuring
         # the expected bump (within ~10% of the exact analytic SDF
-        # prediction once 2-3 voxels span the smallest feature radius).
-        # So: sharpen the grid only as far as needed to resolve the
-        # smallest face feature, capped to bound runtime cost (uniform
-        # global refinement this coarse already costs ~5x at the cap
-        # tested here) — and if even the cap can't get there (a face
-        # that's a very small fraction of the frame), skip adding the
-        # face geometry rather than silently shipping a change too small
-        # for any viewer or slicer to ever see.
+        # prediction once voxel size roughly matched the smallest feature's
+        # own radius — not several voxels across it, an earlier guess that
+        # was checked against real numbers and found to demand a far finer
+        # grid than necessary). So: sharpen the grid only as far as needed
+        # to resolve the smallest face feature, capped to bound runtime
+        # cost — and if even the cap can't get there (a face that's a very
+        # small fraction of the frame), skip adding the face geometry
+        # rather than silently shipping a change too small for any viewer
+        # or slicer to ever see.
         face_radii = [r for cap in face_capsules for r in cap[2:4]] + [r for _c, r in eye_sockets]
-        required_resolution = dims.max() / (min(face_radii) * FACE_VOXEL_FRAC)
-        if required_resolution > MAX_GRID_RESOLUTION_WITH_FACE * FACE_SKIP_FACTOR:
+        required_resolution_face = dims.max() / (min(face_radii) * FACE_VOXEL_FRAC)
+        if required_resolution_face > MAX_GRID_RESOLUTION_WITH_FACE * FACE_SKIP_FACTOR:
             print(
                 "Note: a face was detected, but it's too small relative to the "
                 "whole-body photo to render fine facial detail at a practical "
@@ -482,7 +521,9 @@ def build_body_mesh(
             )
             face_capsules, eye_sockets = [], []
         else:
-            grid_resolution = int(np.clip(required_resolution, grid_resolution, MAX_GRID_RESOLUTION_WITH_FACE))
+            grid_resolution = int(
+                np.clip(required_resolution_face, grid_resolution, MAX_GRID_RESOLUTION_WITH_FACE)
+            )
 
     res = np.maximum((dims / dims.max() * grid_resolution).astype(int), 8)
     xs = np.linspace(mins[0], maxs[0], res[0])
