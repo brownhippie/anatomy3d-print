@@ -1,8 +1,9 @@
 """2D body keypoint detection via MediaPipe Pose."""
 from dataclasses import dataclass
 
-import cv2
 import mediapipe as mp
+
+from .preprocess import load_image_rgb
 
 # MediaPipe BlazePose landmark indices for the joints we fit against.
 MEDIAPIPE_JOINT_INDEX = {
@@ -31,14 +32,11 @@ class DetectedKeypoints:
 
 
 def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5) -> DetectedKeypoints:
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
-    height, width = image.shape[:2]
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    prepared = load_image_rgb(image_path)
+    width, height = prepared.width, prepared.height
 
     with mp.solutions.pose.Pose(static_image_mode=True, model_complexity=2) as pose:
-        result = pose.process(rgb)
+        result = pose.process(prepared.rgb)
 
     if not result.pose_landmarks:
         raise RuntimeError(
