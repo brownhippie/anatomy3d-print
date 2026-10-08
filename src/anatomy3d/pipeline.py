@@ -47,7 +47,9 @@ def run_pipeline(
 
         views = []
         for path, angle in zip(paths, angles_deg):
-            prepared = load_image_rgb(path)
+            # Full resolution here — unlike pose detection, boundary
+            # precision in the silhouette directly limits carving accuracy.
+            prepared = load_image_rgb(path, max_dimension=None)
             mask = extract_silhouette(prepared.rgb)
             views.append(SilhouetteView(mask=mask, angle_deg=angle))
 

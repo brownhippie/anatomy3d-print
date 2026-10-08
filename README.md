@@ -30,16 +30,24 @@ joint proportions.
 (front first, then rotating — a phone-selfie "turnaround" or someone else
 walking around you works) → `visual_hull.py`: classical visual hull / space
 carving (Laurentini 1994; Kutulakos & Seitz 2000). `silhouette.py` extracts
-each photo's subject outline (sample the border as background color,
-threshold, keep the largest connected blob — this specific technique is
-carried over from unrelated research of mine on a different project, where
-it was specified for the same background-removal problem). Each silhouette
-rules out everything outside it; carving a voxel grid down to what survives
-every view recovers the subject's *actual* cross-section, not a guess. Two
-photos (front + side) already constrain both width and depth; more photos
-narrow it further. This is strictly more information than one photo can
-ever give — the real tradeoff for better accuracy is taking more photos,
-not a bigger model.
+each photo's subject outline in two stages: threshold against the sampled
+background color (carried over from unrelated research of mine on a
+different project, where it was specified for the same background-removal
+problem), then a single-pass statistical reclassification — fit
+foreground/background color distributions from that threshold result and
+re-decide every pixel by which it actually fits, the same core idea as
+GrabCut's color model without pulling in OpenCV for it. (A third stage,
+snapping the boundary to image edges with an active contour, was tried and
+reverted — on a figure with a narrow neck and separated legs, it pulled the
+contour straight across both and deleted the head and most of the legs.
+Documented in `silhouette.py` in case it's worth revisiting with a
+shape-aware safety check instead of the area-ratio one that let it through.)
+Each silhouette rules out everything outside it; carving a voxel grid down
+to what survives every view recovers the subject's *actual* cross-section,
+not a guess. Two photos (front + side) already constrain both width and
+depth; more photos narrow it further. This is strictly more information
+than one photo can ever give — the real tradeoff for better accuracy is
+taking more photos, not a bigger model.
 
 Both paths go through `print_prep.py` (repairs the mesh: merges vertices,
 fills holes, fixes normals, drops stray disconnected debris down to the

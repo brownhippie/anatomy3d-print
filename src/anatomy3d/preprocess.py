@@ -25,10 +25,14 @@ class PreparedImage:
 
 def load_image_rgb(
     path: str,
-    max_dimension: int = 1280,
+    max_dimension: "int | None" = 1280,
     sharpen: bool = True,
     normalize_contrast: bool = True,
 ) -> PreparedImage:
+    """`max_dimension=None` skips resizing entirely — used by the
+    silhouette path, where boundary precision benefits from the camera's
+    real resolution. Pose detection doesn't gain anything past ~1280px, so
+    it keeps the default cap."""
     try:
         im = Image.open(path)
     except Exception as exc:
@@ -37,7 +41,7 @@ def load_image_rgb(
     im = ImageOps.exif_transpose(im)  # correct phone-camera rotation
     im = im.convert("RGB")
 
-    scale = max_dimension / max(im.width, im.height)
+    scale = max_dimension / max(im.width, im.height) if max_dimension else 1.0
     if scale < 1.0:
         new_size = (max(1, round(im.width * scale)), max(1, round(im.height * scale)))
         # LANCZOS keeps edges crisper on downsampling than bilinear, which
