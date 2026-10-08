@@ -502,6 +502,55 @@ def _two_sided_reclassify(
     return result_mask.reshape(rgb.shape[:2])
 
 
+# Every fix up to this point assumed the border-sampled color model COULD
+# in principle separate subject from background, just not accurately
+# enough yet. Tested that assumption directly against a photo with a
+# complex, textured, multi-material background (patterned curtains, a lit
+# window, flags) and it's false there, not just under-tuned: held-out
+# hand-picked background patches measured mean Mahalanobis distance 2.01
+# (range 0.61-3.09) from the fitted background clusters, while held-out
+# subject patches (face, suit, hands) measured mean 1.56 (range 0.94-3.70)
+# — the two populations overlap almost completely, foreground even scoring
+# LOWER on average. No threshold or cluster count fixes that (raising
+# background_clusters from 5 to 50 was tried directly: coverage stayed
+# under 4.3% throughout, never separating). Color alone cannot solve this
+# category of background; this isn't a parameter to tune further.
+#
+# When `bones` are given and trustworthy, position is a completely
+# different, independent signal that doesn't care about this at all — see
+# _position_is_on_body. COLOR_FAILURE_RATIO measures, per photo, whether
+# color is actually contributing anything: the ratio of stage-1's own
+# (color-only) coverage to a pure position-only mask's coverage. A raw
+# coverage number alone can't be the trigger (a subject who's small in
+# frame legitimately has low coverage without anything being broken) but
+# this RATIO is scale- and framing-invariant, confirmed across all 3
+# photos tested: 0.499 (beach, color working normally), 0.667 (business,
+# color working normally), 0.008 (this curtain photo, color having
+# measurably failed) — a 60-80x gap between "working" and "failed", not a
+# borderline call. 0.15 sits with wide margin on both sides of that gap.
+COLOR_FAILURE_RATIO = 0.15
+
+
+def _position_only_mask(
+    bones: "list[tuple[np.ndarray, np.ndarray]]", body_scale_px: float, shape: "tuple[int, int]"
+) -> np.ndarray:
+    """A crude, color-independent silhouette from the skeleton alone: every
+    pixel within POSITION_CORRIDOR_MAX_RATIO of body_scale_px (the most
+    generous per-bone radius this module ever uses) of any bone segment.
+    Deliberately generous/coarse rather than precise — this only runs when
+    COLOR_FAILURE_RATIO has already established that color classification
+    can't be trusted on this photo at all, so there's no per-bone
+    thickness measurement available to tighten it with (that measurement
+    itself comes from the now-untrustworthy color mask). A rough outline
+    close to the real figure beats a near-empty mask from a classifier
+    that's already been shown not to work here."""
+    h, w = shape
+    radius = POSITION_CORRIDOR_MAX_RATIO * body_scale_px
+    yy, xx = np.mgrid[0:h, 0:w]
+    points_xy = np.stack([xx.ravel(), yy.ravel()], axis=-1).astype(np.float64)
+    return _position_is_on_body(points_xy, bones, [radius] * len(bones)).reshape(h, w)
+
+
 def extract_silhouette(
     rgb: np.ndarray,
     border_width: int = 12,
@@ -524,8 +573,25 @@ def extract_silhouette(
     docstring for why the position-based corridor/ceiling need this
     instead of a flat pixel count to generalize across photo resolutions.
     None falls back to the flat pixel constants this was originally
-    calibrated with."""
+    calibrated with, and also skips the COLOR_FAILURE_RATIO fallback
+    below (no scale to build a position-only mask from)."""
     mask = _largest_filled_blob(_threshold_mask(rgb, border_width, threshold, background_clusters), body_scale_px)
+
+    if bones and body_scale_px:
+        pos_mask = _position_only_mask(bones, body_scale_px, rgb.shape[:2])
+        if pos_mask.any() and mask.mean() / pos_mask.mean() < COLOR_FAILURE_RATIO:
+            print(
+                f"Note: color-based classification measured as failed on this photo "
+                f"(stage-1/position coverage ratio {mask.mean() / pos_mask.mean():.3f}, well under "
+                f"the {COLOR_FAILURE_RATIO} line that separates working from failed — see "
+                "COLOR_FAILURE_RATIO) — likely a complex, textured, or multi-material "
+                "background whose color range overlaps the subject's. Falling back to a "
+                "coarse, position-only silhouette from the detected pose instead of the "
+                "near-empty result color classification alone would give; this traces the "
+                "figure's rough outline, not precise boundary detail."
+            )
+            return _largest_filled_blob(pos_mask, body_scale_px)
+
     if not refine:
         return mask
     return _largest_filled_blob(
