@@ -39,6 +39,22 @@ def _bone_list(keypoints) -> List[tuple]:
     ]
 
 
+def _body_scale_px(keypoints) -> "float | None":
+    """Shoulder width in pixels — the subject's own measured size in this
+    photo, used to scale silhouette.py's position-based corridor/ceiling
+    instead of the flat pixel constants they were calibrated with. See
+    POSITION_CORRIDOR_MIN/MAX_RATIO's docstring: those constants were
+    tuned on one 96.2px-shoulder-width photo and measurably broke on a
+    second photo shot at 5.5x that scale. None when both shoulders aren't
+    detected (silhouette.py falls back to the flat constants)."""
+    joints = keypoints.joints
+    if "left_shoulder" not in joints or "right_shoulder" not in joints:
+        return None
+    return float(np.linalg.norm(
+        np.array(joints["left_shoulder"][:2]) - np.array(joints["right_shoulder"][:2])
+    ))
+
+
 def _default_angles(n: int) -> List[float]:
     """Calibrated against an analytic ellipsoid with known ground-truth
     volume (depth axis deliberately the shape's short axis, so depth
@@ -124,7 +140,9 @@ def run_pipeline(
             # — required for the silhouette mask and the joint positions
             # to share one coordinate system (see build_body_mesh).
             silhouette_rgb = load_image_rgb(paths[0]).rgb
-            silhouette_mask = extract_silhouette(silhouette_rgb, bones=_bone_list(keypoints))
+            silhouette_mask = extract_silhouette(
+                silhouette_rgb, bones=_bone_list(keypoints), body_scale_px=_body_scale_px(keypoints)
+            )
         except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
             print(f"Note: silhouette-based shape refinement failed ({exc}); using generic proportions.")
             silhouette_mask = None

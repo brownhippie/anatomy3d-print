@@ -291,6 +291,24 @@ POSITION_CORRIDOR_SCALE = 2.0  # multiple of a bone's own measured half-width �
 POSITION_CORRIDOR_MIN_PX = 10.0  # floor for a degenerate/zero thickness reading (e.g. a bone sampled off the confident mask)
 POSITION_CORRIDOR_MAX_PX = 45.0  # ceiling — stays comfortably under the 51.4-74.0px the two known-bad spots measured
 
+# POSITION_CORRIDOR_MIN/MAX_PX and FAR_FOREGROUND_CEILING_PX above were all
+# calibrated as flat pixel counts against one real photo (shoulder width
+# 96.2px). Confirmed as a real, serious bug on a second, much higher-
+# resolution photo (shoulder width 525.9px, 5.5x larger): EVERY bone's
+# measured corridor radius hit the flat 45px ceiling and got truncated,
+# because 45px was a generous allowance at the first photo's scale but a
+# tiny fraction of a limb's real on-screen width at this one — the clip
+# chopped real, solid torso fabric into ragged holes that weren't there
+# without `bones` at all. Expressing both as ratios of the subject's own
+# measured shoulder width (when available) fixes this the same way
+# _bone_corridor_radii already fixes per-bone thickness: scale the
+# allowance from something measured in THIS photo, not a constant tuned
+# on a different one. Ratios below are exactly the flat constants divided
+# by the first photo's own 96.2px shoulder width, so a photo at that same
+# scale reproduces the original numbers unchanged.
+POSITION_CORRIDOR_MIN_RATIO = POSITION_CORRIDOR_MIN_PX / 96.2
+POSITION_CORRIDOR_MAX_RATIO = POSITION_CORRIDOR_MAX_PX / 96.2
+
 # A real, confirmed gap the per-bone corridor above doesn't cover: it only
 # resolves color-AMBIGUOUS pixels (see AMBIGUITY_MARGIN), but a real bug was
 # found where bright wave-foam color near the subject's feet was
@@ -317,10 +335,14 @@ POSITION_CORRIDOR_MAX_PX = 45.0  # ceiling — stays comfortably under the 51.4-
 # position-only check can't have that failure mode, since it never touches
 # the color model.)
 FAR_FOREGROUND_CEILING_PX = 90.0
+FAR_FOREGROUND_CEILING_RATIO = FAR_FOREGROUND_CEILING_PX / 96.2  # see POSITION_CORRIDOR_MIN/MAX_RATIO
 
 
 def _bone_corridor_radii(
-    bones: "list[tuple[np.ndarray, np.ndarray]]", dist_map: np.ndarray, n_samples: int = 5
+    bones: "list[tuple[np.ndarray, np.ndarray]]",
+    dist_map: np.ndarray,
+    n_samples: int = 5,
+    body_scale_px: "float | None" = None,
 ) -> "list[float]":
     """Each bone's own corridor radius, from the CONFIDENT mask's own
     Euclidean distance transform (`dist_map`) sampled at several points
@@ -328,7 +350,19 @@ def _bone_corridor_radii(
     of several interior samples (excluding the very ends, where a
     nearby joint's own thicker cross-section would bias a thin limb's
     reading) rather than a single point, so one unlucky sample landing in
-    a gap doesn't set the whole bone's radius."""
+    a gap doesn't set the whole bone's radius.
+
+    `body_scale_px`: the subject's own measured size in THIS photo (e.g.
+    shoulder width), used to scale the [min, max] clip range instead of
+    the flat POSITION_CORRIDOR_MIN/MAX_PX — see those constants' own
+    docstring for the real photo this was confirmed necessary on. None
+    falls back to the flat pixel constants (e.g. no shoulder pair
+    detected to measure a scale from)."""
+    if body_scale_px:
+        min_px = POSITION_CORRIDOR_MIN_RATIO * body_scale_px
+        max_px = POSITION_CORRIDOR_MAX_RATIO * body_scale_px
+    else:
+        min_px, max_px = POSITION_CORRIDOR_MIN_PX, POSITION_CORRIDOR_MAX_PX
     radii = []
     h, w = dist_map.shape
     for a, b in bones:
@@ -341,7 +375,7 @@ def _bone_corridor_radii(
                 if r > 0:
                     samples.append(r)
         thickness = float(np.median(samples)) if samples else 0.0
-        radii.append(float(np.clip(thickness * POSITION_CORRIDOR_SCALE, POSITION_CORRIDOR_MIN_PX, POSITION_CORRIDOR_MAX_PX)))
+        radii.append(float(np.clip(thickness * POSITION_CORRIDOR_SCALE, min_px, max_px)))
     return radii
 
 
@@ -375,6 +409,7 @@ def _two_sided_reclassify(
     foreground_clusters: int = DEFAULT_FOREGROUND_CLUSTERS,
     background_clusters: int = DEFAULT_BACKGROUND_CLUSTERS,
     bones: "list[tuple[np.ndarray, np.ndarray]] | None" = None,
+    body_scale_px: "float | None" = None,
 ) -> np.ndarray:
     """Replaces the single-Gaussian-per-side reclassifier this project
     used before: that version fit ONE broad Gaussian to everything stage 1
@@ -429,7 +464,7 @@ def _two_sided_reclassify(
     if bones:
         h, w = rgb.shape[:2]
         dist_map = ndimage.distance_transform_edt(seed_mask)
-        radii = _bone_corridor_radii(bones, dist_map)
+        radii = _bone_corridor_radii(bones, dist_map, body_scale_px=body_scale_px)
         yy, xx = np.mgrid[0:h, 0:w]
         points_xy = np.stack([xx.ravel(), yy.ravel()], axis=-1).astype(np.float64)
         on_body = _position_is_on_body(points_xy, bones, radii)
@@ -438,8 +473,9 @@ def _two_sided_reclassify(
         # FAR_FOREGROUND_CEILING_PX's docstring. Applied to every foreground
         # pixel, confident or not, since the bug it catches (wave foam
         # confidently matched as foreground) never even reaches `ambiguous`.
+        ceiling_px = FAR_FOREGROUND_CEILING_RATIO * body_scale_px if body_scale_px else FAR_FOREGROUND_CEILING_PX
         within_ceiling = _position_is_on_body(
-            points_xy, bones, [FAR_FOREGROUND_CEILING_PX] * len(bones)
+            points_xy, bones, [ceiling_px] * len(bones)
         )
         result_mask &= within_ceiling
     else:
@@ -459,14 +495,24 @@ def extract_silhouette(
     background_clusters: int = DEFAULT_BACKGROUND_CLUSTERS,
     foreground_clusters: int = DEFAULT_FOREGROUND_CLUSTERS,
     bones: "list[tuple[np.ndarray, np.ndarray]] | None" = None,
+    body_scale_px: "float | None" = None,
 ) -> np.ndarray:
     """`bones`: optional list of (joint_a, joint_b) pixel-coordinate pairs
     from the same photo's own detected pose (e.g. shoulder-to-elbow,
     hip-to-knee) — see _two_sided_reclassify's docstring. Deliberately
     plain coordinate pairs, not a landmarks.py type, so this module stays
     decoupled from pose-detection internals; the caller (pipeline.py)
-    builds the list from whatever keypoints it already has."""
+    builds the list from whatever keypoints it already has.
+
+    `body_scale_px`: the subject's own measured size in THIS photo (e.g.
+    shoulder width in pixels) — see POSITION_CORRIDOR_MIN/MAX_RATIO's
+    docstring for why the position-based corridor/ceiling need this
+    instead of a flat pixel count to generalize across photo resolutions.
+    None falls back to the flat pixel constants this was originally
+    calibrated with."""
     mask = _largest_filled_blob(_threshold_mask(rgb, border_width, threshold, background_clusters))
     if not refine:
         return mask
-    return _largest_filled_blob(_two_sided_reclassify(rgb, mask, foreground_clusters, background_clusters, bones))
+    return _largest_filled_blob(
+        _two_sided_reclassify(rgb, mask, foreground_clusters, background_clusters, bones, body_scale_px)
+    )

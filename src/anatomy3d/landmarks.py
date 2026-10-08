@@ -98,7 +98,7 @@ class DetectedKeypoints:
     joints: dict
 
 
-def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5) -> DetectedKeypoints:
+def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5, min_presence: float = 0.5) -> DetectedKeypoints:
     prepared = load_image_rgb(image_path)
     width, height = prepared.width, prepared.height
 
@@ -114,7 +114,16 @@ def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5) -> Detec
     joints = {}
     for name, idx in MEDIAPIPE_JOINT_INDEX.items():
         lm = landmarks[idx]
-        if lm.visibility < min_visibility:
+        # `visibility` (is this point occluded, given it's in frame) and
+        # `presence` (is this point in frame at all) are two different
+        # MediaPipe scores — confirmed as a real, separate gap, not a
+        # guess: on a tightly-cropped portrait, the hip joints (actually
+        # below the photo's bottom edge) scored visibility 0.85-0.90 (well
+        # past the 0.5 cutoff) while their own presence scored only
+        # 0.31-0.43 — visibility alone let two hallucinated, off-frame
+        # joints straight through. Filtering on both catches that case;
+        # visibility alone did not.
+        if lm.visibility < min_visibility or lm.presence < min_presence:
             continue
         joints[name] = (lm.x * width, lm.y * height, lm.visibility)
 
