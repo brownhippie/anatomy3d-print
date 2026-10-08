@@ -69,6 +69,29 @@ SHIN_RADIUS_FRAC = 0.21
 ARM_TAPER = 0.85  # tip radius = base radius * this
 LEG_TAPER = 0.75  # legs narrow more from hip/knee to knee/ankle than arms do
 
+# Hand: previously the arm chain just dead-ended at the wrist with a
+# tapered capsule cap — no hand at all, confirmed directly (no "hand" or
+# "finger" reference anywhere in this file before this). MediaPipe Pose's
+# 33-point topology already detects index/pinky/thumb landmarks (indices
+# 17-22) alongside the wrist; they just weren't read.
+#
+# The palm's LENGTH and ORIENTATION come from the actual detected
+# index/pinky/thumb positions for that hand in that photo (a position is
+# a position, regardless of how the model arrived at it). Its WIDTH does
+# not: tried using the measured index-to-pinky distance directly first,
+# and it came out to 1.3-1.5 units against a ~7.8-unit wrist radius on
+# the test photo — physically implausible (a palm narrower than the
+# wrist). These 6 points are BlazePose's approximate hand-orientation
+# stubs, not the dedicated 21-point hand landmark model; confirmed here
+# that their mutual spacing isn't a trustworthy width signal even though
+# their position is a fine direction/length signal. So width instead
+# scales off the wrist radius itself by a fixed anatomical ratio, same
+# standard every other segment in this file already uses.
+PALM_RADIUS_FRAC_OF_WRIST = 1.3  # palm is measurably wider than the wrist, not narrower
+PALM_DEPTH_RATIO = 0.45  # flatter than a limb: a hand is close to planar compared to a forearm
+THUMB_DEPTH_RATIO = 0.70
+THUMB_RADIUS_FRAC_OF_PALM = 0.45  # thumb is visibly thinner than the palm's own half-width
+
 # Hair: a radial profile of small bumps around the head, sized from the
 # photo's own hair mask (hair_features.py) instead of a generic cap —
 # stylized (a volume, not individual strands), same "deliberately
@@ -461,6 +484,10 @@ def _build_capsules(
         p = pulled(f"{side}_hip", "pelvis")
         if p is not None:
             joints[f"{side}_hip_attach"] = p
+        idx_pt = joints.get(f"{side}_index")
+        pinky_pt = joints.get(f"{side}_pinky")
+        if idx_pt is not None and pinky_pt is not None:
+            joints[f"{side}_hand_mid"] = (idx_pt + pinky_pt) / 2.0
 
     head_r = HEAD_RADIUS_FRAC_OF_SHOULDER_WIDTH * shoulder_width
     torso_r_top = TORSO_RADIUS_FRAC_OF_SHOULDER_WIDTH * shoulder_width
@@ -487,6 +514,25 @@ def _build_capsules(
         ("left_knee", "left_ankle", hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
         ("right_knee", "right_ankle", hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
     ]
+
+    # Hand capsules: a palm from wrist to the index/pinky midpoint, plus a
+    # thumb, each its own group so they blend smoothly into the forearm
+    # at the wrist the same way the forearm blends into the upper arm —
+    # not appended as a dead-end cap. Skipped per-side (not a hard
+    # requirement like legs above) when that hand's landmarks weren't
+    # confidently detected, same fallback as every other optional joint
+    # in this function.
+    wrist_r = shoulder_width * FOREARM_RADIUS_FRAC * ARM_TAPER
+    for side in ("left", "right"):
+        hand_mid_name = f"{side}_hand_mid"
+        if hand_mid_name not in joints:
+            continue
+        palm_r = wrist_r * PALM_RADIUS_FRAC_OF_WRIST
+        segs.append((f"{side}_wrist", hand_mid_name, wrist_r, palm_r, DEPTH_RATIO_LIMB, PALM_DEPTH_RATIO))
+        thumb_name = f"{side}_thumb"
+        if thumb_name in joints:
+            thumb_r = palm_r * THUMB_RADIUS_FRAC_OF_PALM
+            segs.append((f"{side}_wrist", thumb_name, wrist_r * 0.6, thumb_r, DEPTH_RATIO_LIMB, THUMB_DEPTH_RATIO))
     use_silhouette = silhouette_mask is not None and image_width and image_height
     logical_count = 0
     for group_id, (a, b, ra, rb, dra, drb) in enumerate(segs):
