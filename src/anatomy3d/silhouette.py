@@ -238,26 +238,57 @@ def _threshold_mask(
 # clean, wide gap in the real distribution, not a borderline choice.
 AMBIGUITY_MARGIN = 2.0
 
-# How far (px) a pixel may sit from the nearest bone segment (a straight
-# line between two detected, anatomically-adjacent joints) and still be
-# trusted as real anatomy, when resolving a color-ambiguous pixel by
-# position. Measured, not guessed: real skin at mid-bone (not just near a
-# joint) sits at 0px by construction, and even an off-the-straight-line
-# point (a shin, which isn't perfectly straight) measured 15.7px; the two
-# confirmed-background ambiguous spots measured 51.4px and 74.0px — both
-# comfortably beyond either real-anatomy figure. 30 sits with a wide
-# margin on both sides of that gap.
-POSITION_CORRIDOR_PX = 30.0
+# A single flat corridor radius was tried first and measurably wrong: a
+# real forearm/upper-arm measured 5.8-10.0px thick (its own confident-mask
+# distance transform at mid-bone) on a real photo, while torso/hip bones
+# on the SAME photo measured 14.9-17.5px — a wide, real difference a flat
+# 30px radius can't fit without being several times too generous for the
+# arms. Confirmed as the actual mechanism, not assumed: that excess width
+# around the arms was exactly the real sky-blue background visible in a
+# cutout image once this was still 30px flat. So the corridor is now
+# scaled from each bone's OWN measured thickness, not one shared guess.
+POSITION_CORRIDOR_SCALE = 2.0  # multiple of a bone's own measured half-width — covers clothing/edge-blur margin, not just bare skin
+POSITION_CORRIDOR_MIN_PX = 10.0  # floor for a degenerate/zero thickness reading (e.g. a bone sampled off the confident mask)
+POSITION_CORRIDOR_MAX_PX = 45.0  # ceiling — stays comfortably under the 51.4-74.0px the two known-bad spots measured
 
 
-def _position_is_on_body(points_xy: np.ndarray, bones: "list[tuple[np.ndarray, np.ndarray]]") -> np.ndarray:
-    """For each (x, y) in `points_xy`, the distance to the nearest of
-    `bones` (each a (joint_a, joint_b) pixel-coordinate pair) — True where
-    that distance is within POSITION_CORRIDOR_PX. See AMBIGUITY_MARGIN's
-    docstring for why this only matters for color-ambiguous pixels, not
-    as a replacement for the color check."""
-    min_dist = None
+def _bone_corridor_radii(
+    bones: "list[tuple[np.ndarray, np.ndarray]]", dist_map: np.ndarray, n_samples: int = 5
+) -> "list[float]":
+    """Each bone's own corridor radius, from the CONFIDENT mask's own
+    Euclidean distance transform (`dist_map`) sampled at several points
+    along that specific bone — not one flat number for every bone. Median
+    of several interior samples (excluding the very ends, where a
+    nearby joint's own thicker cross-section would bias a thin limb's
+    reading) rather than a single point, so one unlucky sample landing in
+    a gap doesn't set the whole bone's radius."""
+    radii = []
+    h, w = dist_map.shape
     for a, b in bones:
+        samples = []
+        for t in np.linspace(0.2, 0.8, n_samples):
+            pt = a + (b - a) * t
+            x, y = int(round(pt[0])), int(round(pt[1]))
+            if 0 <= x < w and 0 <= y < h:
+                r = dist_map[y, x]
+                if r > 0:
+                    samples.append(r)
+        thickness = float(np.median(samples)) if samples else 0.0
+        radii.append(float(np.clip(thickness * POSITION_CORRIDOR_SCALE, POSITION_CORRIDOR_MIN_PX, POSITION_CORRIDOR_MAX_PX)))
+    return radii
+
+
+def _position_is_on_body(
+    points_xy: np.ndarray, bones: "list[tuple[np.ndarray, np.ndarray]]", radii: "list[float]"
+) -> np.ndarray:
+    """For each (x, y) in `points_xy`, True if it's within that specific
+    bone's own corridor radius (see _bone_corridor_radii) of the nearest
+    bone segment (a straight line between two detected, anatomically-
+    adjacent joints). See AMBIGUITY_MARGIN's docstring for why this only
+    matters for color-ambiguous pixels, not as a replacement for the
+    color check."""
+    on_body = None
+    for (a, b), radius in zip(bones, radii):
         ab = b - a
         length_sq = float(np.dot(ab, ab))
         if length_sq < 1e-9:
@@ -266,8 +297,9 @@ def _position_is_on_body(points_xy: np.ndarray, bones: "list[tuple[np.ndarray, n
             t = np.clip(((points_xy - a) @ ab) / length_sq, 0, 1)
             closest = a + t[:, None] * ab
             d = np.linalg.norm(points_xy - closest, axis=-1)
-        min_dist = d if min_dist is None else np.minimum(min_dist, d)
-    return min_dist <= POSITION_CORRIDOR_PX
+        within = d <= radius
+        on_body = within if on_body is None else (on_body | within)
+    return on_body if on_body is not None else np.zeros(len(points_xy), dtype=bool)
 
 
 def _two_sided_reclassify(
@@ -329,9 +361,11 @@ def _two_sided_reclassify(
     result_mask = confident_fg.copy()
     if bones:
         h, w = rgb.shape[:2]
+        dist_map = ndimage.distance_transform_edt(seed_mask)
+        radii = _bone_corridor_radii(bones, dist_map)
         yy, xx = np.mgrid[0:h, 0:w]
         points_xy = np.stack([xx.ravel(), yy.ravel()], axis=-1).astype(np.float64)
-        on_body = _position_is_on_body(points_xy, bones)
+        on_body = _position_is_on_body(points_xy, bones, radii)
         result_mask[ambiguous] = on_body[ambiguous]
     else:
         # No pose to check position against — keep stage 1's own call for
