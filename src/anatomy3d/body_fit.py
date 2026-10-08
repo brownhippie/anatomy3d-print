@@ -1,4 +1,5 @@
-"""Fit SMPL-X body shape/pose to 2D keypoints via weak-perspective reprojection.
+"""Optional, higher-fidelity body fitting via SMPL-X — NOT used by the
+default pipeline.
 
 SMPL-X's shape space (`betas`) is a PCA basis learned from thousands of real
 body scans, so it already encodes plausible human proportions. Regularizing
@@ -6,17 +7,23 @@ body scans, so it already encodes plausible human proportions. Regularizing
 learned distribution instead of letting an under-constrained single-photo
 fit drift into an anatomically implausible shape.
 
-This is a simplified, from-scratch reimplementation of the general idea
-behind SMPLify-X-style fitting (2D-keypoint-driven optimization of a SMPL
-family model) — not a port of that codebase.
-"""
-from dataclasses import dataclass
+This module is kept for research/non-commercial experimentation only: it
+requires SMPL-X model weights, which are licensed for non-commercial
+scientific research use (see https://smpl-x.is.tue.mpg.de/). Commercial use
+requires a separate license from Meshcapade. The default pipeline
+(`procedural_body.py`) does not use this module or depend on it.
 
+Install extras with `pip install -r requirements-smplx.txt` before using
+this module. This is a simplified, from-scratch reimplementation of the
+general idea behind SMPLify-X-style fitting (2D-keypoint-driven
+optimization of a SMPL family model) — not a port of that codebase.
+"""
 import numpy as np
 import smplx
 import torch
 
 from .landmarks import DetectedKeypoints
+from .mesh_types import BodyMesh as FittedBody
 
 # Standard SMPL/SMPL-X body joint order (first 22 joints of the model output).
 SMPLX_JOINT_INDEX = {
@@ -35,12 +42,6 @@ SMPLX_JOINT_INDEX = {
     "left_wrist": 20,
     "right_wrist": 21,
 }
-
-
-@dataclass
-class FittedBody:
-    vertices: np.ndarray  # (V, 3)
-    faces: np.ndarray  # (F, 3)
 
 
 def _build_targets(keypoints: DetectedKeypoints, device: torch.device):

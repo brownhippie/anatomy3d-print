@@ -1,12 +1,12 @@
 """Convert fitted body vertices/faces into a trimesh.Trimesh and export OBJ."""
 import trimesh
 
-from .body_fit import FittedBody
+from .mesh_types import BodyMesh
 
 
-def to_trimesh(body: FittedBody) -> trimesh.Trimesh:
+def to_trimesh(body: BodyMesh) -> trimesh.Trimesh:
     return trimesh.Trimesh(vertices=body.vertices, faces=body.faces, process=False)
 
 
-def export_obj(body: FittedBody, path: str) -> None:
+def export_obj(body: BodyMesh, path: str) -> None:
     to_trimesh(body).export(path, file_type="obj")

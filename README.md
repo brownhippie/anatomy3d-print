@@ -1,26 +1,42 @@
 # anatomy3d-print
 
-Fit a photo of a person to an anatomically-correct parametric body model
-(SMPL-X), then export a watertight, 3D-printable mesh.
+Fit a photo of a person to a stylized 3D body figure, built entirely from
+scratch (no licensed model, no gated training data), and export a
+watertight, 3D-printable mesh.
 
-## How it works
+## Why "from scratch"
 
-1. **`landmarks.py`** — runs MediaPipe Pose on the input photo to get 2D
-   body keypoints (the "pattern recognition" step).
-2. **`body_fit.py`** — optimizes SMPL-X shape (`betas`), pose, global
-   orientation, and a weak-perspective camera so the model's projected
-   joints line up with the detected 2D keypoints. SMPL-X's shape space is
-   trained on thousands of real body scans, so regularizing `betas` toward
-   zero during fitting keeps the result inside that learned, anatomically
-   plausible distribution rather than letting it collapse into an
-   arbitrary blob.
-3. **`print_prep.py`** — repairs the resulting mesh (merges vertices, fills
-   holes, fixes normals) and exports STL/OBJ.
-4. **`pipeline.py`** / **`cli.py`** — wires the three steps together.
+An earlier version of this project used SMPL-X, a body model trained on
+real 3D body scans. It looks more realistic, but its free license is
+**non-commercial research use only** — commercial use requires a separate
+paid license from Meshcapade. Since the goal here is a project you can
+eventually commercialize without anyone else's permission, the default
+pipeline no longer depends on it. The SMPL-X path still exists as an
+optional, clearly-marked research mode (see below) for anyone who wants
+higher fidelity under that license.
 
-This is original glue code built around two existing, proven components
-(MediaPipe for 2D keypoints, SMPL-X for the body prior) — not a wrapper
-around a packaged image-to-3D product.
+## How the default pipeline works
+
+1. **`landmarks.py`** — runs MediaPipe Pose (Apache-2.0, commercial-friendly)
+   on the input photo to get 2D body keypoints.
+2. **`procedural_body.py`** — builds a 3D figure with no learned model at
+   all:
+   - places a skeleton from the detected keypoints,
+   - wraps each bone in a tapered capsule, sized from generic,
+     widely-published figure-proportion ratios (the kind used in figure
+     drawing / character-modeling references — not a licensed dataset)
+     scaled by that bone's own measured length from the photo,
+   - blends overlapping capsules with a smooth-minimum of their signed
+     distance fields (a standard, well-known CG technique) so joints merge
+     instead of leaving hard seams,
+   - extracts the result as a closed surface with marching cubes.
+3. **`print_prep.py`** — repairs the mesh (merges vertices, fills holes,
+   fixes normals) and exports STL/OBJ.
+4. **`pipeline.py`** / **`cli.py`** — wires it together.
+
+Every piece here is either measured directly from your photo or a
+well-known, unencumbered formula — no third-party model weights, no
+training-data license, nothing to clear before you can use this commercially.
 
 ## Setup
 
@@ -29,33 +45,27 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-### SMPL-X model files (required, not included)
-
-SMPL-X model weights are distributed under their own license and can't be
-redistributed in this repo. Register and download them yourself:
-
-1. Go to https://smpl-x.is.tue.mpg.de, register, accept the license.
-2. Download `SMPLX_NEUTRAL.npz` (or MALE/FEMALE variants).
-3. Place it under `models/smplx/SMPLX_NEUTRAL.npz` in this repo (the
-   `models/` directory is gitignored).
+No model downloads, no license gate, no registration needed.
 
 ## Usage
 
 ```bash
 python -m anatomy3d.cli \
   --image path/to/photo.jpg \
-  --smplx-model-dir models/smplx \
-  --gender neutral \
-  --out output/figure.stl
+  --out output/figure.stl \
+  --height-mm 150
 ```
 
 Outputs an STL ready for a slicer, plus an OBJ of the same mesh for
-rendering/animation use elsewhere.
+rendering/animation use elsewhere. `--height-mm` sets the printed figure's
+height (a monocular photo gives no reliable real-world scale, so the whole
+figure is normalized to this target height rather than guessed from the
+photo).
 
 ## Desktop app (.exe)
 
 `desktop_app.py` is a Tkinter GUI over the same pipeline — pick a photo,
-pick your SMPL-X model folder, pick an output path, click Generate.
+set the target height, pick an output path, click Generate.
 
 Run it directly:
 
@@ -70,10 +80,6 @@ the Actions tab — it runs PyInstaller on a real `windows-latest` runner
 it) and uploads `anatomy3d-print.exe` as a build artifact, attaching it to
 the release if triggered by a tag.
 
-The exe will be large (torch + mediapipe bundled) and slow to start the
-first time — that's expected for a PyInstaller `--onefile` build with
-these dependencies.
-
 ## Web app / Railway deployment
 
 `webapp/app.py` is a small FastAPI front end: upload a photo, get back an
@@ -83,53 +89,58 @@ STL. Run it locally with:
 uvicorn app:app --app-dir webapp --reload
 ```
 
-To deploy on Railway, the included `Dockerfile` and `railway.toml` are
-ready to go once this repo is connected to a Railway service. The only
-thing you must set yourself is where the container gets its SMPL-X
-weights from — they're license-gated and never committed here:
-
-1. Host your own downloaded `SMPLX_NEUTRAL.npz` somewhere only you
-   control (a private S3/GCS URL, a private Hugging Face repo file URL
-   with a token, etc.) — never a public URL, since redistributing it
-   violates the SMPL-X license.
-2. Set the Railway service variable `SMPLX_MODEL_URL` to that private
-   URL.
-3. `entrypoint.sh` downloads it into the container on startup before
-   launching the server.
+The included `Dockerfile` and `railway.toml` deploy as-is on Railway —
+no license-gated files to host or inject, since the default pipeline
+doesn't need any.
 
 ## Limitations (read before printing)
 
-- **Single photo, frontal pose assumed.** Anything not visible in the
-  photo (the back, occluded limbs) is filled in by the body prior, not
-  reconstructed from real data. Likeness accuracy drops fast outside the
-  photographed angle. Front + side + back photos and multi-view fitting
-  is the natural next step if this matters to you.
-- **Weak-perspective camera.** The fitting ignores true depth/perspective
-  distortion. Fine for a roughly frontal, centered photo; not accurate for
-  close-up or extreme-angle shots.
-- **No clothing or texture.** SMPL-X models the body shape, not clothing
-  — output is a bare body mesh. Texturing/clothing reconstruction is a
-  separate, harder problem not covered here.
+- **Stylized, not realistic.** This is a smooth mannequin-like figure —
+  tapered limbs, a simple head, no face, no hands/fingers, no clothing.
+  It will not look like a scanned likeness of the person in the photo.
+  That's the direct trade-off for not depending on a licensed body model.
+- **Single photo, frontal pose assumed, no depth.** The figure is built
+  with a fixed, stylized front-to-back thickness, not measured depth —
+  there's no way to recover real depth from one photo. Proportions
+  (limb lengths, torso width) come from the photo; roundness doesn't.
 - **Check the STL in your slicer before printing.** The repair step fixes
-  common issues (non-manifold edges, small holes) but thin parts (fingers,
-  ankles) may still need manual thickening in Meshmixer/Netfabb/Blender
-  depending on your printer's nozzle size and material.
+  common issues (non-manifold edges, small holes) but very thin joints may
+  still need manual cleanup in Meshmixer/Netfabb/Blender depending on your
+  printer's nozzle size and material.
+
+## Optional: higher-fidelity SMPL-X mode (non-commercial only)
+
+`body_fit.py` still contains a from-scratch SMPLify-X-style fitter that
+optimizes an actual SMPL-X body to the photo's keypoints, which looks
+noticeably more realistic. It's not used by the default pipeline or wired
+into the CLI/web/desktop apps. To experiment with it:
+
+1. `pip install -r requirements-smplx.txt`
+2. Register at https://smpl-x.is.tue.mpg.de, accept the license (read it —
+   it's non-commercial research use only), and download the "SMPL-X v1.1"
+   package. You need `models/smplx/SMPLX_NEUTRAL.npz` specifically (not the
+   plain "SMPL" or "SMPL+H" packages).
+3. Call `anatomy3d.body_fit.fit_body(...)` directly (see its docstring) —
+   it's deliberately not connected to `pipeline.py`, so using it is a
+   conscious opt-in, not something that happens by accident in a
+   commercial build.
 
 ## Project layout
 
 ```
 src/anatomy3d/
-  landmarks.py     2D pose keypoint detection
-  body_fit.py       SMPL-X optimization against keypoints
-  mesh_export.py    OBJ export
-  print_prep.py     mesh repair + STL export
-  pipeline.py        orchestration
-  cli.py             command-line entry point
+  landmarks.py       2D pose keypoint detection
+  procedural_body.py  default: from-scratch capsule/SDF body builder
+  body_fit.py          optional: SMPL-X fitting (non-commercial license)
+  mesh_types.py        shared BodyMesh type
+  mesh_export.py        OBJ export
+  print_prep.py          mesh repair + STL export
+  pipeline.py              orchestration (uses procedural_body.py)
+  cli.py                    command-line entry point
 webapp/app.py        FastAPI web front end
 desktop_app.py       Tkinter desktop GUI (-> .exe via PyInstaller)
 Dockerfile           Railway/container build for the web app
-entrypoint.sh        Fetches SMPL-X weights at container start, then serves
 railway.toml         Railway build/deploy config
 .github/workflows/   CI: builds the Windows .exe on tag push
-models/              SMPL-X weights go here (not tracked)
+requirements-smplx.txt  optional extras for the SMPL-X research mode
 ```

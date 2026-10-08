@@ -17,7 +17,7 @@ class App(tk.Tk):
         self.geometry("520x320")
 
         self.image_path = tk.StringVar()
-        self.model_dir = tk.StringVar(value="models/smplx")
+        self.height_mm = tk.StringVar(value="150")
         self.out_path = tk.StringVar(value="output/figure.stl")
         self.log_queue = queue.Queue()
 
@@ -35,9 +35,8 @@ class App(tk.Tk):
 
         row = ttk.Frame(self)
         row.pack(fill="x", **pad)
-        ttk.Label(row, text="SMPL-X dir:", width=12).pack(side="left")
-        ttk.Entry(row, textvariable=self.model_dir).pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse", command=self._pick_model_dir).pack(side="left")
+        ttk.Label(row, text="Height (mm):", width=12).pack(side="left")
+        ttk.Entry(row, textvariable=self.height_mm, width=10).pack(side="left")
 
         row = ttk.Frame(self)
         row.pack(fill="x", **pad)
@@ -57,11 +56,6 @@ class App(tk.Tk):
         )
         if path:
             self.image_path.set(path)
-
-    def _pick_model_dir(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.model_dir.set(path)
 
     def _pick_out_path(self):
         path = filedialog.asksaveasfilename(defaultextension=".stl", filetypes=[("STL", "*.stl")])
@@ -89,7 +83,8 @@ class App(tk.Tk):
 
     def _run_pipeline_thread(self):
         try:
-            run_pipeline(self.image_path.get(), self.model_dir.get(), self.out_path.get())
+            height = float(self.height_mm.get() or 150.0)
+            run_pipeline(self.image_path.get(), self.out_path.get(), target_height_mm=height)
             self.log_queue.put(f"Done. Wrote {self.out_path.get()}")
         except Exception as exc:  # noqa: BLE001 - surface any failure to the GUI log
             self.log_queue.put(f"Error: {exc}")

@@ -1,10 +1,14 @@
 """Repair a mesh for 3D printing and export STL.
 
-SMPL-X's template topology is closed by construction, so most fits are
-already watertight. This pass still runs standard cleanup (merge duplicate
-vertices, drop degenerate faces, fill any remaining holes, fix normal
-orientation) because reprojection-driven optimization can occasionally
-produce near-degenerate triangles that a slicer will reject.
+Cleanup here (merge duplicate vertices, drop degenerate faces, fill
+remaining holes, fix normal orientation) handles the usual slicer-rejection
+causes. It also drops every connected component except the largest: the
+procedural body builder blends several overlapping signed-distance fields
+near the neck/shoulders/hips, and where three or more fields meet near the
+same point, chaining pairwise smooth-min between them can leave tiny
+isolated slivers a voxel or two across — floating debris, not part of the
+figure. Discarding everything but the main body is standard practice for
+marching-cubes output in general, not just a workaround for this.
 """
 import trimesh
 
@@ -12,8 +16,13 @@ import trimesh
 def repair_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     mesh = mesh.copy()
     mesh.merge_vertices()
-    mesh.remove_duplicate_faces()
-    mesh.remove_degenerate_faces()
+    mesh.update_faces(mesh.unique_faces())
+    mesh.update_faces(mesh.nondegenerate_faces())
+
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        mesh = max(components, key=lambda c: c.vertices.shape[0])
+
     trimesh.repair.fill_holes(mesh)
     mesh.fix_normals()
     return mesh

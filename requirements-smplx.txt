@@ -1,0 +1,6 @@
+# Optional extras for src/anatomy3d/body_fit.py (NOT used by the default
+# pipeline). Requires SMPL-X model weights licensed for non-commercial
+# scientific research use only — see README.md.
+-r requirements.txt
+torch>=2.0
+smplx>=0.1.28

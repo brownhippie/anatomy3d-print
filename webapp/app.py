@@ -2,12 +2,10 @@
 import os
 import tempfile
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
 from anatomy3d.pipeline import run_pipeline
-
-SMPLX_MODEL_DIR = os.environ.get("SMPLX_MODEL_DIR", "models/smplx")
 
 app = FastAPI(title="anatomy3d-print")
 
@@ -20,7 +18,8 @@ INDEX_HTML = """
   <p>Upload a clear, front-facing, full-body photo. You'll get back a
   3D-printable STL (plus an OBJ for other uses).</p>
   <form action="/fit" method="post" enctype="multipart/form-data">
-    <input type="file" name="image" accept="image/*" required>
+    <input type="file" name="image" accept="image/*" required><br><br>
+    <label>Height (mm): <input type="number" name="height_mm" value="150" min="20" max="1000"></label><br><br>
     <button type="submit">Generate model</button>
   </form>
 </body>
@@ -39,14 +38,7 @@ def health():
 
 
 @app.post("/fit")
-async def fit(image: UploadFile = File(...)):
-    if not os.path.exists(SMPLX_MODEL_DIR):
-        raise HTTPException(
-            500,
-            f"SMPL-X model files not found at {SMPLX_MODEL_DIR}. "
-            "See README for how to provide them.",
-        )
-
+async def fit(image: UploadFile = File(...), height_mm: float = Form(150.0)):
     with tempfile.TemporaryDirectory() as tmp:
         image_path = os.path.join(tmp, image.filename or "upload.jpg")
         with open(image_path, "wb") as f:
@@ -54,7 +46,7 @@ async def fit(image: UploadFile = File(...)):
 
         out_stl = os.path.join(tmp, "figure.stl")
         try:
-            run_pipeline(image_path, SMPLX_MODEL_DIR, out_stl)
+            run_pipeline(image_path, out_stl, target_height_mm=height_mm)
         except Exception as exc:
             raise HTTPException(400, str(exc)) from exc
 

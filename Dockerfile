@@ -3,7 +3,7 @@ FROM python:3.11-slim
 # mediapipe/opencv need these at runtime even though they're not pulled in
 # by pip's wheel dependencies.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 curl \
+    libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -19,6 +19,5 @@ COPY webapp ./webapp
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
-ENV SMPLX_MODEL_DIR=/app/models/smplx
 EXPOSE 8000
 CMD ["./entrypoint.sh"]

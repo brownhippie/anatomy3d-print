@@ -1,11 +1,9 @@
-torch>=2.0
-smplx>=0.1.28
 mediapipe>=0.10
 opencv-python>=4.8
 trimesh>=4.0
 numpy>=1.24
 scipy>=1.11
+scikit-image>=0.22
 fastapi>=0.110
 uvicorn>=0.27
 python-multipart>=0.0.9
-
