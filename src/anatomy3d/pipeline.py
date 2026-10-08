@@ -119,7 +119,7 @@ def run_pipeline(
             # resized back down to match keypoints' own resolution so
             # pixel coordinates line up (see the same fix applied to face
             # landmarks in procedural_body.py's _face_to_local_xyz).
-            hair_mask = detect_hair_mask(paths[0])
+            hair_mask = detect_hair_mask(paths[0], keypoints=keypoints)
             if hair_mask is not None and hair_mask.shape != (keypoints.image_height, keypoints.image_width):
                 from PIL import Image
 
