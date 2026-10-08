@@ -584,10 +584,13 @@ def extract_silhouette(
                 f"Note: color-based classification measured as failed on this photo "
                 f"(stage-1/position coverage ratio {mask.mean() / pos_mask.mean():.3f}, well under "
                 f"the {COLOR_FAILURE_RATIO} line that separates working from failed — see "
-                "COLOR_FAILURE_RATIO) — likely a complex, textured, or multi-material "
-                "background whose color range overlaps the subject's. Falling back to a "
-                "coarse, position-only silhouette from the detected pose instead of the "
-                "near-empty result color classification alone would give; this traces the "
+                "COLOR_FAILURE_RATIO). The ratio itself is measured, not guessed, but WHY "
+                "color failed on this specific photo isn't diagnosed here — confirmed causes "
+                "on different test photos include a complex/multi-material background whose "
+                "color range overlaps the subject's, and dark clothing blending into dark "
+                "background tones at low resolution; there may be others untested. Falling "
+                "back to a coarse, position-only silhouette from the detected pose instead of "
+                "the near-empty result color classification alone would give; this traces the "
                 "figure's rough outline, not precise boundary detail."
             )
             return _largest_filled_blob(pos_mask, body_scale_px)
