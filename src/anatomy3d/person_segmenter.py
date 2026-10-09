@@ -391,52 +391,89 @@ def _refine_crop(
 _MULTI_SUBJECT_CORE_THRESHOLD = 0.85
 _MULTI_SUBJECT_MIN_COMPONENT_PX = 50
 
+# Re-counting subjects after each round (instead of once) matters
+# because fixing one round's confusion can reveal or resolve another —
+# a subject's own core can grow once a neighboring false claim on it is
+# removed, which can in turn change the count or shape of what's left
+# to resolve. Each round is its own fresh "how many subjects are here,
+# and what does each one's own crop say" pass; it stops once nothing
+# changes by more than the tolerance (the result has stabilized) or
+# after a bounded number of rounds, whichever comes first — never
+# unbounded, since each round is a full extra set of model calls.
+_MULTI_SUBJECT_MAX_ROUNDS = 3
+_MULTI_SUBJECT_CONVERGENCE_TOL = 0.01
+
 
 def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, raw_fn) -> "tuple[np.ndarray, np.ndarray]":
     h, w = mask.shape
-    core = alpha > _MULTI_SUBJECT_CORE_THRESHOLD
-    labeled, n = ndimage.label(core)
-    if n == 0:
-        return mask, alpha
-    sizes = ndimage.sum(core, labeled, index=range(1, n + 1))
-    significant = [i + 1 for i, s in enumerate(sizes) if s >= _MULTI_SUBJECT_MIN_COMPONENT_PX]
-    if len(significant) < 2:
-        return mask, alpha
+    current = alpha
 
-    out_alpha = alpha.copy()
-    for component_id in significant:
-        ys, xs = np.where(labeled == component_id)
-        y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
-        bbox_h, bbox_w = y1 - y0 + 1, x1 - x0 + 1
-        if bbox_h >= _CROP_REFINE_MAX_FRAC * h and bbox_w >= _CROP_REFINE_MAX_FRAC * w:
-            continue
-        margin_y, margin_x = int(bbox_h * _CROP_REFINE_MARGIN_FRAC), int(bbox_w * _CROP_REFINE_MARGIN_FRAC)
-        cy0, cy1 = max(0, y0 - margin_y), min(h, y1 + margin_y + 1)
-        cx0, cx1 = max(0, x0 - margin_x), min(w, x1 + margin_x + 1)
-        refined = _segment_coarse(rgb[cy0:cy1, cx0:cx1], raw_fn)
-        if refined is None:
-            continue
-        _, refined_alpha = refined
-        # Only ever LOWER alpha here, never raise it. Found directly:
-        # an unconditional replace fixed the four-pets bridging case but
-        # broke a single real person's photo — a dark-sleeved arm's own
-        # core fragmented away from the rest of the body (a local
-        # confidence dip, not a second subject), and cropping tight
-        # around just that fragment hit the exact same context-shift
-        # problem _refine_crop's own gating already exists to prevent:
-        # the zoomed-in view nudged up confidence over a real patch of
-        # wall, which nothing then protected since the wall isn't
-        # "another subject"'s territory. A one-directional minimum()
-        # can't reintroduce that failure mode (it only ever removes
+    for _round in range(_MULTI_SUBJECT_MAX_ROUNDS):
+        core = current > _MULTI_SUBJECT_CORE_THRESHOLD
+        labeled, n = ndimage.label(core)
+        if n == 0:
+            break
+        sizes = ndimage.sum(core, labeled, index=range(1, n + 1))
+        significant = [i + 1 for i, s in enumerate(sizes) if s >= _MULTI_SUBJECT_MIN_COMPONENT_PX]
+        if len(significant) < 2:
+            break  # one subject (or none) left to resolve -- this pass is done
+
+        # Each subject gets its own tight crop+margin and its own
+        # independent reading there, same as a single-subject refine.
+        # best_claim collects, per pixel, the most confident reading ANY
+        # subject's own crop gave it — so where two subjects' crops
+        # overlap, that pixel is checked against both before anything is
+        # decided, not handed to whichever happened to run first.
+        # Pixels no subject's crop reaches at all stay unclaimed (-1)
+        # and are left untouched.
+        best_claim = np.full((h, w), -1.0, dtype=np.float32)
+        any_crop_ran = False
+        for component_id in significant:
+            ys, xs = np.where(labeled == component_id)
+            y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+            bbox_h, bbox_w = y1 - y0 + 1, x1 - x0 + 1
+            if bbox_h >= _CROP_REFINE_MAX_FRAC * h and bbox_w >= _CROP_REFINE_MAX_FRAC * w:
+                continue
+            margin_y, margin_x = int(bbox_h * _CROP_REFINE_MARGIN_FRAC), int(bbox_w * _CROP_REFINE_MARGIN_FRAC)
+            cy0, cy1 = max(0, y0 - margin_y), min(h, y1 + margin_y + 1)
+            cx0, cx1 = max(0, x0 - margin_x), min(w, x1 + margin_x + 1)
+            refined = _segment_coarse(rgb[cy0:cy1, cx0:cx1], raw_fn)
+            if refined is None:
+                continue
+            _, refined_alpha = refined
+            any_crop_ran = True
+            region = best_claim[cy0:cy1, cx0:cx1]
+            best_claim[cy0:cy1, cx0:cx1] = np.maximum(region, refined_alpha)
+
+        if not any_crop_ran:
+            break
+
+        # Only ever LOWER alpha here, never raise it, exactly where some
+        # subject's own crop actually examined the pixel. Found
+        # directly: an unconditional replace fixed the four-pets
+        # bridging case but broke a single real person's photo — a
+        # dark-sleeved arm's own core fragmented away from the rest of
+        # the body (a local confidence dip, not a second subject), and
+        # cropping tight around just that fragment hit the exact same
+        # context-shift problem _refine_crop's own gating already
+        # exists to prevent: the zoomed-in view nudged up confidence
+        # over a real patch of wall. The minimum() here can't
+        # reintroduce that failure mode (it only ever removes
         # confidence, never adds it) while still correcting the
         # original bug, since the false-positive bridge between two
-        # real subjects was a case of too-HIGH confidence to begin with.
-        crop_labels = labeled[cy0:cy1, cx0:cx1]
-        other_subjects = (crop_labels != 0) & (crop_labels != component_id)
-        region = out_alpha[cy0:cy1, cx0:cx1]
-        lowered = np.minimum(region, refined_alpha)
-        out_alpha[cy0:cy1, cx0:cx1] = np.where(other_subjects, region, lowered)
-    return _hysteresis_mask(out_alpha), out_alpha
+        # real subjects was a case of too-HIGH confidence to begin
+        # with. A contested pixel with no confident claim from any
+        # subject (best_claim stays low) is left low too — omitted
+        # rather than guessed into either one's silhouette.
+        claimed = best_claim >= 0
+        next_alpha = np.where(claimed, np.minimum(current, best_claim), current)
+
+        changed = np.abs(next_alpha - current).max()
+        current = next_alpha
+        if changed < _MULTI_SUBJECT_CONVERGENCE_TOL:
+            break
+
+    return _hysteresis_mask(current), current
 
 
 def _segment_full(rgb: np.ndarray, raw_fn) -> "Optional[tuple[np.ndarray, np.ndarray]]":
