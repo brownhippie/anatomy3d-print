@@ -812,6 +812,24 @@ _POSE_MIN_JOINTS = 4
 _POSE_MIN_CORROBORATION = 0.8
 _POSE_ORDER_CHAIN = ("shoulder", "hip", "knee", "ankle")
 
+# A third, independent signal, found necessary by trying to close a
+# different gap (see _POSE_MAX_SUBJECTS below): lowering the detector's
+# own confidence floor to catch real but small/distant people also let
+# a NEW hallucination through both existing gates on the same hand
+# photo as before — a fabricated skeleton with shoulders at (2109,3263)
+# and (2222,2557), only 113px apart in x but 706px apart in y, an
+# almost-vertical "shoulder line" at 80.9 degrees from horizontal. Real
+# shoulders run side-to-side, not stacked: checked directly against 6
+# real detected poses (standing, blurred, two-people including an
+# awkward twisted lunge, a flowing-poncho photo, a studio portrait) and
+# every one measured under 4 degrees. Hip angle was tried too and
+# rejected the same way the shoulder-to-hip-width ratio was: the same
+# twisted lunge photo measured a real 60.5-degree hip angle (hips
+# rotate independently of the camera in a real dynamic pose; shoulders
+# much less so), overlapping hallucinated values — not separable,
+# unlike shoulder angle.
+_POSE_MAX_SHOULDER_ANGLE_DEG = 30.0
+
 
 def _pose_vertically_ordered(joints: dict) -> bool:
     ys = []
@@ -833,6 +851,15 @@ def _pose_vertically_ordered(joints: dict) -> bool:
     return True
 
 
+def _pose_shoulders_level(joints: dict) -> bool:
+    ls, rs = joints.get("left_shoulder"), joints.get("right_shoulder")
+    if ls is None or rs is None:
+        return True  # nothing to check without both shoulders
+    dx, dy = rs[0] - ls[0], rs[1] - ls[1]
+    angle = np.degrees(np.arctan2(abs(dy), abs(dx) + 1e-9))
+    return angle <= _POSE_MAX_SHOULDER_ANGLE_DEG
+
+
 # landmarks.py's own detector is capped at num_poses=1 — deliberately
 # so for its own job (fitting ONE 3D body mesh per photo, used by
 # pipeline.py), but reusing it here silently broke multi-person photos:
@@ -843,6 +870,22 @@ def _pose_vertically_ordered(joints: dict) -> bool:
 # landmarks.py's — same cached model file (no new download), different
 # num_poses, so body-fitting's behavior is untouched.
 _POSE_MAX_SUBJECTS = 5
+
+# Even with 5 slots available, MediaPipe's default detection confidence
+# (0.5) still misses a real, smaller/more-distant second person in
+# frame — confirmed directly on a real two-outfit photo (a close
+# foreground man plus a further-back, smaller woman in a flowing
+# poncho): at 0.5 she wasn't detected at all, and her real content
+# survived the reach limit only because the one detected man's own
+# generous radius happened to reach her anyway (a 70px margin on a
+# ~275px radius — not a guarantee on a different photo). Lowering this
+# finds her (confirmed: 2 raw poses at 0.15 vs 1 at 0.5), but on its
+# own that's not a safe change — it also let a NEW hallucinated pose
+# through both existing gates on the hand photo (confirmed: 2 raw
+# candidates at 0.15 vs 1 at 0.5, one of them accepted). That's exactly
+# why _pose_shoulders_level exists: the new hallucination's near-vertical
+# "shoulder line" is what it's built to catch, and does.
+_POSE_MIN_DETECTION_CONFIDENCE = 0.15
 _pose_detector = None
 
 
@@ -856,6 +899,7 @@ def _get_pose_detector() -> mp_vision.PoseLandmarker:
             base_options=base_options,
             running_mode=mp_vision.RunningMode.IMAGE,
             num_poses=_POSE_MAX_SUBJECTS,
+            min_pose_detection_confidence=_POSE_MIN_DETECTION_CONFIDENCE,
         )
         _pose_detector = mp_vision.PoseLandmarker.create_from_options(options)
     return _pose_detector
@@ -866,7 +910,8 @@ def _pose_landmarks(rgb: np.ndarray, mask: "Optional[np.ndarray]" = None):
     pose that passed validation (possibly empty) — each pose is
     independently rejected if too few of its joints are confident
     enough to use, its joints don't run top-to-bottom the way a real
-    photographed person's always do (see _pose_vertically_ordered), or
+    photographed person's always do (see _pose_vertically_ordered), its
+    shoulders aren't roughly level (see _pose_shoulders_level), or
     (when `mask` is given) too few of its joints land on content the
     segmenter itself calls the subject (see _POSE_MIN_CORROBORATION) —
     a hallucinated pose next to a real one doesn't get to invalidate
@@ -889,6 +934,8 @@ def _pose_landmarks(rgb: np.ndarray, mask: "Optional[np.ndarray]" = None):
         if len(joints) < _POSE_MIN_JOINTS:
             continue
         if not _pose_vertically_ordered(joints):
+            continue
+        if not _pose_shoulders_level(joints):
             continue
         if mask is not None:
             supported = 0
