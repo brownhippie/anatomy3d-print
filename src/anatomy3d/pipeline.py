@@ -82,6 +82,7 @@ def run_pipeline(
     angles_deg: Optional[List[float]] = None,
     use_depth: bool = False,
     target_faces: Optional[int] = 20000,
+    bake_color: bool = True,
 ) -> None:
     """One photo -> the capsule/SDF body builder (a geometric guess).
     Two or more photos (different angles around the subject) -> visual hull
@@ -98,6 +99,14 @@ def run_pipeline(
     dependency (torch + transformers), not something that should change
     behavior just because it happens to be installed in a given
     environment. Requires `pip install -r requirements-depth.txt`.
+
+    `bake_color`: single-photo mode only (multi-photo visual-hull mode
+    carries no per-vertex color regardless — see carve_visual_hull). Set
+    False to skip photo-color sampling entirely and get a plain,
+    untextured mesh — useful when only the shape/geometry matters and
+    color is a distraction (e.g. judging silhouette/fit accuracy without
+    texture quality as a confound). The STL output already carries no
+    color either way; this only affects the OBJ/GLB.
 
     Single-photo mode also tries face detail (nose, chin, eye sockets,
     face_features.py) automatically — unlike `use_depth`, this needs no
@@ -177,7 +186,12 @@ def run_pipeline(
         # photo, same resolution as keypoints) instead of loading the
         # image a second time; falls back to a fresh load so texture
         # baking still works when silhouette extraction itself failed.
-        texture_rgb = silhouette_rgb if silhouette_mask is not None else load_image_rgb(paths[0]).rgb
+        # None (bake_color=False) reaches build_body_mesh unchanged —
+        # it already treats a missing texture_rgb as "skip color baking"
+        # (see procedural_body.py), not an error.
+        texture_rgb = None
+        if bake_color:
+            texture_rgb = silhouette_rgb if silhouette_mask is not None else load_image_rgb(paths[0]).rgb
         body = build_body_mesh(
             keypoints,
             target_height_mm=target_height_mm,
