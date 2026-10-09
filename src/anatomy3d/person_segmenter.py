@@ -397,6 +397,70 @@ def _segment_full_animal_robust(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, 
     return None
 
 
+# A dense cluster of small enclosed background pockets is texture-
+# confusion noise, not a deliberate gap — confirmed directly on a real
+# photo: a horse's woven saddle blanket produced 14 separate tiny
+# enclosed holes packed into one ~50x80px patch (most within 2-15px of
+# their nearest neighbor), and the model gave every one of them zero
+# elevated confidence (alpha 0.04-0.24, right at the background noise
+# floor measured elsewhere in this module) — not a borderline call, the
+# model simply has no category for saddle tack. A plain size cutoff
+# can't tell this apart from a real gap: these holes (up to 130px) are
+# individually *larger* than a real OK-sign-gesture gap's own smaller
+# half (119px) on another test photo. But every real gap found in this
+# project's testing is a single compact void, and even where
+# anti-aliasing visibly splits one into two pieces (both hands'
+# OK-sign circles did), those pieces stayed 35-51px apart — well
+# outside the dilation radius used here. So cluster on proximity
+# instead of area: only 3 or more small enclosed pockets within
+# _NOISE_CLUSTER_DILATION_PX of each other count as noise: an isolated
+# pocket or a close pair (exactly what a real gap split in two looks
+# like) is left alone.
+_NOISE_CLUSTER_DILATION_PX = 10
+_NOISE_CLUSTER_MIN_COMPONENTS = 3
+
+
+def _fill_noise_clusters(mask: np.ndarray, alpha: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+    bg = ~mask
+    labeled, n = ndimage.label(bg)
+    if n == 0:
+        return mask, alpha
+    border_labels = set(np.unique(labeled[0, :])) | set(np.unique(labeled[-1, :]))
+    border_labels |= set(np.unique(labeled[:, 0])) | set(np.unique(labeled[:, -1]))
+    border_labels.discard(0)
+    enclosed = (labeled != 0) & ~np.isin(labeled, list(border_labels))
+    if not enclosed.any():
+        return mask, alpha
+
+    dilated = ndimage.binary_dilation(enclosed, iterations=_NOISE_CLUSTER_DILATION_PX)
+    dilated_labels, _ = ndimage.label(dilated)
+    group_members: "dict[int, set]" = {}
+    for group_id, component_id in zip(dilated_labels[enclosed], labeled[enclosed]):
+        group_members.setdefault(int(group_id), set()).add(int(component_id))
+
+    noisy_ids = [
+        cid for members in group_members.values() if len(members) >= _NOISE_CLUSTER_MIN_COMPONENTS for cid in members
+    ]
+    if not noisy_ids:
+        return mask, alpha
+    fill = np.isin(labeled, noisy_ids)
+    return mask | fill, np.where(fill, 1.0, alpha).astype(alpha.dtype)
+
+
+def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    person = _segment_full_person(rgb)
+    animal = _segment_full_animal_robust(rgb)
+    if person is None and animal is None:
+        return None
+    if person is None:
+        mask, alpha = animal
+    elif animal is None:
+        mask, alpha = person
+    else:
+        mask, alpha = person[0] | animal[0], np.maximum(person[1], animal[1])
+    return _fill_noise_clusters(mask, alpha)
+
+
 def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     """Returns a boolean (H, W) mask, True where the model reads the
     photographed subject — a person (any of hair/body-skin/face-skin/
@@ -409,14 +473,11 @@ def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     Internally unions the person and animal channels, each of which
     itself unions two full-frame passes (normal + aggressively
     sharpened) and then a crop-refine pass — see this module's docstring
-    for the sharpening and _refine_crop's docstring for the crop step."""
-    person = _segment_full_person(rgb)
-    animal = _segment_full_animal_robust(rgb)
-    if person is None:
-        return animal[0] if animal else None
-    if animal is None:
-        return person[0]
-    return person[0] | animal[0]
+    for the sharpening and _refine_crop's docstring for the crop step.
+    A final pass fills small clustered background pockets neither
+    channel recognized — see _fill_noise_clusters."""
+    combined = _combine_channels(rgb)
+    return combined[0] if combined else None
 
 
 # The hard category_mask this module used at first (`!= BACKGROUND_CATEGORY`)
@@ -447,11 +508,7 @@ def detect_person_alpha(rgb: np.ndarray) -> Optional[np.ndarray]:
     goes through the same full-frame-union-plus-crop-refine pipeline —
     see _segment_full — and the two channels' alphas are combined with
     elementwise max, the continuous equivalent of detect_person_mask's
-    boolean OR."""
-    person = _segment_full_person(rgb)
-    animal = _segment_full_animal_robust(rgb)
-    if person is None:
-        return animal[1] if animal else None
-    if animal is None:
-        return person[1]
-    return np.maximum(person[1], animal[1])
+    boolean OR. Also goes through the same clustered-background-pocket
+    fill detect_person_mask does — see _fill_noise_clusters."""
+    combined = _combine_channels(rgb)
+    return combined[1] if combined else None
