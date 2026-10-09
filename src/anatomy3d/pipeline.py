@@ -11,6 +11,7 @@ from .preprocess import load_image_rgb
 from .print_prep import export_stl
 from .procedural_body import build_body_mesh
 from .silhouette import extract_silhouette
+from .silhouette_relief import build_silhouette_relief_mesh
 from .visual_hull import SilhouetteView, carve_visual_hull
 
 
@@ -223,6 +224,53 @@ def run_pipeline(
     # glTF binary: a standard interchange format other tools/engines can
     # consume, carrying the same photo-baked per-vertex colors as the OBJ
     # (which the STL has no room for at all).
+    glb_path = os.path.splitext(out_stl_path)[0] + ".glb"
+    export_glb(body, glb_path)
+
+    mesh = to_trimesh(body)
+    export_stl(mesh, out_stl_path, target_faces=target_faces)
+
+    print(f"Wrote {out_stl_path} (printing), {obj_path} (render/animation), and {glb_path} (glTF, for other tools).")
+
+
+def run_silhouette_relief_pipeline(
+    image_path: str,
+    out_stl_path: str,
+    target_height_mm: float = 150.0,
+    target_faces: Optional[int] = 20000,
+) -> None:
+    """A deliberately different, simpler path than run_pipeline's
+    single-photo mode: the mesh's own front-on silhouette is built
+    directly from the photo's 2D cutout (detect_person_alpha -- the same
+    function the webapp's /jobs/{id}/cutout.png serves), not from
+    capsule primitives fit to detected pose joints (see
+    silhouette_relief.py for why that makes the two genuinely different
+    shapes, not just different code paths to the same result).
+
+    No pose detection, so no pose-plausibility requirement and no face/
+    hair/depth/color options -- the tradeoff for guaranteeing the mesh's
+    silhouette matches the cutout exactly: no anatomical detail beyond
+    what the 2D outline itself shows (fingers only as wide as the
+    cutout's own hand shape, no separate face features, no fur/hair
+    volume). Multi-photo visual-hull mode (run_pipeline) is the existing
+    option when multiple viewing angles are available instead."""
+    os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
+
+    from .person_segmenter import detect_person_alpha
+
+    rgb = load_image_rgb(image_path, max_dimension=None).rgb
+    alpha = detect_person_alpha(rgb)
+    if alpha is None:
+        raise RuntimeError(
+            "No person/animal detected in the image -- use a clear photo with "
+            "the subject against a reasonably distinct background."
+        )
+
+    body = build_silhouette_relief_mesh(alpha, target_height_mm=target_height_mm)
+
+    obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
+    export_obj(body, obj_path)
+
     glb_path = os.path.splitext(out_stl_path)[0] + ".glb"
     export_glb(body, glb_path)
 
