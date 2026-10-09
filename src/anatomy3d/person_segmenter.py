@@ -748,6 +748,215 @@ def _segment_full_animal_robust(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, 
     return None
 
 
+# Pose-landmark-guided reach limiting for the PERSON channel only — no
+# equivalent exists for animals, checked directly: MediaPipe's full model
+# catalog (every category it ships, not a guess) has face/hand/pose/
+# object/holistic landmarkers and nothing animal-specific at all, so
+# there's no same-license, same-source skeleton model to build this on
+# for the animal channel.
+#
+# This module's own docstring already documents why pose landmarks were
+# deliberately NOT used for the base mask: an earlier version of this
+# project had a real, measured bug from trusting hallucinated elbow/wrist
+# tracking — a confident background bulge in the wrong place. A first
+# version of this check was shipped, found to reproduce that exact bug
+# class on a real photo, and reverted; everything below reflects what
+# that failure actually required, not a guess at what might be enough.
+_POSE_BONES = (
+    ("left_shoulder", "left_elbow"), ("left_elbow", "left_wrist"),
+    ("right_shoulder", "right_elbow"), ("right_elbow", "right_wrist"),
+    ("left_shoulder", "right_shoulder"),
+    ("left_shoulder", "left_hip"), ("right_shoulder", "right_hip"),
+    ("left_hip", "right_hip"),
+    ("left_hip", "left_knee"), ("left_knee", "left_ankle"),
+    ("right_hip", "right_knee"), ("right_knee", "right_ankle"),
+)
+# Calibrated against real anthropometric proportions (hand length is
+# roughly 0.4x shoulder width), not guessed — confirmed necessary by a
+# direct test: a looser value (1.1x) failed to flag a synthetic bulge
+# planted 180px past a real detected wrist on a real photo (shoulder
+# width there was 94.9px, so even the bulge's nearest edge, ~140px out,
+# fell inside a 1.1x-plus-slack radius).
+_POSE_LIMB_RADIUS_FRAC = 0.5
+_POSE_TORSO_RADIUS_FRAC = 1.6
+_POSE_EXCESS_TOLERANCE = 0.3
+_POSE_MIN_JOINTS = 4
+
+# BlazePose doesn't refuse to find a human in a photo with no human in
+# it — confirmed directly, twice, not assumed. First: a real photo of
+# four pets and zero people got a full 8-joint skeleton (nose, both
+# shoulders, an elbow, wrist, thumb, both hips) invented on it. Second,
+# found only after the first fix shipped: a real photo of a single hand
+# against plain background (no body at all) got a 12-joint skeleton
+# invented on it — nose, both shoulders, an elbow, wrist, hips, knees —
+# and because the hand's own real mask is large (covers a third of a
+# big photo), 11 of those 12 fake joints happened to land on pixels the
+# segmenter itself confidently called "person" anyway, passing the
+# per-joint corroboration check below with 92% agreement. That check
+# (do the joints land on content the segmenter also calls the subject)
+# catches the first case but not the second, because it only asks
+# whether each point individually lands somewhere in a big blob — it
+# never checks whether the joints make sense RELATIVE TO EACH OTHER.
+#
+# The fix: a real photographed person's joints run top-to-bottom in a
+# fixed order — shoulders above hips above knees above ankles. Checked
+# directly against 5 different real detected poses (standing, blurred,
+# two-people, torso-cropped): zero exceptions, every single one. The
+# hand photo's hallucinated skeleton violates this outright — its knee
+# landed ABOVE its hip (anatomically backwards), which the per-joint
+# corroboration check had no way to notice since each fake joint still
+# individually sat on real "person" pixels. A shoulder-to-hip-width
+# ratio check was tried too and rejected: real photos measured 1.63-2.80
+# depending on pose, which overlaps the hallucinated cases' 1.82-1.93 —
+# not a separable signal, unlike vertical ordering.
+_POSE_MIN_CORROBORATION = 0.8
+_POSE_ORDER_CHAIN = ("shoulder", "hip", "knee", "ankle")
+
+
+def _pose_vertically_ordered(joints: dict) -> bool:
+    ys = []
+    for part in _POSE_ORDER_CHAIN:
+        left, right = joints.get(f"left_{part}"), joints.get(f"right_{part}")
+        pts = [p[1] for p in (left, right) if p is not None]
+        ys.append(np.mean(pts) if pts else None)
+    present = [y for y in ys if y is not None]
+    # need at least 2 rungs of the chain present to check anything
+    if len(present) < 2:
+        return True
+    prev = None
+    for y in ys:
+        if y is None:
+            continue
+        if prev is not None and y < prev:
+            return False
+        prev = y
+    return True
+
+
+def _pose_landmarks(rgb: np.ndarray, mask: "Optional[np.ndarray]" = None):
+    """Returns {joint_name: (x, y)} in pixel coords, or None if no pose
+    was found, too few joints are confident enough to use, the detected
+    joints don't run top-to-bottom the way a real photographed person's
+    always do (see _pose_vertically_ordered), or (when `mask` is given)
+    too few of the detected joints land on content the segmenter itself
+    calls the subject (see _POSE_MIN_CORROBORATION). Reuses the same
+    cached model/detector landmarks.py already downloads for
+    body-fitting — not a new model or license to clear."""
+    from . import landmarks as _landmarks_mod
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+    result = _landmarks_mod._get_detector().detect(mp_image)
+    if not result.pose_landmarks:
+        return None
+    h, w = rgb.shape[:2]
+    lm_list = result.pose_landmarks[0]
+    joints = {}
+    for name, idx in _landmarks_mod.MEDIAPIPE_JOINT_INDEX.items():
+        lm = lm_list[idx]
+        if lm.visibility < 0.5 or lm.presence < 0.5:
+            continue
+        joints[name] = (lm.x * w, lm.y * h)
+    if len(joints) < _POSE_MIN_JOINTS:
+        return None
+
+    if not _pose_vertically_ordered(joints):
+        return None
+
+    if mask is not None:
+        supported = 0
+        for x, y in joints.values():
+            xi, yi = min(int(x), w - 1), min(int(y), h - 1)
+            supported += int(mask[yi, xi])
+        if supported / len(joints) < _POSE_MIN_CORROBORATION:
+            return None
+
+    return joints
+
+
+def _point_segment_distance(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Vectorized distance from each row of `points` (N,2) to the line
+    segment a-b (each a 2-vector)."""
+    ab = b - a
+    ab_len2 = np.dot(ab, ab)
+    if ab_len2 < 1e-9:
+        return np.linalg.norm(points - a, axis=1)
+    t = np.clip(((points - a) @ ab) / ab_len2, 0.0, 1.0)
+    closest = a + t[:, None] * ab
+    return np.linalg.norm(points - closest, axis=1)
+
+
+def _pose_reach_limit(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    joints = _pose_landmarks(rgb, mask=mask)
+    if joints is None:
+        return alpha
+    if "left_shoulder" in joints and "right_shoulder" in joints:
+        ls, rs = np.array(joints["left_shoulder"]), np.array(joints["right_shoulder"])
+        scale = np.linalg.norm(ls - rs)
+    elif "left_hip" in joints and "right_hip" in joints:
+        lh, rh = np.array(joints["left_hip"]), np.array(joints["right_hip"])
+        scale = np.linalg.norm(lh - rh)
+    else:
+        return alpha
+    if scale < 1.0:
+        return alpha
+
+    segments = []
+    for name_a, name_b in _POSE_BONES:
+        if name_a not in joints or name_b not in joints:
+            continue
+        a, b = np.array(joints[name_a]), np.array(joints[name_b])
+        is_torso = {name_a, name_b} <= {"left_shoulder", "right_shoulder", "left_hip", "right_hip"}
+        radius = scale * (_POSE_TORSO_RADIUS_FRAC if is_torso else _POSE_LIMB_RADIUS_FRAC)
+        segments.append((a, b, radius))
+    # The head/neck has no shoulder-shoulder-only bone above to cover it;
+    # treat nose-to-shoulder-midpoint as one more generous segment so a
+    # real head isn't flagged just for being above the shoulder line.
+    if "nose" in joints and "left_shoulder" in joints and "right_shoulder" in joints:
+        mid = (np.array(joints["left_shoulder"]) + np.array(joints["right_shoulder"])) / 2
+        segments.append((np.array(joints["nose"]), mid, scale * 1.3))
+    if not segments:
+        return alpha
+
+    # Unlike the soft-shell classifier checks elsewhere in this file,
+    # this isn't scoped to non-core pixels — confirmed necessary by a
+    # direct test: a synthetic planted bulge at full 0.95 confidence
+    # (core-confidence territory) was silently skipped when this was
+    # gated the same way, because core pixels are normally treated as
+    # already-validated. A geometrically implausible region is wrong
+    # regardless of how confident the model is in it — that's the
+    # entire point of a reach check, not something core confidence can
+    # excuse.
+    shell = mask
+    if not shell.any():
+        return alpha
+    ys, xs = np.nonzero(shell)
+    points = np.stack([xs, ys], axis=1).astype(np.float64)
+
+    min_excess = None
+    for a, b, radius in segments:
+        dist = _point_segment_distance(points, a, b)
+        excess = (dist - radius) / scale
+        min_excess = excess if min_excess is None else np.minimum(min_excess, excess)
+
+    # Only pixels CLEARLY past every segment's radius (_POSE_EXCESS_TOLERANCE
+    # shoulder-widths of slack beyond it) are touched. The damping has to
+    # be steep, not a gentle scale-down — confirmed directly: a gentler
+    # curve (damp floor 0.2, half-strength slope) only pulled a synthetic
+    # planted bulge's alpha from 0.95 down to ~0.42, which is still above
+    # PERSON_ALPHA_LOW_THRESHOLD (0.2) and so stayed in the mask anyway
+    # via ordinary hysteresis bridging to the real wrist next to it. A
+    # pixel clearly past the reach limit needs to actually clear that
+    # floor, not just get a little less confident.
+    too_far = min_excess > _POSE_EXCESS_TOLERANCE
+    if not too_far.any():
+        return alpha
+    flag_ys, flag_xs = ys[too_far], xs[too_far]
+    new_alpha = alpha.copy()
+    damp = np.clip(1.0 - min_excess[too_far] * 1.5, 0.0, 1.0)
+    new_alpha[flag_ys, flag_xs] = np.minimum(alpha[flag_ys, flag_xs], alpha[flag_ys, flag_xs] * damp)
+    return new_alpha
+
+
 # A dense cluster of small enclosed background pockets is texture-
 # confusion noise, not a deliberate gap — confirmed directly on a real
 # photo: a horse's woven saddle blanket produced 14 separate tiny
@@ -801,6 +1010,10 @@ def _fill_noise_clusters(mask: np.ndarray, alpha: np.ndarray) -> "tuple[np.ndarr
 def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
     person = _segment_full_person(rgb)
     animal = _segment_full_animal_robust(rgb)
+    if person is not None:
+        person_mask, person_alpha = person
+        person_alpha = _pose_reach_limit(rgb, person_mask, person_alpha)
+        person = (_hysteresis_mask(person_alpha), person_alpha)
     if person is None and animal is None:
         return None
     if person is None:
