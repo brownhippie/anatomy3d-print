@@ -1,8 +1,20 @@
-"""Real per-pixel person/background separation via MediaPipe's Selfie
-Multiclass Segmenter — same Apache-2.0 MediaPipe model family, same GCS
-model bucket, same ImageSegmenter task API as the Hair Segmenter already
-used in hair_features.py. Not a new dependency or license to clear (see
-README's "Why from scratch" section).
+"""Real per-pixel subject/background separation via MediaPipe's Selfie
+Multiclass Segmenter for people and its DeepLabV3 Image Segmenter for
+animals — same Apache-2.0 MediaPipe model family, same GCS model bucket,
+same ImageSegmenter task API as the Hair Segmenter already used in
+hair_features.py. Not a new dependency or license to clear (see README's
+"Why from scratch" section).
+
+Animals are a real, intended subject for this pipeline, not an edge case
+to reject. Found directly: a MediaPipe test photo of children on a pony
+showed the pony's head and body only partially included (ghosted, not
+solid) — the selfie model has no animal categories at all, so it was
+guessing. DeepLabV3 (PASCAL VOC's 21 classes: background, person, and 20
+object categories including bird/cat/cow/dog/horse/sheep) gives a real,
+trained signal for those categories instead. Both models run through the
+same pipeline below (sharpened-pass rescue, hysteresis, crop-refine) and
+their results are unioned, so an animal subject gets the identical
+treatment a human subject does, not a lesser fallback.
 
 This replaces silhouette.py's from-scratch color-clustering approach as
 the PRIMARY silhouette method (see extract_silhouette), not an addition
@@ -75,24 +87,43 @@ MODEL_CACHE_PATH = Path.home() / ".cache" / "anatomy3d-print" / "selfie_multicla
 # person mask.
 BACKGROUND_CATEGORY = 0
 
+ANIMAL_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+    "deeplab_v3/float32/latest/deeplab_v3.tflite"
+)
+ANIMAL_MODEL_CACHE_PATH = Path.home() / ".cache" / "anatomy3d-print" / "deeplab_v3.tflite"
 
-def _ensure_model() -> str:
-    if MODEL_CACHE_PATH.exists() and MODEL_CACHE_PATH.stat().st_size > 1_000_000:
-        return str(MODEL_CACHE_PATH)
-    MODEL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = str(MODEL_CACHE_PATH) + ".part"
-    urlretrieve(MODEL_URL, tmp_path)
-    os.replace(tmp_path, MODEL_CACHE_PATH)
-    return str(MODEL_CACHE_PATH)
+# DeepLabV3's 21 PASCAL VOC categories, confirmed directly (not guessed
+# from documentation): segmenting a real photo of a horse produced
+# category 13 — this is the standard PASCAL VOC 2012 class order (0
+# background, 1 aeroplane, 2 bicycle, 3 bird, 4 boat, 5 bottle, 6 bus,
+# 7 car, 8 cat, 9 chair, 10 cow, 11 diningtable, 12 dog, 13 horse,
+# 14 motorbike, 15 person, 16 pottedplant, 17 sheep, 18 sofa, 19 train,
+# 20 tvmonitor). Only the actual animal categories go in the animal
+# channel — the rest (vehicles, furniture, plants, "person" — already
+# handled by the selfie model above) are not subjects this pipeline
+# treats as foreground.
+ANIMAL_CATEGORIES = (3, 8, 10, 12, 13, 17)  # bird, cat, cow, dog, horse, sheep
+
+
+def _ensure_model(url: str, cache_path: Path) -> str:
+    if cache_path.exists() and cache_path.stat().st_size > 1_000_000:
+        return str(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = str(cache_path) + ".part"
+    urlretrieve(url, tmp_path)
+    os.replace(tmp_path, cache_path)
+    return str(cache_path)
 
 
 _segmenter = None  # lazy singleton: model loading is slow, worth reusing across calls
+_animal_segmenter = None
 
 
 def _get_segmenter() -> mp_vision.ImageSegmenter:
     global _segmenter
     if _segmenter is None:
-        base_options = mp_python.BaseOptions(model_asset_path=_ensure_model())
+        base_options = mp_python.BaseOptions(model_asset_path=_ensure_model(MODEL_URL, MODEL_CACHE_PATH))
         # Both outputs requested together: confirmed requesting
         # output_confidence_masks alongside output_category_mask doesn't
         # change category_mask's own values (checked directly — the
@@ -105,6 +136,19 @@ def _get_segmenter() -> mp_vision.ImageSegmenter:
         )
         _segmenter = mp_vision.ImageSegmenter.create_from_options(options)
     return _segmenter
+
+
+def _get_animal_segmenter() -> mp_vision.ImageSegmenter:
+    global _animal_segmenter
+    if _animal_segmenter is None:
+        base_options = mp_python.BaseOptions(
+            model_asset_path=_ensure_model(ANIMAL_MODEL_URL, ANIMAL_MODEL_CACHE_PATH)
+        )
+        options = mp_vision.ImageSegmenterOptions(
+            base_options=base_options, output_category_mask=True, output_confidence_masks=True
+        )
+        _animal_segmenter = mp_vision.ImageSegmenter.create_from_options(options)
+    return _animal_segmenter
 
 
 # Deliberately much stronger than preprocess.py's general UnsharpMask(2,
@@ -163,6 +207,10 @@ PERSON_ALPHA_THRESHOLD = 0.5
 # background never bridges into a real mask.
 PERSON_ALPHA_LOW_THRESHOLD = 0.2
 
+# Reused as-is for the animal channel below: both models' confidence
+# masks are a softmax over their own categories (sum to 1 per pixel), so
+# the same probability-space thresholds transfer without recalibration.
+
 
 def _hysteresis_mask(alpha: np.ndarray) -> np.ndarray:
     strong = alpha > PERSON_ALPHA_THRESHOLD
@@ -175,7 +223,7 @@ def _hysteresis_mask(alpha: np.ndarray) -> np.ndarray:
     return np.isin(labeled, strong_labels)
 
 
-def _segment_raw(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+def _segment_raw_person(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
     """One inference pass, both outputs: (boolean mask, float32 alpha in
     [0, 1]). Alpha is 1 - background confidence — see detect_person_alpha
     for why that, not the hair-category confidence alone, is the right
@@ -192,17 +240,32 @@ def _segment_raw(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
     return mask, alpha
 
 
-def _segment_raw_sharpened(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
-    sharpened_rgb = np.array(Image.fromarray(rgb).filter(_RESCUE_SHARPEN))
-    return _segment_raw(sharpened_rgb)
+def _segment_raw_animal(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    """Same shape of result as _segment_raw_person, via DeepLabV3's
+    animal categories instead of the selfie model's person categories.
+    Alpha is the summed confidence across ANIMAL_CATEGORIES (the animal
+    equivalent of "1 - background": both models' confidence masks are a
+    softmax over their own categories, so summing the subject categories
+    and subtracting background from 1 are the same quantity)."""
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+    result = _get_animal_segmenter().segment(mp_image)
+    confidences = [result.confidence_masks[i].numpy_view().squeeze() for i in ANIMAL_CATEGORIES]
+    alpha = np.clip(np.sum(confidences, axis=0), 0.0, 1.0)
+    mask = _hysteresis_mask(alpha)
+    if not mask.any():
+        return None
+    return mask, alpha
 
 
-def _segment_coarse(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+def _segment_coarse(rgb: np.ndarray, raw_fn) -> "Optional[tuple[np.ndarray, np.ndarray]]":
     """The normal+sharpened union, factored out of detect_person_mask so
     _refine_crop (and detect_person_alpha) can reuse it on an image crop
-    too, not just the full photo."""
-    normal = _segment_raw(rgb)
-    sharpened = _segment_raw_sharpened(rgb)
+    too, not just the full photo. `raw_fn` is _segment_raw_person or
+    _segment_raw_animal — the same pipeline runs both channels, see this
+    module's docstring."""
+    normal = raw_fn(rgb)
+    sharpened_rgb = np.array(Image.fromarray(rgb).filter(_RESCUE_SHARPEN))
+    sharpened = raw_fn(sharpened_rgb)
     if normal is None:
         return sharpened
     if sharpened is None:
@@ -260,7 +323,9 @@ _CROP_REFINE_MAX_FRAC = 0.6
 _CROP_REFINE_MARGIN_FRAC = 0.2
 
 
-def _refine_crop(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+def _refine_crop(
+    rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, raw_fn
+) -> "tuple[np.ndarray, np.ndarray]":
     h, w = mask.shape
     ys, xs = np.where(mask)
     if ys.size == 0:
@@ -272,7 +337,7 @@ def _refine_crop(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "tuple
     margin_y, margin_x = int(bbox_h * _CROP_REFINE_MARGIN_FRAC), int(bbox_w * _CROP_REFINE_MARGIN_FRAC)
     cy0, cy1 = max(0, y0 - margin_y), min(h, y1 + margin_y + 1)
     cx0, cx1 = max(0, x0 - margin_x), min(w, x1 + margin_x + 1)
-    refined = _segment_coarse(rgb[cy0:cy1, cx0:cx1])
+    refined = _segment_coarse(rgb[cy0:cy1, cx0:cx1], raw_fn)
     if refined is None:
         return mask, alpha
     refined_mask, refined_alpha = refined
@@ -293,26 +358,41 @@ def _refine_crop(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "tuple
     return _hysteresis_mask(out_alpha), out_alpha
 
 
-def _segment_full(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
-    coarse = _segment_coarse(rgb)
+def _segment_full(rgb: np.ndarray, raw_fn) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    coarse = _segment_coarse(rgb, raw_fn)
     if coarse is None:
         return None
-    return _refine_crop(rgb, *coarse)
+    return _refine_crop(rgb, *coarse, raw_fn)
+
+
+def _segment_full_person(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    return _segment_full(rgb, _segment_raw_person)
+
+
+def _segment_full_animal(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    return _segment_full(rgb, _segment_raw_animal)
 
 
 def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     """Returns a boolean (H, W) mask, True where the model reads the
-    photographed person (any of hair/body-skin/face-skin/clothes/
-    accessories), in the same pixel coordinate system as `rgb`. Returns
-    None (does not raise) if nothing is detected as a person — letting
+    photographed subject — a person (any of hair/body-skin/face-skin/
+    clothes/accessories) or an animal (bird/cat/cow/dog/horse/sheep,
+    see ANIMAL_CATEGORIES) — in the same pixel coordinate system as
+    `rgb`. Returns None (does not raise) if nothing is detected, letting
     the caller fall back to the color/position pipeline, same as every
     other optional-model step in this project (face/hair detection).
 
-    Internally unions two full-frame passes (normal + aggressively
+    Internally unions the person and animal channels, each of which
+    itself unions two full-frame passes (normal + aggressively
     sharpened) and then a crop-refine pass — see this module's docstring
     for the sharpening and _refine_crop's docstring for the crop step."""
-    full = _segment_full(rgb)
-    return full[0] if full else None
+    person = _segment_full_person(rgb)
+    animal = _segment_full_animal(rgb)
+    if person is None:
+        return animal[0] if animal else None
+    if animal is None:
+        return person[0]
+    return person[0] | animal[0]
 
 
 # The hard category_mask this module used at first (`!= BACKGROUND_CATEGORY`)
@@ -333,14 +413,21 @@ def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
 # already had.
 def detect_person_alpha(rgb: np.ndarray) -> Optional[np.ndarray]:
     """Returns a float32 (H, W) array in [0, 1] — the model's own
-    confidence that each pixel belongs to the photographed person, NOT
-    thresholded to a hard boolean. Use this (not detect_person_mask) when
-    the goal is a soft-edged cutout/compositing result; use
-    detect_person_mask when a boolean is actually required (hole-filling,
-    connected-component cleanup, anything feeding the 3D mesh pipeline,
-    which has no notion of partial coverage). Returns None under the same
-    condition detect_person_mask does. Also goes through the same
-    full-frame-union-plus-crop-refine pipeline detect_person_mask does —
-    see _segment_full."""
-    full = _segment_full(rgb)
-    return full[1] if full else None
+    confidence that each pixel belongs to the photographed subject
+    (person or animal), NOT thresholded to a hard boolean. Use this (not
+    detect_person_mask) when the goal is a soft-edged cutout/compositing
+    result; use detect_person_mask when a boolean is actually required
+    (hole-filling, connected-component cleanup, anything feeding the 3D
+    mesh pipeline, which has no notion of partial coverage). Returns
+    None under the same condition detect_person_mask does. Each channel
+    goes through the same full-frame-union-plus-crop-refine pipeline —
+    see _segment_full — and the two channels' alphas are combined with
+    elementwise max, the continuous equivalent of detect_person_mask's
+    boolean OR."""
+    person = _segment_full_person(rgb)
+    animal = _segment_full_animal(rgb)
+    if person is None:
+        return animal[1] if animal else None
+    if animal is None:
+        return person[1]
+    return np.maximum(person[1], animal[1])
