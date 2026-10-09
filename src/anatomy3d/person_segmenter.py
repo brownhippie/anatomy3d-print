@@ -373,6 +373,30 @@ def _segment_full_animal(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndar
     return _segment_full(rgb, _segment_raw_animal)
 
 
+def _segment_full_animal_robust(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+    """DeepLabV3 isn't rotation-robust the way the selfie model turned
+    out to be — confirmed directly, not assumed: on a real MediaPipe
+    test photo rotated 90 degrees, the animal channel found nothing at
+    all (completely empty), while the same rotation applied to a human
+    photo left the selfie model's result just as solid as the upright
+    version (mask area barely moved, 8.0% -> 8.6%). An animal
+    photographed sideways shouldn't get a worse result than a person
+    photographed sideways. So when the upright pass finds nothing, retry
+    at 90/180/270 degrees before giving up — cheap in the common case
+    (no animal in the photo, the upright pass already returns nothing
+    quickly) and brings a sideways animal photo back to the same solid
+    result an upright one gets."""
+    upright = _segment_full_animal(rgb)
+    if upright is not None:
+        return upright
+    for k in (1, 2, 3):
+        rotated = _segment_full_animal(np.ascontiguousarray(np.rot90(rgb, k)))
+        if rotated is not None:
+            mask, alpha = rotated
+            return np.ascontiguousarray(np.rot90(mask, -k)), np.ascontiguousarray(np.rot90(alpha, -k))
+    return None
+
+
 def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     """Returns a boolean (H, W) mask, True where the model reads the
     photographed subject — a person (any of hair/body-skin/face-skin/
@@ -387,7 +411,7 @@ def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
     sharpened) and then a crop-refine pass — see this module's docstring
     for the sharpening and _refine_crop's docstring for the crop step."""
     person = _segment_full_person(rgb)
-    animal = _segment_full_animal(rgb)
+    animal = _segment_full_animal_robust(rgb)
     if person is None:
         return animal[0] if animal else None
     if animal is None:
@@ -425,7 +449,7 @@ def detect_person_alpha(rgb: np.ndarray) -> Optional[np.ndarray]:
     elementwise max, the continuous equivalent of detect_person_mask's
     boolean OR."""
     person = _segment_full_person(rgb)
-    animal = _segment_full_animal(rgb)
+    animal = _segment_full_animal_robust(rgb)
     if person is None:
         return animal[1] if animal else None
     if animal is None:
