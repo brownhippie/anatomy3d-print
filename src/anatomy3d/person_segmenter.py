@@ -409,6 +409,24 @@ _MULTI_SUBJECT_MIN_COMPONENT_PX = 50
 # whole mechanism exists to catch.
 _MULTI_SUBJECT_EXTENT_THRESHOLD = 0.3
 
+# How far a subject's territory is allowed to extend past its own core,
+# as a fraction of the photo's shorter side — see the pad comment at its
+# use site for the real failure this bounds.
+_MULTI_SUBJECT_TERRITORY_PAD_FRAC = 0.15
+
+# Territory expansion is for subjects whose own core is too small to
+# represent their real extent (the cat's own core was its 29x74px
+# whiskers, not its whole face) — a subject whose core is already a
+# reasonable size doesn't need it and does measurably worse with it.
+# Confirmed directly: the corgi's own core (382x399, plenty to crop
+# tight around on its own) still had its territory-expanded crop reach
+# wide enough to pull the poodle back into view, reproducing the
+# original bridging confusion the whole per-subject mechanism exists to
+# remove. A core at least this large in both dimensions uses its own
+# bbox directly instead, the same as the first, successful version of
+# this fix did before territory expansion was added for the cat.
+_MULTI_SUBJECT_SELF_SUFFICIENT_CORE_PX = 150
+
 # Re-counting subjects after each round (instead of once) matters
 # because fixing one round's confusion can reveal or resolve another —
 # a subject's own core can grow once a neighboring false claim on it is
@@ -462,11 +480,51 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
         best_claim = np.full((h, w), -1.0, dtype=np.float32)
         any_crop_ran = False
         for component_id in significant:
-            territory = extent & (territory_of == component_id)
-            ys, xs = np.where(territory)
-            if ys.size == 0:
-                continue
-            y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+            # The territory itself has to stay bounded near this
+            # subject's OWN core, not just wherever the Voronoi
+            # partition happens to reach — confirmed directly: the
+            # corgi's own territory, sized this way with no bound,
+            # ballooned past its own 399px-wide core out to 813px wide
+            # (nearly the whole photo), because "closest significant
+            # seed" still reaches a long way across any broad,
+            # ambiguous, weakly-elevated area. That undid the whole
+            # point of cropping tight around just the corgi: its own
+            # crop was wide enough to see the other pets again and
+            # reproduced the original confusion. Capping how far
+            # territory can extend past the core keeps a small core
+            # (the cat's own whisker-sized core) free to grow enough to
+            # reach the rest of its face, while a core that's already
+            # sizeable (the corgi's) stays close to its own real extent.
+            core_component = labeled == component_id
+            core_ys, core_xs = np.where(core_component)
+            core_y0, core_y1 = core_ys.min(), core_ys.max()
+            core_x0, core_x1 = core_xs.min(), core_xs.max()
+            core_h, core_w = core_y1 - core_y0 + 1, core_x1 - core_x0 + 1
+
+            self_sufficient = (
+                core_h >= _MULTI_SUBJECT_SELF_SUFFICIENT_CORE_PX and core_w >= _MULTI_SUBJECT_SELF_SUFFICIENT_CORE_PX
+            )
+            if self_sufficient:
+                # A core this size can be cropped tight around its own
+                # bbox directly — no need to grow it. Ownership of the
+                # ambiguous pixels around it (ambiguous enough to never
+                # have reached the strict core threshold themselves, the
+                # exact pixels this whole mechanism exists to correct)
+                # is everything in the crop that isn't ANOTHER subject's
+                # own confirmed core — the same rule the first, working
+                # version of this fix used throughout.
+                y0, y1, x0, x1 = core_y0, core_y1, core_x0, core_x1
+            else:
+                pad = int(_MULTI_SUBJECT_TERRITORY_PAD_FRAC * min(h, w))
+                bound_y0, bound_y1 = max(0, core_y0 - pad), min(h, core_y1 + pad + 1)
+                bound_x0, bound_x1 = max(0, core_x0 - pad), min(w, core_x1 + pad + 1)
+                territory_full = extent & (territory_of == component_id)
+                territory = np.zeros_like(territory_full)
+                territory[bound_y0:bound_y1, bound_x0:bound_x1] = territory_full[bound_y0:bound_y1, bound_x0:bound_x1]
+                ys, xs = np.where(territory)
+                if ys.size == 0:
+                    continue
+                y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
             bbox_h, bbox_w = y1 - y0 + 1, x1 - x0 + 1
             if bbox_h >= _CROP_REFINE_MAX_FRAC * h and bbox_w >= _CROP_REFINE_MAX_FRAC * w:
                 continue
@@ -478,7 +536,11 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
                 continue
             _, refined_alpha = refined
             any_crop_ran = True
-            own_territory_in_crop = territory_of[cy0:cy1, cx0:cx1] == component_id
+            if self_sufficient:
+                crop_labels = labeled[cy0:cy1, cx0:cx1]
+                own_territory_in_crop = (crop_labels == 0) | (crop_labels == component_id)
+            else:
+                own_territory_in_crop = territory[cy0:cy1, cx0:cx1]
             region = best_claim[cy0:cy1, cx0:cx1]
             best_claim[cy0:cy1, cx0:cx1] = np.where(
                 own_territory_in_crop, np.maximum(region, refined_alpha), region
