@@ -658,6 +658,56 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
     return _hysteresis_mask(current), current
 
 
+def _drop_unvalidated_islands(mask: np.ndarray, alpha: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+    """A small mask component, fully disconnected from the real subject,
+    that never reaches the same core-confidence bar this file already
+    requires before trusting a SEPARATE subject (see
+    _MULTI_SUBJECT_CORE_THRESHOLD) was never actually validated by
+    anything — _refine_per_subject only re-examines components that
+    clear that bar, so a weaker one just passes through the hysteresis
+    mask untouched. Confirmed directly on a real cat photo: a sisal-wrapped
+    cat scratching post, 50+ pixels away from the cat with genuine
+    background between them, read 63% "person" from the clean pass alone
+    (fibrous rope texture, not sharpening noise this time) — mean alpha
+    0.23, peak 0.64, zero pixels anywhere near the 0.85 core bar. A real
+    second subject (confirmed on the four-pets photo this core threshold
+    was built for) reads 0.85+ throughout its own body; this never did,
+    so it was never a found subject, just an unvalidated leftover from
+    the hysteresis chain.
+
+    Run on the UNIONED mask in _combine_channels, not per-channel inside
+    _segment_full — confirmed directly why that matters: on the same
+    four-pets photo, the person channel alone weakly reads part of the
+    cat's own face as "person" (fur mistaken for hair), too small and
+    disconnected from that channel's own largest blob to pass this same
+    bar by itself. But the animal channel confidently and validly reads
+    that exact same region as the cat (already cross-checked by
+    _refine_per_subject, since the cat is one of the four "significant"
+    subjects that mechanism exists for) — so once the two channels are
+    unioned, that area is part of one large, already-validated
+    component, not a small disconnected one. Dropping per-channel
+    punished the person channel's real, corroborated contribution for
+    not independently clearing a bar it never needed to clear alone;
+    dropping after the union only removes what's small and
+    disconnected even with every channel's evidence combined."""
+    labeled, n = ndimage.label(mask)
+    if n <= 1:
+        return mask, alpha
+    sizes = ndimage.sum(mask, labeled, index=range(1, n + 1))
+    largest_label = int(np.argmax(sizes)) + 1
+    core = alpha > _MULTI_SUBJECT_CORE_THRESHOLD
+    core_sizes = ndimage.sum(core, labeled, index=range(1, n + 1))
+    drop_labels = [
+        i + 1
+        for i in range(n)
+        if (i + 1) != largest_label and core_sizes[i] < _MULTI_SUBJECT_MIN_COMPONENT_PX
+    ]
+    if not drop_labels:
+        return mask, alpha
+    drop = np.isin(labeled, drop_labels)
+    return mask & ~drop, np.where(drop, 0.0, alpha).astype(alpha.dtype)
+
+
 def _segment_full(rgb: np.ndarray, raw_fn) -> "Optional[tuple[np.ndarray, np.ndarray]]":
     coarse = _segment_coarse(rgb, raw_fn)
     if coarse is None:
@@ -759,7 +809,11 @@ def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray
         mask, alpha = person
     else:
         mask, alpha = person[0] | animal[0], np.maximum(person[1], animal[1])
-    return _fill_noise_clusters(mask, alpha)
+    mask, alpha = _fill_noise_clusters(mask, alpha)
+    mask, alpha = _drop_unvalidated_islands(mask, alpha)
+    if not mask.any():
+        return None
+    return mask, alpha
 
 
 def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
