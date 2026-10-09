@@ -18,12 +18,16 @@ import uuid
 from pathlib import Path
 from typing import List
 
+import numpy as np
 import trimesh
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
 from anatomy3d.pipeline import run_pipeline
+from anatomy3d.person_segmenter import detect_person_alpha
+from anatomy3d.preprocess import load_image_rgb
 
 app = FastAPI(title="anatomy3d-print")
 
@@ -44,6 +48,26 @@ def _sweep_old_jobs() -> None:
                 shutil.rmtree(entry, ignore_errors=True)
         except FileNotFoundError:
             pass  # another request already cleaned it up — fine
+
+
+def _write_cutout(image_path: str, out_path: Path) -> bool:
+    """Best-effort 2D cutout of the front photo as a real transparent PNG
+    (soft per-pixel alpha, not a hard boolean) — reuses the same
+    detect_person_alpha this job's own silhouette step already calls, at
+    full resolution for the same reason extract_silhouette is (boundary
+    precision). A missing/failed detection is not fatal to the job, same
+    "a failed bonus feature shouldn't fail the run" pattern pipeline.py
+    uses for face/hair/silhouette. Returns whether a file was written."""
+    try:
+        rgb = load_image_rgb(image_path, max_dimension=None).rgb
+        alpha = detect_person_alpha(rgb)
+        if alpha is None:
+            return False
+        rgba = np.dstack([rgb, (alpha * 255).astype(np.uint8)])
+        Image.fromarray(rgba, mode="RGBA").save(out_path)
+        return True
+    except Exception:
+        return False
 
 
 def _job_dir(job_id: str) -> Path:
@@ -104,7 +128,12 @@ async def api_generate(
     mesh = trimesh.load(str(out_stl), process=True)
     height_actual = float(mesh.vertices[:, 1].max() - mesh.vertices[:, 1].min())
 
-    return {
+    # Front photo only — a cutout is a single-view concept, same as the
+    # "front first" convention run_pipeline's own docstring documents for
+    # multi-photo visual-hull mode.
+    has_cutout = _write_cutout(image_paths[0], job_dir / "cutout.png")
+
+    result = {
         "job_id": job_id,
         "obj_url": f"/jobs/{job_id}/model.obj",
         "stl_url": f"/jobs/{job_id}/model.stl",
@@ -117,6 +146,9 @@ async def api_generate(
             "watertight": bool(mesh.is_watertight),
         },
     }
+    if has_cutout:
+        result["cutout_url"] = f"/jobs/{job_id}/cutout.png"
+    return result
 
 
 @app.get("/jobs/{job_id}/model.obj")
@@ -141,6 +173,14 @@ def get_glb(job_id: str):
     if not path.exists():
         raise HTTPException(404, "Not found.")
     return FileResponse(path, media_type="model/gltf-binary", filename="figure.glb")
+
+
+@app.get("/jobs/{job_id}/cutout.png")
+def get_cutout(job_id: str):
+    path = _job_dir(job_id) / "cutout.png"
+    if not path.exists():
+        raise HTTPException(404, "No cutout for this job (detection may have failed on the front photo).")
+    return FileResponse(path, media_type="image/png", filename="cutout.png")
 
 
 @app.post("/fit")
