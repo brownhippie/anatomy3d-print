@@ -391,6 +391,24 @@ def _refine_crop(
 _MULTI_SUBJECT_CORE_THRESHOLD = 0.85
 _MULTI_SUBJECT_MIN_COMPONENT_PX = 50
 
+# A subject's own crop must cover its WHOLE visible extent, not just its
+# strict-confidence core — confirmed directly: a cat sitting next to a
+# much larger, more confidently-read corgi had its own core reduced to a
+# 28px-tall sliver (just its whiskers), far smaller than its actual
+# face. That tiny core's own crop+margin never reached the cat's own
+# ears/forehead, while the corgi's much bigger crop (sized off its own,
+# much larger core) did reach there instead, correctly read "not
+# corgi" from its own perspective, and wrongly dragged the cat's own
+# face down with it. _MULTI_SUBJECT_EXTENT_THRESHOLD finds each
+# subject's true territory with a Voronoi-style partition: any pixel
+# at least this confident is assigned to whichever significant core is
+# nearest, not left to whichever subject's crop happens to reach it
+# first. Set comfortably above the ~0.1-0.2 background noise floor
+# measured elsewhere in this module, well below both the cat's own
+# ~0.4 mean facial confidence and the bridging patch's 0.68 that this
+# whole mechanism exists to catch.
+_MULTI_SUBJECT_EXTENT_THRESHOLD = 0.3
+
 # Re-counting subjects after each round (instead of once) matters
 # because fixing one round's confusion can reveal or resolve another —
 # a subject's own core can grow once a neighboring false claim on it is
@@ -418,18 +436,36 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
         if len(significant) < 2:
             break  # one subject (or none) left to resolve -- this pass is done
 
-        # Each subject gets its own tight crop+margin and its own
-        # independent reading there, same as a single-subject refine.
-        # best_claim collects, per pixel, the most confident reading ANY
-        # subject's own crop gave it — so where two subjects' crops
-        # overlap, that pixel is checked against both before anything is
-        # decided, not handed to whichever happened to run first.
-        # Pixels no subject's crop reaches at all stay unclaimed (-1)
-        # and are left untouched.
+        # Every significant core is a Voronoi seed; every pixel at least
+        # _MULTI_SUBJECT_EXTENT_THRESHOLD confident is assigned to
+        # whichever seed is nearest — see that constant's docstring for
+        # why this, not each core's own (possibly tiny) bounding box,
+        # sizes each subject's crop.
+        significant_seeds = np.where(np.isin(labeled, significant), labeled, 0)
+        nearest_idx = ndimage.distance_transform_edt(
+            significant_seeds == 0, return_distances=False, return_indices=True
+        )
+        territory_of = significant_seeds[tuple(nearest_idx)]
+        extent = current > _MULTI_SUBJECT_EXTENT_THRESHOLD
+
+        # Each subject gets its own tight crop+margin, sized from its
+        # own territory, and its own independent reading there, same as
+        # a single-subject refine. best_claim collects, per pixel, the
+        # most confident reading ANY subject's own crop gave it within
+        # ITS OWN territory — so where two subjects' crops overlap
+        # (both reach the same pixel), that pixel is checked against
+        # both before anything is decided, never just handed to
+        # whichever ran first, and a neighbor's crop can never outvote
+        # the subject whose own territory the pixel actually belongs
+        # to. Pixels no subject's territory reaches at all stay
+        # unclaimed (-1) and are left untouched.
         best_claim = np.full((h, w), -1.0, dtype=np.float32)
         any_crop_ran = False
         for component_id in significant:
-            ys, xs = np.where(labeled == component_id)
+            territory = extent & (territory_of == component_id)
+            ys, xs = np.where(territory)
+            if ys.size == 0:
+                continue
             y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
             bbox_h, bbox_w = y1 - y0 + 1, x1 - x0 + 1
             if bbox_h >= _CROP_REFINE_MAX_FRAC * h and bbox_w >= _CROP_REFINE_MAX_FRAC * w:
@@ -442,8 +478,11 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
                 continue
             _, refined_alpha = refined
             any_crop_ran = True
+            own_territory_in_crop = territory_of[cy0:cy1, cx0:cx1] == component_id
             region = best_claim[cy0:cy1, cx0:cx1]
-            best_claim[cy0:cy1, cx0:cx1] = np.maximum(region, refined_alpha)
+            best_claim[cy0:cy1, cx0:cx1] = np.where(
+                own_territory_in_crop, np.maximum(region, refined_alpha), region
+            )
 
         if not any_crop_ran:
             break
