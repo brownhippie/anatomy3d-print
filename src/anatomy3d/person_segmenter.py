@@ -266,10 +266,39 @@ def _segment_coarse(rgb: np.ndarray, raw_fn) -> "Optional[tuple[np.ndarray, np.n
     normal = raw_fn(rgb)
     sharpened_rgb = np.array(Image.fromarray(rgb).filter(_RESCUE_SHARPEN))
     sharpened = raw_fn(sharpened_rgb)
-    if normal is None:
-        return sharpened
     if sharpened is None:
         return normal
+    if normal is None:
+        # A clean pass finding literally nothing isn't a free pass for
+        # the sharpened one — confirmed on a real photo with no person
+        # or animal in it at all (an autumn park bridge, all trees and
+        # foliage): the sharpened pass alone read 98% of the FULL FRAME
+        # as "person" from amplified bark/leaf texture noise, with
+        # nothing in the clean pass to corroborate any of it. A real
+        # subject covering the majority of the frame that the clean
+        # pass missed entirely is implausible — that's exactly the
+        # broad, diffuse confidence inflation sharpening noise produces
+        # (as opposed to a real subject's own detail), so it's rejected
+        # outright here.
+        #
+        # A SMALL sharpened-only finding is a different, already-
+        # trusted case, not a smaller version of the same bug: it's
+        # exactly what this pass has always been trusted for when the
+        # clean pass finds nothing (the most aggressive end of the
+        # blurred-photo rescue this mechanism exists for), and
+        # _refine_per_subject's min-consensus below depends on reading
+        # these modest, low-confidence crop results (not just their
+        # hard mask) to let one subject's own crop veto a neighboring
+        # subject's overconfidence in its territory — confirmed
+        # directly: rejecting every normal-is-None result unconditionally
+        # (an earlier version of this fix) silently dropped exactly that
+        # correction on a real puppy/kitten photo's tail-shadow region,
+        # which had relied on one subject's own narrow crop reading
+        # mostly background there even though its clean pass alone
+        # found nothing in that crop at all.
+        if sharpened[0].mean() > _CROP_REFINE_MAX_FRAC:
+            return None
+        return sharpened
     normal_mask, normal_alpha = normal
     sharp_mask, sharp_alpha = sharpened
 
