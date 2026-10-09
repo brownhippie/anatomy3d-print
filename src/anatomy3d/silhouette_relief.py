@@ -15,10 +15,12 @@ technique procedural_body.py already uses for its own, much coarser,
 naturally thick in limb/torso centers and tapers toward the cutout's own
 edge, rather than a flat cardboard cutout.
 """
+from typing import Optional
+
 import numpy as np
 import trimesh
 from PIL import Image
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, map_coordinates
 from skimage.measure import marching_cubes
 
 from .mesh_types import BodyMesh
@@ -27,13 +29,29 @@ from .mesh_types import BodyMesh
 def build_silhouette_relief_mesh(
     alpha: np.ndarray,
     target_height_mm: float = 150.0,
-    grid_size: int = 220,
+    grid_size: int = 360,
     depth_scale: float = 0.5,
+    depth_rgb: Optional[np.ndarray] = None,
+    depth_strength: float = 0.5,
 ) -> BodyMesh:
     """`alpha`: a float [0,1] or boolean (H, W) mask -- the same soft
     cutout alpha detect_person_alpha produces (and the webapp's
     /jobs/{id}/cutout.png serves), thresholded at 0.5 to a hard boundary
     for a clean, closed mesh.
+
+    `grid_size`: raised from this function's original 220. NOTE: this
+    was a wrong diagnosis for the specific problem it was raised to fix
+    (a dog's head/ears reading as a featureless blob) -- confirmed
+    directly, not assumed: inspecting the alpha mask at full NATIVE
+    resolution around the head showed the same smooth, undifferentiated
+    boundary already present before any downsampling at all. That head
+    was photographed in a 3/4 view, where the eyes/snout/ears are
+    conveyed by color and shading, not by any silhouette discontinuity
+    against the background -- no grid resolution recovers detail the
+    boundary itself never had. (See depth_rgb below for what actually
+    helps that case.) Still kept at 360 since it's cheap and does help
+    ordinary edge precision generally -- just not a fix for that
+    specific failure mode.
 
     `depth_scale`: real human/animal depth (front-to-back) runs
     shallower than half of the local width a straight distance-transform
@@ -41,6 +59,22 @@ def build_silhouette_relief_mesh(
     side-to-side width, not equal to it) -- a tuned, not measured,
     flattening factor, same honesty this project already applies to its
     own tuned constants elsewhere (procedural_body.py's blend_k_frac).
+
+    `depth_rgb`/`depth_strength`: optional real per-pixel depth (Depth
+    Anything V2 Small, see depth_source.py -- same optional extra
+    build_body_mesh's own depth_rgb uses). Pure silhouette extrusion has
+    no way to know a region is angled toward the camera rather than
+    flat-on -- confirmed directly as a real limitation, not a guess: a
+    photographed head turned toward the camera came out just as
+    symmetric as a straight-on torso, because distance-to-edge alone
+    carries no orientation information. When given, biases the FRONT
+    surface only (same asymmetric-front/untouched-back design as
+    procedural_body._sculpt_front_surface_from_depth, and the same
+    sign convention, confirmed directly against a real photo -- a
+    known subject in front of a background scored higher raw depth than
+    the background did, i.e. higher = closer). Leave None for the
+    original pure-silhouette behavior (depth bias is additive on top of
+    it, not a replacement).
 
     No pose, no color, no texture -- purely the cutout's own shape swept
     into a rounded volume. Render/texture it yourself from here."""
@@ -85,7 +119,49 @@ def build_silhouette_relief_mesh(
     min_half_thickness = max(1.0 / scale, 0.5)
     half_thickness = np.where(grid_mask, np.sqrt(half_thickness_raw**2 + min_half_thickness**2), 0.0)
 
-    true_max = float(half_thickness.max())
+    # mid/half_span generalize the symmetric lens (front = +half_thickness,
+    # back = -half_thickness) to an optionally asymmetric one -- with no
+    # depth_rgb, mid stays 0 and half_span stays half_thickness, exactly
+    # recovering the original symmetric behavior.
+    mid = np.zeros_like(half_thickness)
+    half_span = half_thickness
+    if depth_rgb is not None:
+        from .depth_source import estimate_relative_depth
+
+        depth = estimate_relative_depth(depth_rgb)
+        depth_h, depth_w = depth.shape
+        # grid (row, col) -> original full-photo pixel coords: undo the
+        # pad offset and the crop+downsample scale, then add back the
+        # crop's own top-left corner (y0, x0).
+        grid_rows, grid_cols = np.mgrid[0:gh, 0:gw]
+        orig_row = y0 + (grid_rows - pad) / scale
+        orig_col = x0 + (grid_cols - pad) / scale
+        sample_row = np.clip(orig_row * (depth_h / mask.shape[0]), 0, depth_h - 1)
+        sample_col = np.clip(orig_col * (depth_w / mask.shape[1]), 0, depth_w - 1)
+        sampled = map_coordinates(depth, [sample_row, sample_col], order=1, mode="nearest")
+
+        # Normalize against the SUBJECT's own depth values, not the whole
+        # crop (which includes background at a very different depth scale
+        # and would swamp the subject's own, much smaller, internal
+        # variation) -- same reasoning procedural_body.py's depth sculpt
+        # already applies, by construction there (it only ever samples
+        # at front-facing body vertices to begin with).
+        subj_vals = sampled[grid_mask]
+        std = subj_vals.std()
+        if std > 1e-9:
+            d_norm = (sampled - subj_vals.mean()) / std
+            # Front-only bias, proportional to each column's own
+            # thickness (tapers to ~0 at the mask edge, same as
+            # _sculpt_front_surface_from_depth's displacement does) --
+            # never let the front cross back past a small positive
+            # floor, matching that function's own "never cross the
+            # centerline" safety.
+            front = np.maximum(half_thickness * (1.0 + d_norm * depth_strength), min_half_thickness * 0.3)
+            back = -half_thickness
+            mid = np.where(grid_mask, (front + back) / 2.0, 0.0)
+            half_span = np.where(grid_mask, (front - back) / 2.0, half_thickness)
+
+    true_max = float((np.abs(mid) + half_span).max())
     if true_max <= 0:
         raise ValueError("Mask too thin/small to extrude a volume from.")
     # A few percent beyond the true max so the solid never exactly
@@ -108,7 +184,7 @@ def build_silhouette_relief_mesh(
     dz = zs[1] - zs[0]
     field = np.empty((gz, gh, gw), dtype=np.float32)
     for i, z in enumerate(zs):
-        field[i] = z * z - half_thickness * half_thickness
+        field[i] = (z - mid) ** 2 - half_span**2
     field[:, ~grid_mask] = 1.0
 
     verts, faces, _, _ = marching_cubes(field, level=0.0, spacing=(dz, 1.0 / scale, 1.0 / scale))

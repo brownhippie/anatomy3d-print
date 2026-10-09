@@ -238,6 +238,8 @@ def run_silhouette_relief_pipeline(
     out_stl_path: str,
     target_height_mm: float = 150.0,
     target_faces: Optional[int] = 20000,
+    use_depth: bool = False,
+    depth_strength: float = 0.5,
 ) -> None:
     """A deliberately different, simpler path than run_pipeline's
     single-photo mode: the mesh's own front-on silhouette is built
@@ -248,12 +250,29 @@ def run_silhouette_relief_pipeline(
     shapes, not just different code paths to the same result).
 
     No pose detection, so no pose-plausibility requirement and no face/
-    hair/depth/color options -- the tradeoff for guaranteeing the mesh's
+    hair/color options -- the tradeoff for guaranteeing the mesh's
     silhouette matches the cutout exactly: no anatomical detail beyond
     what the 2D outline itself shows (fingers only as wide as the
-    cutout's own hand shape, no separate face features, no fur/hair
-    volume). Multi-photo visual-hull mode (run_pipeline) is the existing
-    option when multiple viewing angles are available instead."""
+    cutout's own hand shape, no fur/hair volume). Multi-photo visual-hull
+    mode (run_pipeline) is the existing option when multiple viewing
+    angles are available instead.
+
+    `use_depth`: same optional extra and reasoning as run_pipeline's own
+    use_depth (requires `pip install -r requirements-depth.txt`). Pure
+    silhouette extrusion has no way to tell a region is angled toward
+    the camera -- confirmed directly as a real gap, not a guess: a
+    turned head came out just as symmetric as a straight-on torso. Real
+    depth data biases the front surface only (see
+    build_silhouette_relief_mesh's own docstring for the mechanism) --
+    off by default since it's a sizeable extra dependency, same
+    reasoning run_pipeline's use_depth already applies.
+
+    Confirmed directly, honestly: real, but crude -- it reads as genuine
+    surface variation where there was a flat symmetric dome before, not
+    a clean recognizable face/snout shape. It's also most visible on the
+    raw marching_cubes mesh; `target_faces` simplification for the final
+    STL smooths a good deal of the fine bumps back out, same as it would
+    for any other fine surface detail."""
     os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
 
     from .person_segmenter import detect_person_alpha
@@ -266,7 +285,12 @@ def run_silhouette_relief_pipeline(
             "the subject against a reasonably distinct background."
         )
 
-    body = build_silhouette_relief_mesh(alpha, target_height_mm=target_height_mm)
+    body = build_silhouette_relief_mesh(
+        alpha,
+        target_height_mm=target_height_mm,
+        depth_rgb=rgb if use_depth else None,
+        depth_strength=depth_strength,
+    )
 
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
