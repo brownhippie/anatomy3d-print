@@ -833,44 +833,72 @@ def _pose_vertically_ordered(joints: dict) -> bool:
     return True
 
 
+# landmarks.py's own detector is capped at num_poses=1 — deliberately
+# so for its own job (fitting ONE 3D body mesh per photo, used by
+# pipeline.py), but reusing it here silently broke multi-person photos:
+# confirmed directly on a real two-figure photo, only the first figure
+# got a skeleton, and the reach limit built from it erased the second
+# figure's real content entirely (mask fraction 0.077 -> 0.038, visibly
+# half the photo gone). This file needs its own detector, not
+# landmarks.py's — same cached model file (no new download), different
+# num_poses, so body-fitting's behavior is untouched.
+_POSE_MAX_SUBJECTS = 5
+_pose_detector = None
+
+
+def _get_pose_detector() -> mp_vision.PoseLandmarker:
+    global _pose_detector
+    if _pose_detector is None:
+        from . import landmarks as _landmarks_mod
+
+        base_options = mp_python.BaseOptions(model_asset_path=_landmarks_mod._ensure_model())
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp_vision.RunningMode.IMAGE,
+            num_poses=_POSE_MAX_SUBJECTS,
+        )
+        _pose_detector = mp_vision.PoseLandmarker.create_from_options(options)
+    return _pose_detector
+
+
 def _pose_landmarks(rgb: np.ndarray, mask: "Optional[np.ndarray]" = None):
-    """Returns {joint_name: (x, y)} in pixel coords, or None if no pose
-    was found, too few joints are confident enough to use, the detected
-    joints don't run top-to-bottom the way a real photographed person's
-    always do (see _pose_vertically_ordered), or (when `mask` is given)
-    too few of the detected joints land on content the segmenter itself
-    calls the subject (see _POSE_MIN_CORROBORATION). Reuses the same
-    cached model/detector landmarks.py already downloads for
-    body-fitting — not a new model or license to clear."""
+    """Returns a list of {joint_name: (x, y)} dicts, one per detected
+    pose that passed validation (possibly empty) — each pose is
+    independently rejected if too few of its joints are confident
+    enough to use, its joints don't run top-to-bottom the way a real
+    photographed person's always do (see _pose_vertically_ordered), or
+    (when `mask` is given) too few of its joints land on content the
+    segmenter itself calls the subject (see _POSE_MIN_CORROBORATION) —
+    a hallucinated pose next to a real one doesn't get to invalidate
+    the real one, or vice versa."""
     from . import landmarks as _landmarks_mod
 
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
-    result = _landmarks_mod._get_detector().detect(mp_image)
+    result = _get_pose_detector().detect(mp_image)
     if not result.pose_landmarks:
-        return None
+        return []
     h, w = rgb.shape[:2]
-    lm_list = result.pose_landmarks[0]
-    joints = {}
-    for name, idx in _landmarks_mod.MEDIAPIPE_JOINT_INDEX.items():
-        lm = lm_list[idx]
-        if lm.visibility < 0.5 or lm.presence < 0.5:
+    accepted = []
+    for lm_list in result.pose_landmarks:
+        joints = {}
+        for name, idx in _landmarks_mod.MEDIAPIPE_JOINT_INDEX.items():
+            lm = lm_list[idx]
+            if lm.visibility < 0.5 or lm.presence < 0.5:
+                continue
+            joints[name] = (lm.x * w, lm.y * h)
+        if len(joints) < _POSE_MIN_JOINTS:
             continue
-        joints[name] = (lm.x * w, lm.y * h)
-    if len(joints) < _POSE_MIN_JOINTS:
-        return None
-
-    if not _pose_vertically_ordered(joints):
-        return None
-
-    if mask is not None:
-        supported = 0
-        for x, y in joints.values():
-            xi, yi = min(int(x), w - 1), min(int(y), h - 1)
-            supported += int(mask[yi, xi])
-        if supported / len(joints) < _POSE_MIN_CORROBORATION:
-            return None
-
-    return joints
+        if not _pose_vertically_ordered(joints):
+            continue
+        if mask is not None:
+            supported = 0
+            for x, y in joints.values():
+                xi, yi = min(int(x), w - 1), min(int(y), h - 1)
+                supported += int(mask[yi, xi])
+            if supported / len(joints) < _POSE_MIN_CORROBORATION:
+                continue
+        accepted.append(joints)
+    return accepted
 
 
 def _point_segment_distance(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -885,10 +913,10 @@ def _point_segment_distance(points: np.ndarray, a: np.ndarray, b: np.ndarray) ->
     return np.linalg.norm(points - closest, axis=1)
 
 
-def _pose_reach_limit(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> np.ndarray:
-    joints = _pose_landmarks(rgb, mask=mask)
-    if joints is None:
-        return alpha
+def _pose_segments(joints: dict):
+    """Builds this one pose's (point_a, point_b, radius) reach segments,
+    or None if there isn't enough of it (no shoulder or hip pair to
+    scale against) to build any."""
     if "left_shoulder" in joints and "right_shoulder" in joints:
         ls, rs = np.array(joints["left_shoulder"]), np.array(joints["right_shoulder"])
         scale = np.linalg.norm(ls - rs)
@@ -896,9 +924,9 @@ def _pose_reach_limit(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> n
         lh, rh = np.array(joints["left_hip"]), np.array(joints["right_hip"])
         scale = np.linalg.norm(lh - rh)
     else:
-        return alpha
+        return None
     if scale < 1.0:
-        return alpha
+        return None
 
     segments = []
     for name_a, name_b in _POSE_BONES:
@@ -915,6 +943,18 @@ def _pose_reach_limit(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> n
         mid = (np.array(joints["left_shoulder"]) + np.array(joints["right_shoulder"])) / 2
         segments.append((np.array(joints["nose"]), mid, scale * 1.3))
     if not segments:
+        return None
+    return scale, segments
+
+
+def _pose_reach_limit(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    poses = _pose_landmarks(rgb, mask=mask)
+    if not poses:
+        return alpha
+
+    per_pose = [_pose_segments(j) for j in poses]
+    per_pose = [p for p in per_pose if p is not None]
+    if not per_pose:
         return alpha
 
     # Unlike the soft-shell classifier checks elsewhere in this file,
@@ -932,11 +972,23 @@ def _pose_reach_limit(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> n
     ys, xs = np.nonzero(shell)
     points = np.stack([xs, ys], axis=1).astype(np.float64)
 
+    # A pixel only needs to be in plausible reach of ONE real person in
+    # the photo, not all of them — confirmed necessary by a direct test
+    # on a real photo with two separate figures in frame: scoring every
+    # pixel against a single detected skeleton (landmarks.py's detector
+    # caps at one pose) erased the second, real figure entirely (mask
+    # fraction 0.077 -> 0.038, half the photo gone). Take each pose's
+    # own min_excess over its own segments, then the MINIMUM across
+    # poses — "too far" only holds if every detected, validated person
+    # in the photo agrees it's too far.
     min_excess = None
-    for a, b, radius in segments:
-        dist = _point_segment_distance(points, a, b)
-        excess = (dist - radius) / scale
-        min_excess = excess if min_excess is None else np.minimum(min_excess, excess)
+    for scale, segments in per_pose:
+        pose_excess = None
+        for a, b, radius in segments:
+            dist = _point_segment_distance(points, a, b)
+            excess = (dist - radius) / scale
+            pose_excess = excess if pose_excess is None else np.minimum(pose_excess, excess)
+        min_excess = pose_excess if min_excess is None else np.minimum(min_excess, pose_excess)
 
     # Only pixels CLEARLY past every segment's radius (_POSE_EXCESS_TOLERANCE
     # shoulder-widths of slack beyond it) are touched. The damping has to
