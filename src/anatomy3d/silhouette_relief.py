@@ -16,6 +16,7 @@ naturally thick in limb/torso centers and tapers toward the cutout's own
 edge, rather than a flat cardboard cutout.
 """
 import numpy as np
+import trimesh
 from PIL import Image
 from scipy.ndimage import distance_transform_edt
 from skimage.measure import marching_cubes
@@ -111,6 +112,25 @@ def build_silhouette_relief_mesh(
     field[:, ~grid_mask] = 1.0
 
     verts, faces, _, _ = marching_cubes(field, level=0.0, spacing=(dz, 1.0 / scale, 1.0 / scale))
+
+    # A genuinely disconnected scrap of surface (e.g. a small noise
+    # island the alpha mask itself has, separate from the main subject)
+    # would otherwise ship as stray floating geometry in the exported
+    # mesh -- same class of defect build_body_mesh already guards
+    # against for its own output. Keep only the largest connected piece,
+    # same pattern. NOTE: this does not fix a part that's wrong but
+    # still attached (confirmed directly on a real photo: a tangled
+    # blob between a dog's two front legs turned out to be a genuine
+    # defect in the alpha mask itself -- a stray bridge connecting the
+    # two legs -- not a disconnected island; this check correctly left
+    # it alone since it's actually one connected piece, matching what
+    # the mask itself says).
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        mesh = max(components, key=lambda c: c.vertices.shape[0])
+    verts, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
+
     vz, vrow, vcol = verts[:, 0], verts[:, 1], verts[:, 2]
     # vrow/vcol are already in physical (original-photo-pixel) units via
     # `spacing` -- center on the PADDED grid's own physical extent (gh/gw
