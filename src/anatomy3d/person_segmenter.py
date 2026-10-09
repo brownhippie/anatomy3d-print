@@ -411,8 +411,14 @@ _MULTI_SUBJECT_EXTENT_THRESHOLD = 0.3
 
 # How far a subject's territory is allowed to extend past its own core,
 # as a fraction of the photo's shorter side — see the pad comment at its
-# use site for the real failure this bounds.
-_MULTI_SUBJECT_TERRITORY_PAD_FRAC = 0.15
+# use site for the real failure this bounds. Measured directly against
+# two real, conflicting cases rather than guessed: too small (0.03-0.05)
+# left a penguin's own head unreached, reproducing the original
+# between-heads bridging; too large (0.15, the value this replaced)
+# let the territory extension itself reach far enough back toward a
+# neighbor to partly reopen the corgi/poodle bridging fix. 0.07 is the
+# measured value that cleanly resolves both at once.
+_MULTI_SUBJECT_TERRITORY_PAD_FRAC = 0.07
 
 # Territory expansion is for subjects whose own core is too small to
 # represent their real extent (the cat's own core was its 29x74px
@@ -504,27 +510,43 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
             self_sufficient = (
                 core_h >= _MULTI_SUBJECT_SELF_SUFFICIENT_CORE_PX and core_w >= _MULTI_SUBJECT_SELF_SUFFICIENT_CORE_PX
             )
+            # The bounded territory (same pad used for a small core) also
+            # supplements a self-sufficient one — confirmed directly on a
+            # penguin photo: a penguin's body core was plenty big on its
+            # own, but its head and neck, being a separate and slightly
+            # less confident region, fell outside that core entirely, so
+            # a crop sized from the body alone never reached the gap
+            # between two birds' heads. Bounding this the same way
+            # already-validated for small cores keeps it from
+            # reintroducing the earlier reach-into-a-neighbor problem.
+            pad = int(_MULTI_SUBJECT_TERRITORY_PAD_FRAC * min(h, w))
+            bound_y0, bound_y1 = max(0, core_y0 - pad), min(h, core_y1 + pad + 1)
+            bound_x0, bound_x1 = max(0, core_x0 - pad), min(w, core_x1 + pad + 1)
+            territory_full = extent & (territory_of == component_id)
+            territory = np.zeros_like(territory_full)
+            territory[bound_y0:bound_y1, bound_x0:bound_x1] = territory_full[bound_y0:bound_y1, bound_x0:bound_x1]
+            terr_ys, terr_xs = np.where(territory)
+
             if self_sufficient:
                 # A core this size can be cropped tight around its own
-                # bbox directly — no need to grow it. Ownership of the
-                # ambiguous pixels around it (ambiguous enough to never
-                # have reached the strict core threshold themselves, the
-                # exact pixels this whole mechanism exists to correct)
-                # is everything in the crop that isn't ANOTHER subject's
-                # own confirmed core — the same rule the first, working
-                # version of this fix used throughout.
+                # bbox directly — no need to grow it to find its own
+                # main body. Ownership of the ambiguous pixels around it
+                # (ambiguous enough to never have reached the strict
+                # core threshold themselves, the exact pixels this whole
+                # mechanism exists to correct) is everything in the crop
+                # that isn't ANOTHER subject's own confirmed core — the
+                # same rule the first, working version of this fix used
+                # throughout. The bounded territory only extends the
+                # crop bbox itself, for cases like a head sitting just
+                # outside the body's own core.
                 y0, y1, x0, x1 = core_y0, core_y1, core_x0, core_x1
+                if terr_ys.size:
+                    y0, y1 = min(y0, terr_ys.min()), max(y1, terr_ys.max())
+                    x0, x1 = min(x0, terr_xs.min()), max(x1, terr_xs.max())
             else:
-                pad = int(_MULTI_SUBJECT_TERRITORY_PAD_FRAC * min(h, w))
-                bound_y0, bound_y1 = max(0, core_y0 - pad), min(h, core_y1 + pad + 1)
-                bound_x0, bound_x1 = max(0, core_x0 - pad), min(w, core_x1 + pad + 1)
-                territory_full = extent & (territory_of == component_id)
-                territory = np.zeros_like(territory_full)
-                territory[bound_y0:bound_y1, bound_x0:bound_x1] = territory_full[bound_y0:bound_y1, bound_x0:bound_x1]
-                ys, xs = np.where(territory)
-                if ys.size == 0:
+                if terr_ys.size == 0:
                     continue
-                y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+                y0, y1, x0, x1 = terr_ys.min(), terr_ys.max(), terr_xs.min(), terr_xs.max()
             bbox_h, bbox_w = y1 - y0 + 1, x1 - x0 + 1
             if bbox_h >= _CROP_REFINE_MAX_FRAC * h and bbox_w >= _CROP_REFINE_MAX_FRAC * w:
                 continue
