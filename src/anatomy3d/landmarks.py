@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.request import urlretrieve
 
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
@@ -98,6 +99,68 @@ class DetectedKeypoints:
     joints: dict
 
 
+# Two anatomical-plausibility checks, originally built for person_segmenter.py's
+# separate pose-reach-limiting detector and ported here so the pose that
+# actually drives the 3D mesh gets the same protection — the
+# visibility/presence filter above already caught one real hallucination
+# class (off-frame joints scored high on visibility but low on presence)
+# but not this one: a real photo of a single hand against plain background
+# (no body at all) got a 12-joint skeleton invented on it — nose, both
+# shoulders, an elbow, wrist, hips, knees — all individually sitting on
+# real "hand" pixels (nothing here checks mask corroboration, unlike the
+# 2D reach-limiter, since there's no segmenter mask available at this
+# point in the pipeline), but its knee landed ABOVE its hip — anatomically
+# backwards.
+#
+# The fix: a real photographed person's joints run top-to-bottom in a
+# fixed order — shoulders above hips above knees above ankles. Checked
+# directly against 5 different real detected poses (standing, blurred,
+# two-people, torso-cropped): zero exceptions, every single one.
+_POSE_ORDER_CHAIN = ("shoulder", "hip", "knee", "ankle")
+
+# A second, independent signal: lowering detection confidence to catch
+# real but small/distant people also let a hallucinated skeleton through
+# the ordering check above (an off-by-coincidence-vertical fake chain) —
+# a fabricated shoulder pair only 113px apart in x but 706px apart in y,
+# an almost-vertical "shoulder line" at 80.9 degrees from horizontal.
+# Real shoulders run side-to-side, not stacked: checked directly against
+# 6 real detected poses (including an awkward twisted lunge) and every
+# one measured under 4 degrees. Hip angle was tried and rejected the same
+# way: a real twisted lunge measured a real 60.5-degree hip angle (hips
+# rotate independently of the camera; shoulders much less so), not a
+# separable signal, unlike shoulder angle.
+_POSE_MAX_SHOULDER_ANGLE_DEG = 30.0
+
+
+def _pose_vertically_ordered(joints: dict) -> bool:
+    ys = []
+    for part in _POSE_ORDER_CHAIN:
+        left, right = joints.get(f"left_{part}"), joints.get(f"right_{part}")
+        pts = [p[1] for p in (left, right) if p is not None]
+        ys.append(np.mean(pts) if pts else None)
+    present = [y for y in ys if y is not None]
+    # need at least 2 rungs of the chain present to check anything
+    if len(present) < 2:
+        return True
+    prev = None
+    for y in ys:
+        if y is None:
+            continue
+        if prev is not None and y < prev:
+            return False
+        prev = y
+    return True
+
+
+def _pose_shoulders_level(joints: dict) -> bool:
+    ls, rs = joints.get("left_shoulder"), joints.get("right_shoulder")
+    if ls is None or rs is None:
+        return True  # nothing to check without both shoulders
+    dx, dy = rs[0] - ls[0], rs[1] - ls[1]
+    angle = np.degrees(np.arctan2(abs(dy), abs(dx) + 1e-9))
+    return angle <= _POSE_MAX_SHOULDER_ANGLE_DEG
+
+
 def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5, min_presence: float = 0.5) -> DetectedKeypoints:
     prepared = load_image_rgb(image_path)
     width, height = prepared.width, prepared.height
@@ -140,6 +203,21 @@ def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5, min_pres
             f"Warning: only {len(joints)} keypoints detected, {result.margin:.0%} "
             f"above the {MIN_KEYPOINTS}-keypoint minimum — pose estimation may be "
             "unreliable. A clearer full-body photo will give a better result."
+        )
+
+    if not _pose_vertically_ordered(joints):
+        raise RuntimeError(
+            "Detected pose fails an anatomical plausibility check (joints out of "
+            "top-to-bottom order — e.g. a knee above a hip). This usually means "
+            "the detector hallucinated a skeleton rather than finding a real one; "
+            "use a clearer, unobstructed full-body photo."
+        )
+    if not _pose_shoulders_level(joints):
+        raise RuntimeError(
+            "Detected pose fails an anatomical plausibility check (shoulder line "
+            f"more than {_POSE_MAX_SHOULDER_ANGLE_DEG:.0f} degrees from horizontal). "
+            "This usually means the detector hallucinated a skeleton rather than "
+            "finding a real one; use a clearer, unobstructed full-body photo."
         )
 
     return DetectedKeypoints(image_width=width, image_height=height, joints=joints)

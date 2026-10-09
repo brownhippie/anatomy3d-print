@@ -74,6 +74,12 @@ from mediapipe.tasks.python import vision as mp_vision
 from PIL import Image, ImageFilter
 from scipy import ndimage
 
+# Vertical-ordering and shoulder-angle plausibility checks live in
+# landmarks.py (shared with its own pose detector, which actually drives
+# the 3D mesh) — imported here, not duplicated, so this file's reach-
+# limiting detector uses the exact same hallucination protection.
+from .landmarks import _POSE_MAX_SHOULDER_ANGLE_DEG, _POSE_ORDER_CHAIN, _pose_shoulders_level, _pose_vertically_ordered
+
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
     "selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
@@ -831,54 +837,6 @@ _POSE_MIN_JOINTS = 4
 # depending on pose, which overlaps the hallucinated cases' 1.82-1.93 —
 # not a separable signal, unlike vertical ordering.
 _POSE_MIN_CORROBORATION = 0.8
-_POSE_ORDER_CHAIN = ("shoulder", "hip", "knee", "ankle")
-
-# A third, independent signal, found necessary by trying to close a
-# different gap (see _POSE_MAX_SUBJECTS below): lowering the detector's
-# own confidence floor to catch real but small/distant people also let
-# a NEW hallucination through both existing gates on the same hand
-# photo as before — a fabricated skeleton with shoulders at (2109,3263)
-# and (2222,2557), only 113px apart in x but 706px apart in y, an
-# almost-vertical "shoulder line" at 80.9 degrees from horizontal. Real
-# shoulders run side-to-side, not stacked: checked directly against 6
-# real detected poses (standing, blurred, two-people including an
-# awkward twisted lunge, a flowing-poncho photo, a studio portrait) and
-# every one measured under 4 degrees. Hip angle was tried too and
-# rejected the same way the shoulder-to-hip-width ratio was: the same
-# twisted lunge photo measured a real 60.5-degree hip angle (hips
-# rotate independently of the camera in a real dynamic pose; shoulders
-# much less so), overlapping hallucinated values — not separable,
-# unlike shoulder angle.
-_POSE_MAX_SHOULDER_ANGLE_DEG = 30.0
-
-
-def _pose_vertically_ordered(joints: dict) -> bool:
-    ys = []
-    for part in _POSE_ORDER_CHAIN:
-        left, right = joints.get(f"left_{part}"), joints.get(f"right_{part}")
-        pts = [p[1] for p in (left, right) if p is not None]
-        ys.append(np.mean(pts) if pts else None)
-    present = [y for y in ys if y is not None]
-    # need at least 2 rungs of the chain present to check anything
-    if len(present) < 2:
-        return True
-    prev = None
-    for y in ys:
-        if y is None:
-            continue
-        if prev is not None and y < prev:
-            return False
-        prev = y
-    return True
-
-
-def _pose_shoulders_level(joints: dict) -> bool:
-    ls, rs = joints.get("left_shoulder"), joints.get("right_shoulder")
-    if ls is None or rs is None:
-        return True  # nothing to check without both shoulders
-    dx, dy = rs[0] - ls[0], rs[1] - ls[1]
-    angle = np.degrees(np.arctan2(abs(dy), abs(dx) + 1e-9))
-    return angle <= _POSE_MAX_SHOULDER_ANGLE_DEG
 
 
 # landmarks.py's own detector is capped at num_poses=1 — deliberately
