@@ -68,6 +68,7 @@ from urllib.request import urlretrieve
 
 import mediapipe as mp
 import numpy as np
+import onnxruntime as ort
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from PIL import Image, ImageFilter
@@ -104,6 +105,26 @@ ANIMAL_MODEL_CACHE_PATH = Path.home() / ".cache" / "anatomy3d-print" / "deeplab_
 # handled by the selfie model above) are not subjects this pipeline
 # treats as foreground.
 ANIMAL_CATEGORIES = (3, 8, 10, 12, 13, 17)  # bird, cat, cow, dog, horse, sheep
+
+# BiRefNet_lite (ZhengPeng7/BiRefNet_lite, MIT license), via the
+# onnx-community ONNX port so it runs on CPU through onnxruntime with no
+# torch/GPU dependency -- this environment has neither. A dedicated
+# matting network, not a general-purpose segmenter like the two above:
+# trained end-to-end on ground-truth alpha data specifically for clean
+# edges on fine detail (hair, fur, whiskers) -- the thing this file's
+# own heuristic passes (four independent attempts, see git history)
+# could never fully solve. Confirmed directly against six real test
+# photos that its edges are visibly better there than this module's own
+# output. See _birefnet_refine for why it's used as a bounded edge
+# refinement rather than a wholesale replacement.
+BIREFNET_MODEL_URL = "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx"
+BIREFNET_MODEL_CACHE_PATH = Path.home() / ".cache" / "anatomy3d-print" / "birefnet_lite.onnx"
+
+# Read directly from the model's own shipped preprocessor_config.json and
+# its ONNX graph's input/output tensor names, not guessed.
+_BIREFNET_INPUT_SIZE = 1024
+_BIREFNET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_BIREFNET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def _ensure_model(url: str, cache_path: Path) -> str:
@@ -1106,6 +1127,82 @@ def _fill_noise_clusters(mask: np.ndarray, alpha: np.ndarray) -> "tuple[np.ndarr
     return mask | fill, np.where(fill, 1.0, alpha).astype(alpha.dtype)
 
 
+_birefnet_session = None
+
+
+def _get_birefnet_session() -> "ort.InferenceSession":
+    global _birefnet_session
+    if _birefnet_session is None:
+        model_path = _ensure_model(BIREFNET_MODEL_URL, BIREFNET_MODEL_CACHE_PATH)
+        _birefnet_session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    return _birefnet_session
+
+
+def _birefnet_alpha(rgb: np.ndarray) -> np.ndarray:
+    """Runs BiRefNet_lite full-frame on CPU and returns its own alpha
+    matte, resized back to the original resolution. ~20-40s per image on
+    this CPU-only environment (no GPU available) -- see _birefnet_refine
+    for why that cost is bounded to a thin edge band rather than paid on
+    every pixel's final answer."""
+    h, w = rgb.shape[:2]
+    session = _get_birefnet_session()
+    img = Image.fromarray(rgb).resize((_BIREFNET_INPUT_SIZE, _BIREFNET_INPUT_SIZE), Image.BILINEAR)
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    arr = (arr - _BIREFNET_MEAN) / _BIREFNET_STD
+    arr = arr.transpose(2, 0, 1)[None].astype(np.float32)
+    logits = session.run(["output_image"], {"input_image": arr})[0][0, 0]
+    alpha = 1.0 / (1.0 + np.exp(-logits))
+    alpha_img = Image.fromarray((alpha * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)
+    return np.asarray(alpha_img).astype(np.float32) / 255.0
+
+
+# How far past the existing mask's own boundary BiRefNet is trusted to
+# rescue real content -- picked at the same order of magnitude as the
+# flyaway-hair/whisker strand lengths seen in this project's real test
+# photos (tens of px, not whole limbs). _NOISE_CLUSTER_DILATION_PX (10px)
+# is a different, smaller-scale check and not reused here on purpose.
+_BIREFNET_BAND_DILATION_PX = 20
+
+
+def _birefnet_refine(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+    """Uses BiRefNet's matte to refine the EDGES of a subject this file's
+    own passes already found -- never to decide whether a subject exists
+    at all. BiRefNet is trained to pick one most-salient subject
+    (confirmed directly: a real multi-object scene with no single
+    dominant subject came back with mean alpha 0.09 across the whole
+    frame), so trusting its full-frame output wholesale would silently
+    undo this file's own multi-subject handling (see _pose_reach_limit's
+    docstring for why that matters). It only ever touches a thin band
+    around content already in `mask`:
+      - inside the existing soft shell (mask, not yet core-confident),
+        LOWER alpha where BiRefNet reads less confidence -- tightens
+        background bleed at an edge. Always safe, same one-directional
+        invariant _pose_reach_limit uses.
+      - just outside the existing mask but still within the band, RAISE
+        alpha only where BiRefNet is confident AND the pixel is
+        connected to the existing mask -- rescues real fine detail (a
+        hair/fur wisp the fast pipeline cut off), gated the same way
+        _segment_coarse's sharpened-pass rescue requires connectivity to
+        the clean pass rather than trusting an unvalidated pass outright.
+    """
+    birefnet = _birefnet_alpha(rgb)
+    core = alpha > _MULTI_SUBJECT_CORE_THRESHOLD
+    band = ndimage.binary_dilation(mask, iterations=_BIREFNET_BAND_DILATION_PX) & ~core
+
+    new_alpha = alpha.copy()
+    shell = band & mask
+    new_alpha[shell] = np.minimum(alpha[shell], birefnet[shell])
+
+    candidate = band & ~mask & (birefnet > PERSON_ALPHA_THRESHOLD)
+    if candidate.any():
+        labeled, _ = ndimage.label(candidate | mask)
+        mask_labels = set(np.unique(labeled[mask])) - {0}
+        connected = candidate & np.isin(labeled, list(mask_labels))
+        new_alpha[connected] = birefnet[connected]
+
+    return _hysteresis_mask(new_alpha), new_alpha
+
+
 def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
     person = _segment_full_person(rgb)
     animal = _segment_full_animal_robust(rgb)
@@ -1123,6 +1220,9 @@ def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray
         mask, alpha = person[0] | animal[0], np.maximum(person[1], animal[1])
     mask, alpha = _fill_noise_clusters(mask, alpha)
     mask, alpha = _drop_unvalidated_islands(mask, alpha)
+    if not mask.any():
+        return None
+    mask, alpha = _birefnet_refine(rgb, mask, alpha)
     if not mask.any():
         return None
     return mask, alpha
