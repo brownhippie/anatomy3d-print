@@ -358,11 +358,93 @@ def _refine_crop(
     return _hysteresis_mask(out_alpha), out_alpha
 
 
+# A dense multi-subject photo confuses the model in a way cropping
+# around the WHOLE group can't fix, and _refine_crop's max-only merge
+# wouldn't fix it either even if it tried — confirmed directly on a
+# real photo of four pets (two cats, two dogs) side by side: a patch of
+# plain pink studio backdrop between a poodle and a corgi scored 0.68
+# "dog" confidence (above the hard-mask threshold) from the full-frame
+# pass alone, not from any pipeline logic here. Re-running the model on
+# a tight crop around just the corgi (excluding the other pets) read
+# that same patch at 0.08 — correctly background. The model isn't
+# missing resolution there, it's reading the OTHER nearby animals as
+# context for "probably more animal nearby." So unlike _refine_crop
+# (which only ever raises alpha, since it exists to rescue missed
+# detail), this one needs to lower it too — it replaces alpha outright
+# within each subject's own tight crop, trusting that an
+# uncluttered, single-subject view is more reliable there than the
+# crowded full-frame one. Guarded two ways: only runs when there are 2+
+# separately-detected subjects to begin with (an ordinary single person
+# or animal never touches this path), and never overwrites pixels
+# already claimed by a DIFFERENT detected subject, so one subject's
+# crop can't degrade a neighboring subject's own correct reading.
+#
+# Detecting those 2+ subjects can't just look for separate components in
+# the regular mask — confirmed directly: on the four-pets photo, the
+# false-positive confidence bridging two of them was itself enough to
+# connect all four pets into a single blob (1 component, not 4), so a
+# check for 2+ ordinary mask components never even saw the problem.
+# Seeding from a stricter confidence floor instead avoids this: real fur
+# at the four pets' own cores read 0.85+ throughout, well above the
+# bridging patch's 0.68 peak, so a core this strict separates them
+# correctly regardless of how confident the bridge in between is.
+_MULTI_SUBJECT_CORE_THRESHOLD = 0.85
+_MULTI_SUBJECT_MIN_COMPONENT_PX = 50
+
+
+def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, raw_fn) -> "tuple[np.ndarray, np.ndarray]":
+    h, w = mask.shape
+    core = alpha > _MULTI_SUBJECT_CORE_THRESHOLD
+    labeled, n = ndimage.label(core)
+    if n == 0:
+        return mask, alpha
+    sizes = ndimage.sum(core, labeled, index=range(1, n + 1))
+    significant = [i + 1 for i, s in enumerate(sizes) if s >= _MULTI_SUBJECT_MIN_COMPONENT_PX]
+    if len(significant) < 2:
+        return mask, alpha
+
+    out_alpha = alpha.copy()
+    for component_id in significant:
+        ys, xs = np.where(labeled == component_id)
+        y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+        bbox_h, bbox_w = y1 - y0 + 1, x1 - x0 + 1
+        if bbox_h >= _CROP_REFINE_MAX_FRAC * h and bbox_w >= _CROP_REFINE_MAX_FRAC * w:
+            continue
+        margin_y, margin_x = int(bbox_h * _CROP_REFINE_MARGIN_FRAC), int(bbox_w * _CROP_REFINE_MARGIN_FRAC)
+        cy0, cy1 = max(0, y0 - margin_y), min(h, y1 + margin_y + 1)
+        cx0, cx1 = max(0, x0 - margin_x), min(w, x1 + margin_x + 1)
+        refined = _segment_coarse(rgb[cy0:cy1, cx0:cx1], raw_fn)
+        if refined is None:
+            continue
+        _, refined_alpha = refined
+        # Only ever LOWER alpha here, never raise it. Found directly:
+        # an unconditional replace fixed the four-pets bridging case but
+        # broke a single real person's photo — a dark-sleeved arm's own
+        # core fragmented away from the rest of the body (a local
+        # confidence dip, not a second subject), and cropping tight
+        # around just that fragment hit the exact same context-shift
+        # problem _refine_crop's own gating already exists to prevent:
+        # the zoomed-in view nudged up confidence over a real patch of
+        # wall, which nothing then protected since the wall isn't
+        # "another subject"'s territory. A one-directional minimum()
+        # can't reintroduce that failure mode (it only ever removes
+        # confidence, never adds it) while still correcting the
+        # original bug, since the false-positive bridge between two
+        # real subjects was a case of too-HIGH confidence to begin with.
+        crop_labels = labeled[cy0:cy1, cx0:cx1]
+        other_subjects = (crop_labels != 0) & (crop_labels != component_id)
+        region = out_alpha[cy0:cy1, cx0:cx1]
+        lowered = np.minimum(region, refined_alpha)
+        out_alpha[cy0:cy1, cx0:cx1] = np.where(other_subjects, region, lowered)
+    return _hysteresis_mask(out_alpha), out_alpha
+
+
 def _segment_full(rgb: np.ndarray, raw_fn) -> "Optional[tuple[np.ndarray, np.ndarray]]":
     coarse = _segment_coarse(rgb, raw_fn)
     if coarse is None:
         return None
-    return _refine_crop(rgb, *coarse, raw_fn)
+    mask, alpha = _refine_crop(rgb, *coarse, raw_fn)
+    return _refine_per_subject(rgb, mask, alpha, raw_fn)
 
 
 def _segment_full_person(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
