@@ -475,15 +475,22 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
         # Each subject gets its own tight crop+margin, sized from its
         # own territory, and its own independent reading there, same as
         # a single-subject refine. best_claim collects, per pixel, the
-        # most confident reading ANY subject's own crop gave it within
-        # ITS OWN territory — so where two subjects' crops overlap
-        # (both reach the same pixel), that pixel is checked against
-        # both before anything is decided, never just handed to
-        # whichever ran first, and a neighbor's crop can never outvote
-        # the subject whose own territory the pixel actually belongs
-        # to. Pixels no subject's territory reaches at all stay
-        # unclaimed (-1) and are left untouched.
-        best_claim = np.full((h, w), -1.0, dtype=np.float32)
+        # MOST SKEPTICAL reading ANY subject's own crop gave it within
+        # ITS OWN territory — so where two subjects' crops overlap (both
+        # reach the same pixel), that pixel is checked against both
+        # before anything is decided. Found directly on a puppy/kitten
+        # photo: a patch of dirt was golden-tan, close enough to the
+        # puppy's own fur color that the puppy's own isolated crop read
+        # it as confidently puppy (0.9998) — but the kitten's isolated
+        # crop (different fur color, no such confusion) read the same
+        # patch as confidently background (0.19). Taking the subjects'
+        # MAX would hand the pixel to whichever one hallucinates harder;
+        # taking the MIN means any one subject's skepticism can veto a
+        # neighbor's overconfidence, consistent with the "only ever
+        # lower, never raise" rule the next step already applies.
+        # Pixels no subject's territory reaches at all stay unclaimed
+        # (sentinel +inf) and are left untouched.
+        best_claim = np.full((h, w), np.inf, dtype=np.float32)
         any_crop_ran = False
         for component_id in significant:
             # The territory itself has to stay bounded near this
@@ -565,7 +572,7 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
                 own_territory_in_crop = territory[cy0:cy1, cx0:cx1]
             region = best_claim[cy0:cy1, cx0:cx1]
             best_claim[cy0:cy1, cx0:cx1] = np.where(
-                own_territory_in_crop, np.maximum(region, refined_alpha), region
+                own_territory_in_crop, np.minimum(region, refined_alpha), region
             )
 
         if not any_crop_ran:
@@ -588,7 +595,7 @@ def _refine_per_subject(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray, ra
         # with. A contested pixel with no confident claim from any
         # subject (best_claim stays low) is left low too — omitted
         # rather than guessed into either one's silhouette.
-        claimed = best_claim >= 0
+        claimed = np.isfinite(best_claim)
         next_alpha = np.where(claimed, np.minimum(current, best_claim), current)
 
         changed = np.abs(next_alpha - current).max()
