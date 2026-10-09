@@ -302,6 +302,29 @@ def _segment_coarse(rgb: np.ndarray, raw_fn) -> "Optional[tuple[np.ndarray, np.n
     # up as visible background smudging in the soft-alpha cutout, since
     # that output isn't thresholded at all.
     rescue_allowed = sharp_mask & ~enclosed_bg
+
+    # The sharpened pass can also manufacture a brand-new, fully isolated
+    # island purely from noise amplification, not a recovered edge of
+    # anything the clean pass found — confirmed directly on a real
+    # portrait with heavy canvas-grain texture in its dark background:
+    # the clean pass correctly read a patch of plain background noise at
+    # alpha 0.09-0.13, but the sharpened pass alone pushed the same patch
+    # to 0.53, over the hard-mask threshold, with zero connection (not
+    # even through the weak hysteresis band) to the real detected
+    # subject — a disconnected 2,594px blob floating in open background.
+    # Rescue exists to recover missed detail OF the subject the clean
+    # pass already located (confirmed on the blurred-photo case this
+    # mechanism was built for: the recovered legs/head stay physically
+    # contiguous with the torso the clean pass did find), not to
+    # introduce a wholly separate blob with no relationship to it. A
+    # rescue-only component that doesn't even touch the clean pass's own
+    # mask is noise, not a find, so it's dropped here.
+    union_labeled, n_union = ndimage.label(normal_mask | rescue_allowed)
+    if n_union > 0:
+        touches_normal = ndimage.sum(normal_mask, union_labeled, index=range(1, n_union + 1)) > 0
+        keep_labels = np.where(touches_normal)[0] + 1
+        rescue_allowed = rescue_allowed & np.isin(union_labeled, keep_labels)
+
     alpha = np.where(rescue_allowed, np.maximum(normal_alpha, sharp_alpha), normal_alpha)
     return normal_mask | rescue_allowed, alpha
 
