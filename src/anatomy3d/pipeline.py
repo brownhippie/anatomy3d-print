@@ -304,3 +304,76 @@ def run_silhouette_relief_pipeline(
     export_stl(mesh, out_stl_path, target_faces=target_faces)
 
     print(f"Wrote {out_stl_path} (printing), {obj_path} (render/animation), and {glb_path} (glTF, for other tools).")
+
+
+def run_trellis_pipeline(
+    image_path: str,
+    out_stl_path: str,
+    target_height_mm: float = 150.0,
+    target_faces: Optional[int] = 20000,
+) -> None:
+    """A third, genuinely different path from both run_pipeline (capsules
+    fit to detected joints) and run_silhouette_relief_pipeline (this
+    project's own silhouette+depth-heuristic extrusion): hands the photo to
+    Microsoft's TRELLIS.2 (see trellis_source.py), an external MIT-licensed
+    general-purpose single-image 3D reconstruction model, and uses its
+    result directly instead of anything this project builds itself.
+
+    Single photo only -- TRELLIS.2 is a single-image model, no multi-view
+    visual-hull concept the way run_pipeline's multi-photo mode has.
+
+    Confirmed directly (not assumed) on this project's own real test photos:
+    excellent on a human portrait -- one clean, connected mesh with correct
+    face/hair/clothing detail and color, better than this project's own
+    pipeline. The SAME real test on an animal photo came back recognizable
+    but fragmented into disconnected pieces, not a printable solid -- so
+    this function refuses animal subjects for now (using the same
+    animal_frac signal person_segmenter/silhouette_relief already use to
+    tell a confidently-animal subject apart from a human one) rather than
+    silently shipping a known-broken result. Revisit once that's actually
+    been fixed or re-verified across more than one real photo.
+
+    Needs network access and, for real use beyond a couple of anonymous
+    rate-limited calls, an HF_TOKEN environment variable -- see
+    trellis_source.py's own docstring."""
+    from .person_segmenter import detect_person_alpha_with_source
+    from .silhouette_relief import _CROP_MAX_ANIMAL_FRAC
+    from .trellis_source import generate_mesh_via_trellis
+
+    os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
+
+    rgb = load_image_rgb(image_path, max_dimension=None).rgb
+    detected = detect_person_alpha_with_source(rgb)
+    if detected is None:
+        raise RuntimeError(
+            "No person/animal detected in the image -- use a clear photo with "
+            "the subject against a reasonably distinct background."
+        )
+    _alpha, animal_frac = detected
+    if animal_frac > _CROP_MAX_ANIMAL_FRAC:
+        raise RuntimeError(
+            "This photo looks like an animal subject. TRELLIS.2 reconstruction "
+            "was confirmed to produce a fragmented, non-printable mesh on a real "
+            "animal test photo in this project's own testing -- not reliable "
+            "enough yet to use here. Use the other pipeline modes for animal "
+            "subjects for now."
+        )
+
+    body = generate_mesh_via_trellis(image_path)
+    # Scale to the requested height exactly, same convention every other
+    # pipeline mode here follows -- TRELLIS.2's own output is in an
+    # arbitrary unit bounding box, not millimeters.
+    height = float(body.vertices[:, 1].max() - body.vertices[:, 1].min())
+    if height > 1e-6:
+        body.vertices = body.vertices * (target_height_mm / height)
+
+    obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
+    export_obj(body, obj_path)
+
+    glb_path = os.path.splitext(out_stl_path)[0] + ".glb"
+    export_glb(body, glb_path)
+
+    mesh = to_trimesh(body)
+    export_stl(mesh, out_stl_path, target_faces=target_faces)
+
+    print(f"Wrote {out_stl_path} (printing), {obj_path} (render/animation), and {glb_path} (glTF, for other tools).")

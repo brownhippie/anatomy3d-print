@@ -489,6 +489,35 @@ into the CLI/web/desktop apps. To experiment with it:
    conscious opt-in, not something that happens by accident in a
    commercial build.
 
+## Optional: TRELLIS.2 mode (external model, MIT-licensed)
+
+`trellis_source.py` / `pipeline.py`'s `run_trellis_pipeline` hand the photo
+to Microsoft's TRELLIS.2 instead of building the mesh with this project's
+own code — confirmed directly on real test photos to give noticeably better
+results on human subjects (one clean, connected, correctly-colored mesh) than
+the from-scratch pipeline. It's exposed in the webapp as the "TRELLIS.2"
+reconstruction method, single photo only.
+
+Unlike SMPL-X above, TRELLIS.2's own license (MIT) is commercially fine —
+but this integration calls Microsoft's free, public Hugging Face Space, not
+something this project hosts or controls, so it isn't a real commercial
+deployment path as-is (see `trellis_source.py`'s own docstring for what that
+would actually take: self-hosting the MIT-licensed weights, or a paid API
+with a real SLA). Treat it as a development/testing mode and an optional
+higher-quality choice for end users, not a production guarantee.
+
+Confirmed directly, not assumed: the SAME real test on an animal photo came
+back recognizable but fragmented into disconnected pieces, not a printable
+solid — `run_trellis_pipeline` refuses animal subjects for this reason
+(using the existing `animal_frac` signal) rather than silently shipping a
+known-broken result.
+
+1. `pip install -r requirements-trellis.txt`
+2. Set an `HF_TOKEN` environment variable to a free Hugging Face account's
+   own read-only access token (https://huggingface.co/settings/tokens) —
+   anonymous calls are heavily rate-limited (confirmed: exhausted within a
+   couple of calls).
+
 ## Project layout
 
 ```
@@ -501,6 +530,7 @@ src/anatomy3d/
   silhouette.py          multi-photo: background removal -> mask
   visual_hull.py           multi-photo: voxel carving -> mesh
   body_fit.py                optional: SMPL-X fitting (non-commercial license)
+  trellis_source.py            optional: TRELLIS.2 external reconstruction (MIT license)
   mesh_types.py        shared BodyMesh type
   mesh_export.py        OBJ export
   safety.py              generic MAD-style margin checks
@@ -513,4 +543,5 @@ Dockerfile           Railway/container build for the web app
 railway.toml         Railway build/deploy config
 .github/workflows/   CI: builds the Windows .exe on tag push
 requirements-smplx.txt  optional extras for the SMPL-X research mode
+requirements-trellis.txt  optional extras for the TRELLIS.2 external mode
 ```

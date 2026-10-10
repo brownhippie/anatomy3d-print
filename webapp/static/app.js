@@ -6,6 +6,8 @@ const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("file-input");
 const fileList = document.getElementById("file-list");
 const heightInput = document.getElementById("height-mm");
+const methodSelect = document.getElementById("method-select");
+const useDepthRow = document.getElementById("use-depth-row");
 const useDepthCheckbox = document.getElementById("use-depth");
 const generateBtn = document.getElementById("generate-btn");
 const resetBtn = document.getElementById("reset-btn");
@@ -23,6 +25,11 @@ let selectedFiles = [];
 function updateModeBanner() {
   if (selectedFiles.length === 0) {
     modeBanner.textContent = "Add a photo to begin.";
+  } else if (methodSelect.value === "trellis") {
+    modeBanner.textContent =
+      selectedFiles.length === 1
+        ? "TRELLIS.2 mode: sent to an external MIT-licensed model, confirmed good quality on human photos — animal photos are refused server-side (confirmed unreliable)."
+        : "TRELLIS.2 takes exactly one photo — remove the extra ones, or switch back to the built-from-scratch method for multi-photo mode.";
   } else if (selectedFiles.length === 1) {
     modeBanner.textContent =
       "Single-photo mode: a stylized geometric guess, with real face detail (nose/chin/eyes) when a face is detected.";
@@ -30,6 +37,12 @@ function updateModeBanner() {
     modeBanner.textContent = `Multi-photo mode (${selectedFiles.length} photos): visual-hull reconstruction from your photos' actual silhouettes — shoot them in turntable order, front first.`;
   }
 }
+
+function updateMethodUI() {
+  useDepthRow.style.display = methodSelect.value === "trellis" ? "none" : "";
+  updateModeBanner();
+}
+methodSelect.addEventListener("change", updateMethodUI);
 
 function renderFileList() {
   fileList.innerHTML = "";
@@ -239,12 +252,19 @@ async function generate() {
     setStatus("error", "Add at least one photo first.");
     return;
   }
+  const method = methodSelect.value;
+  if (method === "trellis" && selectedFiles.length !== 1) {
+    setStatus("error", "TRELLIS.2 takes exactly one photo — remove the extras or switch methods.");
+    return;
+  }
   clearStatus();
   messagesEl.innerHTML = "";
   generateBtn.disabled = true;
   loadingOverlay.classList.add("show");
   loadingMsg.textContent =
-    selectedFiles.length === 1
+    method === "trellis"
+      ? "Sending to TRELLIS.2 (external model, this can take a minute)…"
+      : selectedFiles.length === 1
       ? "Detecting pose and face, building the figure…"
       : "Extracting silhouettes and carving the visual hull…";
   downloadBar.innerHTML = "";
@@ -254,6 +274,7 @@ async function generate() {
   selectedFiles.forEach((f) => form.append("images", f));
   form.append("height_mm", heightInput.value || "150");
   form.append("use_depth", useDepthCheckbox.checked ? "true" : "false");
+  form.append("method", method);
 
   try {
     const res = await fetch("/api/generate", { method: "POST", body: form });

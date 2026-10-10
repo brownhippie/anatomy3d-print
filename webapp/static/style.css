@@ -70,7 +70,17 @@ main {
 }
 
 @media (max-width: 860px) {
-  main { grid-template-columns: 1fr; }
+  /* Stacked layout: settings on top, viewer below. Without an explicit row
+     split, the settings panel's natural content height (dropzone, file
+     chips, two fields, a select, a checkbox, buttons, status, messages) can
+     exceed a typical phone's viewport height, which would push the 3D
+     viewer below the fold -- not verified against a real device in this
+     session (no browser tool available here), but a real risk given the
+     panel's actual content. Capping the panel and giving the stage a floor
+     keeps both usable without scrolling past the model; worth confirming
+     on a real phone and adjusting the 48vh/320px numbers if needed. */
+  main { grid-template-columns: 1fr; grid-template-rows: auto minmax(320px, 1fr); }
+  .panel { max-height: 48vh; }
 }
 
 .panel {
@@ -168,10 +178,31 @@ main {
   color: var(--text);
   border-radius: 8px;
   padding: 9px 10px;
-  font-size: 14px;
+  /* 16px, not 14px: iOS Safari auto-zooms the page on focus for any
+     input/select with a smaller computed font-size -- confirmed behavior,
+     not a guess, and worth avoiding since it's jarring on a phone. */
+  font-size: 16px;
 }
 
 .field input[type="number"]:focus { outline: none; border-color: var(--accent); }
+
+.field select {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 16px;
+  min-height: 44px; /* Apple's own 44pt minimum comfortable tap target */
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%), linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+  background-position: calc(100% - 18px) center, calc(100% - 13px) center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.field select:focus { outline: none; border-color: var(--accent); }
 
 .checkbox-row {
   display: flex;
@@ -350,6 +381,16 @@ button.secondary:hover { border-color: var(--accent); }
   right: 16px;
   display: flex;
   gap: 8px;
+}
+
+@media (max-width: 480px) {
+  /* Side-by-side (stats bottom-left, downloads bottom-right) risks the two
+     colliding in the middle on a narrow phone, since the download bar alone
+     can hold 3 links. Stack them instead: stats above, downloads at the
+     very bottom, both full-width and centered. */
+  .stats-bar, .download-bar { left: 10px; right: 10px; justify-content: center; flex-wrap: wrap; }
+  .stats-bar { bottom: 62px; }
+  .download-bar { bottom: 10px; }
 }
 .download-bar a {
   background: var(--accent);

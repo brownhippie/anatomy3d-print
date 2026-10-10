@@ -39,7 +39,14 @@
           <label for="height-mm">Target height (mm)</label>
           <input type="number" id="height-mm" value="150" min="20" max="1000" />
         </div>
-        <div class="checkbox-row">
+        <div class="field">
+          <label for="method-select">Reconstruction method</label>
+          <select id="method-select">
+            <option value="capsule" selected>Built from scratch (this project's own pipeline)</option>
+            <option value="trellis">TRELLIS.2 (external, MIT-licensed — single human photo only; confirmed unreliable on animals, see below)</option>
+          </select>
+        </div>
+        <div class="checkbox-row" id="use-depth-row">
           <input type="checkbox" id="use-depth" />
           <label for="use-depth" style="margin:0">Use real depth estimation (single photo, needs the server's optional depth extras)</label>
         </div>

@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from anatomy3d.pipeline import run_pipeline
+from anatomy3d.pipeline import run_pipeline, run_trellis_pipeline
 from anatomy3d.person_segmenter import detect_person_alpha
 from anatomy3d.preprocess import load_image_rgb
 
@@ -94,7 +94,13 @@ async def api_generate(
     images: List[UploadFile] = File(...),
     height_mm: float = Form(150.0),
     use_depth: bool = Form(False),
+    method: str = Form("capsule"),
 ):
+    if method not in ("capsule", "trellis"):
+        raise HTTPException(400, f"Unknown method '{method}' -- use 'capsule' or 'trellis'.")
+    if method == "trellis" and len(images) != 1:
+        raise HTTPException(400, "The trellis method takes exactly one photo -- it has no multi-view mode.")
+
     _sweep_old_jobs()
 
     job_id = uuid.uuid4().hex
@@ -117,7 +123,10 @@ async def api_generate(
     captured = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured):
-            run_pipeline(image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth)
+            if method == "trellis":
+                run_trellis_pipeline(image_paths[0], str(out_stl), target_height_mm=height_mm)
+            else:
+                run_pipeline(image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth)
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         messages = [line for line in captured.getvalue().splitlines() if line.strip()]

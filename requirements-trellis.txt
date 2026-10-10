@@ -1,0 +1,7 @@
+# Optional extra for trellis_source.py / pipeline.py's run_trellis_pipeline
+# (the webapp's "trellis" method). NOT needed for the default pipeline --
+# see README.md. Calls Microsoft's TRELLIS.2 Hugging Face Space over the
+# network rather than running anything locally, so this has no torch/GPU
+# requirement of its own -- just the API client.
+-r requirements.txt
+gradio_client>=1.0
