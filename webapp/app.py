@@ -27,7 +27,8 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from starlette.concurrency import run_in_threadpool
 
-from anatomy3d.pipeline import run_pipeline, run_trellis_pipeline
+from anatomy3d.depth_source import depth_available
+from anatomy3d.pipeline import run_pipeline, run_silhouette_relief_pipeline, run_trellis_pipeline
 from anatomy3d.person_segmenter import detect_person_alpha
 from anatomy3d.preprocess import load_image_rgb
 from anatomy3d.trellis_source import get_quota_status, token_configured, token_preview
@@ -150,10 +151,17 @@ async def api_generate(
     method: str = Form("capsule"),
     description: str = Form(""),
 ):
-    if method not in ("capsule", "trellis"):
-        raise HTTPException(400, f"Unknown method '{method}' -- use 'capsule' or 'trellis'.")
-    if method == "trellis" and len(images) != 1:
-        raise HTTPException(400, "The trellis method takes exactly one photo -- it has no multi-view mode.")
+    if method not in ("capsule", "trellis", "silhouette_relief"):
+        raise HTTPException(400, f"Unknown method '{method}' -- use 'capsule', 'trellis', or 'silhouette_relief'.")
+    if method in ("trellis", "silhouette_relief") and len(images) != 1:
+        raise HTTPException(400, f"The {method} method takes exactly one photo -- it has no multi-view mode.")
+    if use_depth and not depth_available():
+        raise HTTPException(
+            400,
+            "Real depth estimation needs this server's optional depth extras "
+            "(pip install -r requirements-depth.txt), which aren't installed here -- "
+            "uncheck 'use real depth estimation' or ask the server operator to add them.",
+        )
 
     # Not yet consumed by either reconstruction method -- confirmed
     # directly, not assumed: TRELLIS.2's own Space API has no text
@@ -213,6 +221,15 @@ async def api_generate(
                     run_pipeline, image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth
                 )
                 return "capsule (fallback)", [fallback_note] + messages
+        elif method == "silhouette_relief":
+            messages = _run_pipeline_capturing(
+                run_silhouette_relief_pipeline,
+                image_paths[0],
+                str(out_stl),
+                target_height_mm=height_mm,
+                use_depth=use_depth,
+            )
+            return method, messages
         else:
             messages = _run_pipeline_capturing(
                 run_pipeline, image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth

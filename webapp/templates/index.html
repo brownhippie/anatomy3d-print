@@ -48,7 +48,8 @@
         <div class="field">
           <label for="method-select">Reconstruction method</label>
           <select id="method-select">
-            <option value="capsule" selected>Built from scratch (this project's own pipeline)</option>
+            <option value="capsule" selected>Capsule body (pose-fitted primitives, any number of photos)</option>
+            <option value="silhouette_relief">Silhouette relief (single photo — follows the photo's own outline directly)</option>
             <option value="trellis">TRELLIS.2 (external, MIT-licensed — single human photo only; confirmed unreliable on animals, see below)</option>
           </select>
           <div class="trellis-status" id="trellis-status" style="display:none"></div>

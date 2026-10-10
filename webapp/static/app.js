@@ -80,6 +80,11 @@ function updateModeBanner() {
       selectedFiles.length === 1
         ? "TRELLIS.2 mode: sent to an external MIT-licensed model, confirmed good quality on human photos — animal photos are refused server-side (confirmed unreliable)."
         : "TRELLIS.2 takes exactly one photo — remove the extra ones, or switch back to the built-from-scratch method for multi-photo mode.";
+  } else if (methodSelect.value === "silhouette_relief") {
+    modeBanner.textContent =
+      selectedFiles.length === 1
+        ? "Silhouette relief mode: the mesh's outline follows the photo's own 2D cutout directly, extruded into 3D — no anatomical guess beyond what the cutout itself shows."
+        : "Silhouette relief takes exactly one photo — remove the extra ones, or switch back to the capsule method for multi-photo mode.";
   } else if (selectedFiles.length === 1) {
     modeBanner.textContent =
       "Single-photo mode: a stylized geometric guess, with real face detail (nose/chin/eyes) when a face is detected.";
@@ -309,8 +314,8 @@ async function generate() {
     return;
   }
   const method = methodSelect.value;
-  if (method === "trellis" && selectedFiles.length !== 1) {
-    setStatus("error", "TRELLIS.2 takes exactly one photo — remove the extras or switch methods.");
+  if ((method === "trellis" || method === "silhouette_relief") && selectedFiles.length !== 1) {
+    setStatus("error", `${method === "trellis" ? "TRELLIS.2" : "Silhouette relief"} takes exactly one photo — remove the extras or switch methods.`);
     return;
   }
   clearStatus();
@@ -320,6 +325,8 @@ async function generate() {
   loadingMsg.textContent =
     method === "trellis"
       ? "Sending to TRELLIS.2 (external model, this can take a minute)…"
+      : method === "silhouette_relief"
+      ? "Extracting the photo's own outline and extruding it into 3D…"
       : selectedFiles.length === 1
       ? "Detecting pose and face, building the figure…"
       : "Extracting silhouettes and carving the visual hull…";
