@@ -313,6 +313,7 @@ def build_silhouette_relief_mesh(
     depth_rgb: Optional[np.ndarray] = None,
     depth_strength: float = 0.5,
     animal_frac: float = 0.0,
+    _depth_local_norm_sigma_frac: Optional[float] = None,
 ) -> BodyMesh:
     """`alpha`: a float [0,1] or boolean (H, W) mask -- the same soft
     cutout alpha detect_person_alpha produces (and the webapp's
@@ -483,7 +484,21 @@ def build_silhouette_relief_mesh(
         subj_vals = sampled[real_grid_mask]
         std = subj_vals.std() if subj_vals.size else 0.0
         if std > 1e-9:
-            d_norm = (sampled - subj_vals.mean()) / std
+            if _depth_local_norm_sigma_frac is not None:
+                # EXPERIMENTAL, not wired into any pipeline/caller --
+                # normalizes each pixel against a Gaussian-weighted LOCAL
+                # neighborhood (restricted to real_grid_mask) instead of
+                # the whole subject's one global mean/std.
+                m = real_grid_mask.astype(np.float32)
+                sigma = gh * _depth_local_norm_sigma_frac
+                w_sum = gaussian_filter(m, sigma, mode="constant")
+                w_sum_safe = np.where(w_sum > 1e-6, w_sum, 1.0)
+                local_mean = gaussian_filter(sampled * m, sigma, mode="constant") / w_sum_safe
+                local_mean_sq = gaussian_filter((sampled**2) * m, sigma, mode="constant") / w_sum_safe
+                local_std = np.sqrt(np.maximum(local_mean_sq - local_mean**2, 1e-6))
+                d_norm = (sampled - local_mean) / local_std
+            else:
+                d_norm = (sampled - subj_vals.mean()) / std
             if animal_frac > _LAYER_RESCUE_MIN_ANIMAL_FRAC:
                 d_norm = d_norm + _layered_detail_rescue(sampled, grid_mask, real_grid_mask, std)
             # Front-only bias, proportional to each column's own
