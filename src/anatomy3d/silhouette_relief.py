@@ -20,7 +20,7 @@ from typing import Optional
 import numpy as np
 import trimesh
 from PIL import Image
-from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinates
 from skimage.measure import marching_cubes
 
 from .mesh_types import BodyMesh
@@ -182,6 +182,129 @@ def _detect_crop_and_extend(mask: np.ndarray, animal_frac: float = 0.0) -> np.nd
     return np.concatenate([mask, extension], axis=0)
 
 
+_LAYER_RESCUE_MIN_ANIMAL_FRAC = _CROP_MAX_ANIMAL_FRAC  # reuse the same "confidently an
+# animal subject" boundary already established above, rather than inventing a second one
+_LAYER_RESCUE_N_LAYERS = 4
+_LAYER_RESCUE_SMOOTH_SIGMA_PX = 2.0  # suppresses single-pixel depth-model noise before clustering
+_LAYER_RESCUE_STRENGTH = 0.5
+_LAYER_RESCUE_MAX_BOOST = 4.0
+
+
+def _kmeans_1d(vals: np.ndarray, k: int, iters: int = 25):
+    """Plain 1D Lloyd's-algorithm k-means (no sklearn dependency for
+    one small clustering step). Returns (centroids sorted far->near,
+    per-value cluster index into that sorted order)."""
+    centroids = np.quantile(vals, np.linspace(0.1, 0.9, k))
+    assign = np.zeros(vals.shape[0], dtype=int)
+    for it in range(iters):
+        d = np.abs(vals[:, None] - centroids[None, :])
+        new_assign = d.argmin(axis=1)
+        if it > 0 and np.array_equal(new_assign, assign):
+            assign = new_assign
+            break
+        assign = new_assign
+        centroids = np.array([
+            vals[assign == i].mean() if np.any(assign == i) else centroids[i]
+            for i in range(k)
+        ])
+    order = np.argsort(centroids)
+    rank = np.empty_like(order)
+    rank[order] = np.arange(k)
+    return centroids, rank[assign]
+
+
+def _layered_detail_rescue(sampled, grid_mask, real_grid_mask, global_std):
+    """An ANIMAL-ONLY addition to the plain global z-score depth bias
+    (see build_silhouette_relief_mesh's depth_rgb branch), gated behind
+    animal_frac. Confirmed directly, not assumed, why it's gated this
+    way and not applied universally:
+
+    A subject like a dog has real, physically-distinct depth layers
+    (ear, head/snout, body, legs) -- but a single whole-subject z-score
+    compresses the SMALL internal relief within any one of those layers
+    (e.g. the snout's own shape) into a tiny sliver of the range the
+    big ear-vs-legs difference dominates. Clustering the subject's own
+    depth values into discrete layers (k-means) and rescuing each
+    layer's own internal detail -- but ONLY where that layer's own std
+    is demonstrably smaller than the subject's global std, i.e. where
+    the global term is provably under-representing it -- recovers real
+    structure there (confirmed: the dog's head/ear region went from an
+    almost-flat crease to a genuinely contoured shape).
+
+    Tried applying the exact same thing to a human portrait and it was
+    a clear regression (confirmed directly, not assumed): a human face
+    is much closer to one continuous surface, so per-layer clustering
+    mostly carves up smooth lighting/skin gradients into arbitrary
+    bands and "rescues" what is actually noise, not real geometry --
+    turned a clean, recognizable face into a noisy, mask-like one even
+    after several rounds of tuning (smoothing first, flooring the
+    per-layer normalization, capping the boost). None of those fixed
+    it, which is itself the evidence that it's the wrong tool for a
+    human face rather than a tuning problem -- so this is gated to
+    animal_frac instead of searching further for one strength value
+    that works everywhere.
+
+    Returns an ADDITIVE term for d_norm (same units: fraction of
+    half_thickness), zero outside the real (non-synthetic-leg) subject
+    mask."""
+    smoothed = gaussian_filter(sampled, sigma=_LAYER_RESCUE_SMOOTH_SIGMA_PX)
+    subj_vals = smoothed[real_grid_mask]
+    if subj_vals.size < _LAYER_RESCUE_N_LAYERS * 4 or global_std <= 1e-9:
+        return np.zeros_like(sampled)
+
+    centroids, layer_of_subj = _kmeans_1d(subj_vals, _LAYER_RESCUE_N_LAYERS)
+    layer_map = np.abs(smoothed[..., None] - centroids[None, None, :]).argmin(axis=-1)
+    layer_centroid_map = centroids[layer_map]
+    detail = smoothed - layer_centroid_map
+
+    subj_layer_map = np.full(smoothed.shape, -1)
+    subj_layer_map[np.nonzero(real_grid_mask)] = layer_of_subj
+
+    rescue = np.zeros_like(smoothed)
+    for i in range(_LAYER_RESCUE_N_LAYERS):
+        layer_mask_full = (layer_map == i) & real_grid_mask
+        layer_vals = detail[(subj_layer_map == i) & real_grid_mask]
+        layer_std = layer_vals.std() if layer_vals.size > 1 else 0.0
+        if layer_std <= 1e-9:
+            continue
+        # a layer whose own std already matches/exceeds the global std needs no rescue --
+        # the global z-score term already represents it; boost=1 leaves it untouched below
+        boost = np.clip(global_std / layer_std, 1.0, _LAYER_RESCUE_MAX_BOOST)
+        # Clipped to +/-3 "layer-detail sigma" -- confirmed directly as a necessary,
+        # not cosmetic, fix: a single noisy outlier pixel divided by a small layer_std
+        # can produce a huge ratio, and that single spike was enough to blow out z_max
+        # (see below) even after heavily smoothing the field, since a blur softens a
+        # spike's edges but barely lowers its peak.
+        layer_detail_norm = np.clip(detail / layer_std, -3.0, 3.0)
+        rescue = np.where(
+            layer_mask_full,
+            layer_detail_norm * (boost - 1.0) / max(_LAYER_RESCUE_MAX_BOOST - 1.0, 1e-6),
+            rescue,
+        )
+    # The per-layer assignment is a hard nearest-centroid pick, so `rescue` has a sharp
+    # step everywhere two layers meet. Smoothing it here turns that sharp terracing into
+    # continuous relief, which is also more anatomically honest -- a real head doesn't
+    # have literal shelf-like steps.
+    #
+    # NOTE on mesh size, confirmed directly rather than assumed: this grid_size (360) and
+    # a real high-resolution photo already produce a large raw marching_cubes mesh
+    # (300k+ vertices) even with NO depth bias and NO rescue at all -- that's pre-existing,
+    # not caused by this function. What IS caused by this function: on at least one real
+    # test photo, export_stl's quadric decimation to the target face count, which
+    # succeeds and stays watertight on the plain/no-rescue mesh at a near-identical raw
+    # vertex count, started failing to stay watertight once this rescue term was added --
+    # despite trying heavier smoothing (confirmed up to sigma=20px, ~10x this default,
+    # with no improvement) and clipping outlier spikes (the fix above, confirmed
+    # necessary but not sufficient on its own). The likely cause is some specific local
+    # curvature/degenerate-triangle pattern this term introduces that trips up
+    # decimation, not raw size or smoothness -- not yet root-caused further than that.
+    # export_stl's own fallback (see print_prep.simplify_for_output) already handles this
+    # safely: if decimation isn't watertight, it ships the larger un-decimated mesh
+    # instead, so this is a real file-size cost on such photos, not a correctness bug.
+    rescue = gaussian_filter(rescue, sigma=_LAYER_RESCUE_SMOOTH_SIGMA_PX * 2.0)
+    return rescue * _LAYER_RESCUE_STRENGTH
+
+
 def build_silhouette_relief_mesh(
     alpha: np.ndarray,
     target_height_mm: float = 150.0,
@@ -247,14 +370,32 @@ def build_silhouette_relief_mesh(
     sockets, mouth, cheek volume all visible in a shaded render of the
     front surface alone). The SAME labrador photo that originally
     motivated this parameter -- a head turned toward the camera -- did
-    NOT: its front surface shows only a faint crease line roughly where
-    the mouth/ear shading falls, not an actual protruding snout volume.
-    Depth Anything V2 Small evidently resolves human facial depth far
-    better than this animal subject's head structure (plausibly a
-    training-data bias toward human subjects, not verified further).
-    So: trust this for human portraits: it is doing real work there.
-    For a turned animal head specifically, treat it as only a marginal
-    improvement over the plain symmetric silhouette, not a real fix.
+    NOT, at first: its front surface showed only a faint crease line
+    roughly where the mouth/ear shading falls, not an actual protruding
+    snout volume. Root-caused, not just retried: the depth map DOES
+    correctly know the dog's head is the closest part overall, but
+    normalizing against the whole subject's std compressed the much
+    smaller internal relief WITHIN the head (snout vs. eye socket vs.
+    ear) into a sliver of a range the head-vs-legs difference dominates.
+
+    When animal_frac says this is confidently an animal subject (see
+    _layered_detail_rescue), an additional per-layer rescue term kicks
+    in: the subject's own depth values are clustered into discrete
+    layers (ear, head, body, legs), and each layer's own internal
+    detail is rescued relative to its own scale, not swamped by the
+    others -- confirmed to turn the labrador's flat crease into a
+    genuinely contoured head/ear shape. This is deliberately NOT
+    applied to human subjects: tried it there directly and it was a
+    clear regression (a clean, recognizable face became noisy and
+    mask-like, even after several rounds of tuning) -- a human face is
+    closer to one continuous surface, so per-layer clustering mostly
+    carves up smooth lighting/skin gradients into arbitrary bands and
+    amplifies noise, not real geometry. So: trust the plain depth bias
+    for human portraits (it already does real work there); trust the
+    animal_frac-gated layered rescue for animal subjects with real
+    physically-distinct parts; for either, this is depth-model-derived
+    detail layered onto the silhouette's own shape, not a substitute
+    for a dedicated landmark/geometry detector.
 
     No pose, no color, no texture -- purely the cutout's own shape swept
     into a rounded volume. Render/texture it yourself from here."""
@@ -343,6 +484,8 @@ def build_silhouette_relief_mesh(
         std = subj_vals.std() if subj_vals.size else 0.0
         if std > 1e-9:
             d_norm = (sampled - subj_vals.mean()) / std
+            if animal_frac > _LAYER_RESCUE_MIN_ANIMAL_FRAC:
+                d_norm = d_norm + _layered_detail_rescue(sampled, grid_mask, real_grid_mask, std)
             # Front-only bias, proportional to each column's own
             # thickness (tapers to ~0 at the mask edge, same as
             # _sculpt_front_surface_from_depth's displacement does) --
