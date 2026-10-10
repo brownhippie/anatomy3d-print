@@ -241,6 +241,21 @@ def build_silhouette_relief_mesh(
     original pure-silhouette behavior (depth bias is additive on top of
     it, not a replacement).
 
+    Verified directly, not assumed, on two real photos before this was
+    trusted to feed a full 3D build: a human portrait's front surface
+    came back with genuinely recognizable bulged structure (nose, eye
+    sockets, mouth, cheek volume all visible in a shaded render of the
+    front surface alone). The SAME labrador photo that originally
+    motivated this parameter -- a head turned toward the camera -- did
+    NOT: its front surface shows only a faint crease line roughly where
+    the mouth/ear shading falls, not an actual protruding snout volume.
+    Depth Anything V2 Small evidently resolves human facial depth far
+    better than this animal subject's head structure (plausibly a
+    training-data bias toward human subjects, not verified further).
+    So: trust this for human portraits: it is doing real work there.
+    For a turned animal head specifically, treat it as only a marginal
+    improvement over the plain symmetric silhouette, not a real fix.
+
     No pose, no color, no texture -- purely the cutout's own shape swept
     into a rounded volume. Render/texture it yourself from here."""
     mask = alpha > 0.5
