@@ -19,8 +19,58 @@ const loadingOverlay = document.getElementById("loading-overlay");
 const loadingMsg = document.getElementById("loading-msg");
 const statsBar = document.getElementById("stats-bar");
 const downloadBar = document.getElementById("download-bar");
+const trellisStatusEl = document.getElementById("trellis-status");
+const descriptionField = document.getElementById("description-field");
+const descriptionInput = document.getElementById("description-input");
+const descriptionHint = document.getElementById("description-hint");
 
 let selectedFiles = [];
+let trellisStatusLoaded = false;
+
+// Neither reconstruction method actually consumes this text as a model
+// input right now -- confirmed directly, not assumed: TRELLIS.2's own
+// Space API (inspected via gradio_client.Client(...).view_api()) exposes
+// no text parameter at all on its image_to_3d endpoint, and this
+// project's own capsule/silhouette pipelines are purely vision-based, no
+// text-conditioning hook exists anywhere in them either. So: captured and
+// stored with the job for your own reference and for future use, but
+// honestly not yet steering the render -- said plainly here instead of
+// implying it does something it doesn't.
+descriptionHint.textContent =
+  "Not used by the 3D model yet (no text input exists on either reconstruction path right now) -- saved with your job for reference.";
+
+function updateDescriptionVisibility() {
+  descriptionField.style.display = selectedFiles.length > 0 ? "" : "none";
+}
+
+async function loadTrellisStatus() {
+  trellisStatusEl.style.display = "block";
+  trellisStatusEl.textContent = "Checking TRELLIS.2 availability…";
+  try {
+    const res = await fetch("/api/trellis-status");
+    const data = await res.json();
+    const parts = [];
+    if (!data.token_configured) {
+      parts.push(`<span class="quota-warn">No server token configured — likely to hit rate limits fast.</span>`);
+    } else {
+      parts.push(`Server token: <b>${data.token_preview}</b>`);
+      if (data.quota.available) {
+        const mins = (data.quota.remaining_seconds / 60).toFixed(1);
+        const cls = data.quota.remaining_seconds > 60 ? "quota-ok" : "quota-warn";
+        parts.push(`<span class="${cls}">${mins} min ZeroGPU quota left</span>`);
+      } else {
+        parts.push(`real quota unknown (token lacks billing-read permission)`);
+      }
+    }
+    parts.push(
+      `this session: ${data.stats.attempts} tried, ${data.stats.successes} succeeded, ${data.stats.fallbacks} fell back`
+    );
+    trellisStatusEl.innerHTML = parts.join(" · ");
+    trellisStatusLoaded = true;
+  } catch (err) {
+    trellisStatusEl.textContent = "Couldn't check TRELLIS.2 status (network error).";
+  }
+}
 
 function updateModeBanner() {
   if (selectedFiles.length === 0) {
@@ -41,6 +91,11 @@ function updateModeBanner() {
 function updateMethodUI() {
   useDepthRow.style.display = methodSelect.value === "trellis" ? "none" : "";
   updateModeBanner();
+  if (methodSelect.value === "trellis") {
+    loadTrellisStatus();
+  } else {
+    trellisStatusEl.style.display = "none";
+  }
 }
 methodSelect.addEventListener("change", updateMethodUI);
 
@@ -69,6 +124,7 @@ function renderFileList() {
     fileList.appendChild(chip);
   });
   updateModeBanner();
+  updateDescriptionVisibility();
 }
 
 function addFiles(fileListObj) {
@@ -275,6 +331,7 @@ async function generate() {
   form.append("height_mm", heightInput.value || "150");
   form.append("use_depth", useDepthCheckbox.checked ? "true" : "false");
   form.append("method", method);
+  form.append("description", descriptionInput.value || "");
 
   try {
     const res = await fetch("/api/generate", { method: "POST", body: form });
@@ -284,10 +341,15 @@ async function generate() {
       renderMessages(data.messages);
       return;
     }
-    setStatus("ok", "Model generated.");
+    if (data.method_used === "capsule (fallback)") {
+      setStatus("ok", "Model generated — TRELLIS.2 was unavailable, so this used the built-in method instead.");
+    } else {
+      setStatus("ok", "Model generated.");
+    }
     renderMessages(data.messages);
     loadModel(data.obj_url);
     currentGlbUrl = data.glb_url;
+    if (method === "trellis") loadTrellisStatus();
 
     statsBar.style.display = "flex";
     statsBar.innerHTML = `
@@ -311,6 +373,7 @@ async function generate() {
 generateBtn.addEventListener("click", generate);
 resetBtn.addEventListener("click", () => {
   selectedFiles = [];
+  descriptionInput.value = "";
   renderFileList();
   clearStatus();
   messagesEl.innerHTML = "";

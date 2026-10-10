@@ -72,6 +72,55 @@ def trellis_available() -> bool:
     return True
 
 
+def token_configured() -> bool:
+    return bool(os.environ.get("HF_TOKEN"))
+
+
+def token_preview() -> Optional[str]:
+    """The configured HF_TOKEN's first/last few characters only -- enough
+    for a human to recognize which token is live without this ever
+    printing or serving the real secret anywhere."""
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        return None
+    if len(token) <= 10:
+        return "***"
+    return f"{token[:5]}...{token[-4:]}"
+
+
+def get_quota_status() -> dict:
+    """Best-effort real remaining ZeroGPU quota for the configured
+    HF_TOKEN, via huggingface_hub's own get_zero_gpu_quota. Confirmed
+    directly that this needs a token with the "Billing > Read billing
+    usage" permission specifically -- a plain Read-Only token (what this
+    project's own setup instructions ask for, since that's all generation
+    itself needs) gets a 403 here. Degrades honestly instead of failing:
+    returns available=False with the reason, so callers can still show
+    their OWN call-count tracking (see app.py) even when this can't be
+    queried."""
+    if not token_configured():
+        return {"available": False, "reason": "No HF_TOKEN configured."}
+    try:
+        from huggingface_hub import get_zero_gpu_quota
+
+        quota = get_zero_gpu_quota(token=os.environ["HF_TOKEN"])
+        return {
+            "available": True,
+            "remaining_seconds": quota.remaining,
+            "base_seconds": quota.base,
+            "resets_at": quota.resets_at.isoformat() if quota.resets_at else None,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": (
+                "Can't read real quota -- the configured token likely lacks the "
+                "'Billing > Read billing usage' permission (a plain Read-Only "
+                f"token, which is all generation itself needs, doesn't have it): {exc}"
+            ),
+        }
+
+
 def generate_mesh_via_trellis(
     image_path: str,
     resolution: str = "1024",

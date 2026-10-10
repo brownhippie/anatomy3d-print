@@ -186,6 +186,20 @@ main {
 
 .field input[type="number"]:focus { outline: none; border-color: var(--accent); }
 
+.field textarea {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 16px; /* same iOS zoom-on-focus reasoning as the number input above */
+  font-family: inherit;
+  resize: vertical;
+  min-height: 44px;
+}
+.field textarea:focus { outline: none; border-color: var(--accent); }
+
 .field select {
   width: 100%;
   background: var(--panel-2);
@@ -219,6 +233,15 @@ main {
   margin-top: 6px;
   line-height: 1.5;
 }
+
+.trellis-status {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.trellis-status .quota-ok { color: var(--ok); }
+.trellis-status .quota-warn { color: var(--warn); }
 
 .mode-banner {
   margin-top: 14px;
