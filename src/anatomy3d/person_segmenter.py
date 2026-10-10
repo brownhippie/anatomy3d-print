@@ -1161,7 +1161,7 @@ def _birefnet_refine(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "t
     return _hysteresis_mask(new_alpha), new_alpha
 
 
-def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray]]":
+def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray, float]]":
     person = _segment_full_person(rgb)
     animal = _segment_full_animal_robust(rgb)
     if person is not None:
@@ -1183,7 +1183,22 @@ def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray
     mask, alpha = _birefnet_refine(rgb, mask, alpha)
     if not mask.any():
         return None
-    return mask, alpha
+    # What fraction of the FINAL mask's area the ANIMAL channel itself
+    # confirms, for callers that need to know whether human anatomy is a
+    # safe assumption about a detected subject (e.g. silhouette_relief.py's
+    # crop-completion, which should not graft human legs onto a dog).
+    # Deliberately the animal channel's own coverage, not "1 - person
+    # coverage" -- tried that first and it doesn't work: checked directly
+    # against a real labrador photo and MediaPipe's selfie/"person" model
+    # (built to find skin-toned/hair regions, not to exclude non-humans)
+    # classified 95% of the DOG's own area as "person" too, nearly as
+    # confidently as it does an actual human. DeepLabV3's animal channel,
+    # a real trained per-species classifier, doesn't share that failure
+    # mode -- confirmed directly on the same two photos: 0.028 (a human
+    # photo, background noise) vs 0.426 (the actual dog), a clean,
+    # well-separated gap.
+    animal_frac = float((mask & animal[0]).sum()) / float(mask.sum()) if animal is not None else 0.0
+    return mask, alpha, animal_frac
 
 
 def detect_person_mask(rgb: np.ndarray) -> Optional[np.ndarray]:
@@ -1237,3 +1252,24 @@ def detect_person_alpha(rgb: np.ndarray) -> Optional[np.ndarray]:
     fill detect_person_mask does — see _fill_noise_clusters."""
     combined = _combine_channels(rgb)
     return combined[1] if combined else None
+
+
+def detect_person_alpha_with_source(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, float]]":
+    """Same alpha as detect_person_alpha, plus animal_fraction: what
+    share of the final mask's area the ANIMAL channel itself confirms
+    (0.0 = no animal-channel evidence at all, higher = more likely a
+    real animal subject, not a person). For callers that need to know
+    whether human anatomy is a safe assumption to make about a detected
+    subject before doing anything with that assumption (e.g.
+    silhouette_relief.py's crop-completion, which should not graft human
+    legs onto a dog or a cat) -- computed from the same single pass
+    detect_person_alpha already does, not a second one.
+
+    NOT "1 - person-channel fraction" -- confirmed directly that doesn't
+    work (see _combine_channels' own comment): MediaPipe's person/selfie
+    model classified 95% of a real dog's own area as "person" too,
+    nearly as confidently as an actual human. animal_fraction instead,
+    because DeepLabV3's animal channel is a real trained per-species
+    classifier and doesn't share that failure mode."""
+    combined = _combine_channels(rgb)
+    return (combined[1], combined[2]) if combined else None

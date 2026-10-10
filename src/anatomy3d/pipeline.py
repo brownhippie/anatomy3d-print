@@ -275,21 +275,23 @@ def run_silhouette_relief_pipeline(
     for any other fine surface detail."""
     os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
 
-    from .person_segmenter import detect_person_alpha
+    from .person_segmenter import detect_person_alpha_with_source
 
     rgb = load_image_rgb(image_path, max_dimension=None).rgb
-    alpha = detect_person_alpha(rgb)
-    if alpha is None:
+    detected = detect_person_alpha_with_source(rgb)
+    if detected is None:
         raise RuntimeError(
             "No person/animal detected in the image -- use a clear photo with "
             "the subject against a reasonably distinct background."
         )
+    alpha, animal_frac = detected
 
     body = build_silhouette_relief_mesh(
         alpha,
         target_height_mm=target_height_mm,
         depth_rgb=rgb if use_depth else None,
         depth_strength=depth_strength,
+        animal_frac=animal_frac,
     )
 
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
