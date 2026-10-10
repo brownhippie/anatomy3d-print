@@ -46,8 +46,8 @@ MIN_CAPSULES = 6
 # forearmcircumferenceflexed, thighcircumference, calfcircumference,
 # wristcircumference, anklecircumference) converts to an effective radius
 # via circumference / (2*pi), treating that cross-section as circular —
-# the same assumption DEPTH_RATIO_LIMB below already made ("limbs are
-# close to round"), now load-bearing instead of just asserted. Every
+# the same "limbs are close to round" assumption DEPTH_RATIO_LIMB_THIN/
+# THICK below make, now load-bearing instead of just asserted. Every
 # ratio is the population mean; std is noted for context, not used here
 # (a single mean figure, not a sampled distribution, same choice already
 # made for every other generic ratio in this file).
@@ -136,7 +136,28 @@ DEPTH_RATIO_HEAD = 1.2914  # headlength : headbreadth, std 0.059
 DEPTH_RATIO_CHEST = 0.8907  # chestdepth : chestbreadth, std 0.078
 DEPTH_RATIO_WAIST = 0.7212  # waistdepth : waistbreadth, std 0.056
 DEPTH_RATIO_HIPS = 0.6934  # buttockdepth : hipbreadth, std 0.055
-DEPTH_RATIO_LIMB = 0.92  # limbs are closer to round, but still slightly flattened — no ANSUR limb-depth column to check this against
+# Limbs aren't one uniform roundness either: a thigh is noticeably more
+# flattened front-to-back than a forearm or shin, the same "wider ->
+# relatively flatter" pattern the four torso ratios above already show
+# (DEPTH_RATIO_HEAD 1.29 down to DEPTH_RATIO_HIPS 0.69 as the trunk gets
+# wider). A single DEPTH_RATIO_LIMB applied to every limb segment misses
+# that exactly the way this project's silhouette_relief.py's single flat
+# depth_scale once did (fixed by blending per-pixel on that subject's own
+# measured width — see that module). There's no equivalent per-pixel
+# photo measurement available here (these radii come from fixed ANSUR
+# body-fraction constants, not a per-pixel silhouette), and ANSUR itself
+# has no separate depth column broken out by limb segment (checked: no
+# published anteroposterior/mediolateral ratio table for thigh vs
+# forearm vs shin turned up either) — so unlike that fix, this can't be
+# calibrated against a real measurement, only reasoned from the same
+# already-measured trend. DEPTH_RATIO_LIMB_THIN keeps the previous
+# single value (closest to round, for the thinnest limb ends — forearm/
+# shin); DEPTH_RATIO_LIMB_THICK reuses DEPTH_RATIO_HIPS, since the
+# thickest limb radius (the thigh, at the hip) is the same bulk as the
+# hip region it attaches to. _build_capsules' own _limb_dr blends between
+# them by each segment end's own radius — see its segs list below.
+DEPTH_RATIO_LIMB_THIN = 0.92
+DEPTH_RATIO_LIMB_THICK = DEPTH_RATIO_HIPS
 
 # Face feature sizing, as a fraction of that face's own measured
 # interocular distance (inner eye corner to inner eye corner) — the
@@ -487,25 +508,48 @@ def _build_capsules(
     waist_r = WAIST_RADIUS_FRAC_OF_SHOULDER_WIDTH * shoulder_width
     torso_r_bot = HIP_RADIUS_FRAC_OF_HIP_WIDTH * hip_width
 
+    upper_arm_r, upper_arm_r_taper = shoulder_width * UPPER_ARM_RADIUS_FRAC, shoulder_width * UPPER_ARM_RADIUS_FRAC * ARM_TAPER
+    forearm_r, forearm_r_taper = shoulder_width * FOREARM_RADIUS_FRAC, shoulder_width * FOREARM_RADIUS_FRAC * ARM_TAPER
+    thigh_r, thigh_r_taper = hip_width * THIGH_RADIUS_FRAC, hip_width * THIGH_RADIUS_FRAC * LEG_TAPER
+    shin_r, shin_r_taper = hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER
+    wrist_r = forearm_r_taper
+
+    # This subject's own actual limb radii (every value a limb segment end
+    # will use, tapered ends included) set the thin/thick range _limb_dr
+    # blends across — not a generic photo-independent range, so a subject
+    # with unusually thick or thin limbs relative to their own shoulder/hip
+    # width still gets the thinnest-of-their-own-limbs end mapped to
+    # DEPTH_RATIO_LIMB_THIN and the thickest to DEPTH_RATIO_LIMB_THICK.
+    _limb_radii = (upper_arm_r, upper_arm_r_taper, forearm_r, forearm_r_taper, thigh_r, thigh_r_taper, shin_r, shin_r_taper, wrist_r)
+    _r_min, _r_max = min(_limb_radii), max(_limb_radii)
+
+    def _limb_dr(r: float) -> float:
+        t = (r - _r_min) / max(_r_max - _r_min, 1e-9)
+        t = min(max(t, 0.0), 1.0)
+        return DEPTH_RATIO_LIMB_THIN * (1.0 - t) + DEPTH_RATIO_LIMB_THICK * t
+
     capsules = []
     # Chest and hips get their own depth ratio either side of the narrower
     # waist, instead of one linear-taper torso capsule — this is the
     # "section by section" proportion split the figure is built from. Each
     # torso segment's depth ratio is itself interpolated end-to-end (chest
     # ratio -> waist ratio -> hip ratio) so the flattening changes smoothly
-    # along the torso instead of jumping where the two segments meet.
+    # along the torso instead of jumping where the two segments meet. Limb
+    # segments get the same end-to-end interpolation now too, via _limb_dr
+    # on each end's own radius (see DEPTH_RATIO_LIMB_THIN/THICK above),
+    # instead of one flat ratio for every limb regardless of how thick it is.
     segs = [
         ("head_top", "neck", head_r, head_r * 0.6, DEPTH_RATIO_HEAD, DEPTH_RATIO_HEAD),
         ("neck", "waist", torso_r_top, waist_r, DEPTH_RATIO_CHEST, DEPTH_RATIO_WAIST),
         ("waist", "pelvis", waist_r, torso_r_bot, DEPTH_RATIO_WAIST, DEPTH_RATIO_HIPS),
-        ("left_shoulder_attach", "left_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC, shoulder_width * UPPER_ARM_RADIUS_FRAC * ARM_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("right_shoulder_attach", "right_elbow", shoulder_width * UPPER_ARM_RADIUS_FRAC, shoulder_width * UPPER_ARM_RADIUS_FRAC * ARM_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("left_elbow", "left_wrist", shoulder_width * FOREARM_RADIUS_FRAC, shoulder_width * FOREARM_RADIUS_FRAC * ARM_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("right_elbow", "right_wrist", shoulder_width * FOREARM_RADIUS_FRAC, shoulder_width * FOREARM_RADIUS_FRAC * ARM_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("left_hip_attach", "left_knee", hip_width * THIGH_RADIUS_FRAC, hip_width * THIGH_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("right_hip_attach", "right_knee", hip_width * THIGH_RADIUS_FRAC, hip_width * THIGH_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("left_knee", "left_ankle", hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
-        ("right_knee", "right_ankle", hip_width * SHIN_RADIUS_FRAC, hip_width * SHIN_RADIUS_FRAC * LEG_TAPER, DEPTH_RATIO_LIMB, DEPTH_RATIO_LIMB),
+        ("left_shoulder_attach", "left_elbow", upper_arm_r, upper_arm_r_taper, _limb_dr(upper_arm_r), _limb_dr(upper_arm_r_taper)),
+        ("right_shoulder_attach", "right_elbow", upper_arm_r, upper_arm_r_taper, _limb_dr(upper_arm_r), _limb_dr(upper_arm_r_taper)),
+        ("left_elbow", "left_wrist", forearm_r, forearm_r_taper, _limb_dr(forearm_r), _limb_dr(forearm_r_taper)),
+        ("right_elbow", "right_wrist", forearm_r, forearm_r_taper, _limb_dr(forearm_r), _limb_dr(forearm_r_taper)),
+        ("left_hip_attach", "left_knee", thigh_r, thigh_r_taper, _limb_dr(thigh_r), _limb_dr(thigh_r_taper)),
+        ("right_hip_attach", "right_knee", thigh_r, thigh_r_taper, _limb_dr(thigh_r), _limb_dr(thigh_r_taper)),
+        ("left_knee", "left_ankle", shin_r, shin_r_taper, _limb_dr(shin_r), _limb_dr(shin_r_taper)),
+        ("right_knee", "right_ankle", shin_r, shin_r_taper, _limb_dr(shin_r), _limb_dr(shin_r_taper)),
     ]
 
     # Hand capsules: a palm from wrist to the index/pinky midpoint, plus a
@@ -515,17 +559,16 @@ def _build_capsules(
     # requirement like legs above) when that hand's landmarks weren't
     # confidently detected, same fallback as every other optional joint
     # in this function.
-    wrist_r = shoulder_width * FOREARM_RADIUS_FRAC * ARM_TAPER
     for side in ("left", "right"):
         hand_mid_name = f"{side}_hand_mid"
         if hand_mid_name not in joints:
             continue
         palm_r = wrist_r * PALM_RADIUS_FRAC_OF_WRIST
-        segs.append((f"{side}_wrist", hand_mid_name, wrist_r, palm_r, DEPTH_RATIO_LIMB, PALM_DEPTH_RATIO))
+        segs.append((f"{side}_wrist", hand_mid_name, wrist_r, palm_r, _limb_dr(wrist_r), PALM_DEPTH_RATIO))
         thumb_name = f"{side}_thumb"
         if thumb_name in joints:
             thumb_r = palm_r * THUMB_RADIUS_FRAC_OF_PALM
-            segs.append((f"{side}_wrist", thumb_name, wrist_r * 0.6, thumb_r, DEPTH_RATIO_LIMB, THUMB_DEPTH_RATIO))
+            segs.append((f"{side}_wrist", thumb_name, wrist_r * 0.6, thumb_r, _limb_dr(wrist_r), THUMB_DEPTH_RATIO))
     use_silhouette = silhouette_mask is not None and image_width and image_height
     # Computed once per photo, not per segment/sample — distance_transform_edt
     # over the whole mask is cheap (milliseconds) next to the per-pixel cost
