@@ -6,7 +6,7 @@ import numpy as np
 from .face_features import detect_face_landmarks
 from .hair_features import detect_hair_mask
 from .landmarks import detect_pose_landmarks
-from .mesh_export import export_glb, export_obj, to_trimesh
+from .mesh_export import add_base_disk, export_glb, export_obj, to_trimesh
 from .preprocess import load_image_rgb
 from .print_prep import export_stl
 from .procedural_body import build_body_mesh
@@ -218,6 +218,7 @@ def run_pipeline(
 
         body = carve_visual_hull(views, target_height_mm=target_height_mm)
 
+    body = add_base_disk(body, target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
 
@@ -294,6 +295,7 @@ def run_silhouette_relief_pipeline(
         animal_frac=animal_frac,
     )
 
+    body = add_base_disk(body, target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
 
@@ -367,6 +369,7 @@ def run_trellis_pipeline(
     if height > 1e-6:
         body.vertices = body.vertices * (target_height_mm / height)
 
+    body = add_base_disk(body, target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
 

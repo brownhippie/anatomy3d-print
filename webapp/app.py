@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -24,6 +25,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from starlette.concurrency import run_in_threadpool
 
 from anatomy3d.pipeline import run_pipeline, run_trellis_pipeline
 from anatomy3d.person_segmenter import detect_person_alpha
@@ -44,6 +46,37 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # this process's own JOBS_DIR. Good enough for "is this getting used /
 # falling back a lot" visibility; not a billing-grade audit log.
 _trellis_stats = {"attempts": 0, "successes": 0, "fallbacks": 0}
+
+# Confirmed directly, not assumed, as the cause of the whole app going
+# unresponsive during a generate call -- not just that one request, but
+# totally unrelated ones too: Railway's own http logs showed plain GET
+# /health requests stuck for 15-20s whenever a generate call was in
+# flight. Cause: /api/generate and /fit were `async def` endpoints that
+# called the heavy, synchronous, CPU-bound run_pipeline/run_trellis_pipeline
+# directly -- that blocks FastAPI's single asyncio event loop for the
+# entire duration (tens of seconds to several minutes), during which NO
+# request of any kind can be served, generate or otherwise.
+# run_in_threadpool moves that blocking call to a worker thread so the
+# event loop stays free. A lock still serializes the actual pipeline work
+# itself (this is a small, CPU-constrained container -- two generate
+# calls fighting over the same cores wouldn't finish any faster run truly
+# in parallel) AND because contextlib.redirect_stdout reassigns the
+# process-wide sys.stdout, which two concurrent calls would corrupt for
+# each other if allowed to run at once.
+_generation_lock = threading.Lock()
+
+
+def _run_pipeline_capturing(fn, *args, **kwargs) -> "list[str]":
+    """Runs `fn` (a run_pipeline/run_trellis_pipeline call) with its
+    print() progress messages captured instead of going to the real
+    stdout, serialized against any other in-flight generation via
+    _generation_lock -- see that lock's own docstring for why. Meant to
+    be called via run_in_threadpool, never directly on the event loop."""
+    with _generation_lock:
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            fn(*args, **kwargs)
+        return [line for line in captured.getvalue().splitlines() if line.strip()]
 
 
 def _sweep_old_jobs() -> None:
@@ -154,33 +187,43 @@ async def api_generate(
     out_obj = job_dir / "model.obj"
     out_glb = job_dir / "model.glb"
 
-    used_method = method
-    captured = io.StringIO()
+    def _generate_sync() -> "tuple[str, list[str]]":
+        """Runs on a worker thread (see run_in_threadpool below) -- never
+        called directly from the event loop. Dispatches method/fallback
+        and returns (used_method, messages); _trellis_stats updates stay
+        under _run_pipeline_capturing's own lock, same as the pipeline
+        call itself, so concurrent requests can't race on the counters."""
+        if method == "trellis":
+            _trellis_stats["attempts"] += 1
+            try:
+                messages = _run_pipeline_capturing(
+                    run_trellis_pipeline, image_paths[0], str(out_stl), target_height_mm=height_mm
+                )
+                _trellis_stats["successes"] += 1
+                return method, messages
+            except Exception as trellis_exc:
+                # Fall back to this project's own always-available pipeline rather
+                # than just failing the request -- TRELLIS.2 depends on an external
+                # service with its own quota/uptime this project doesn't control
+                # (see trellis_source.py), so a visitor still gets a model instead
+                # of an error when it's unavailable. Weaker result, but a real one.
+                _trellis_stats["fallbacks"] += 1
+                fallback_note = f"TRELLIS.2 failed, falling back to the built-in method: {trellis_exc}"
+                messages = _run_pipeline_capturing(
+                    run_pipeline, image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth
+                )
+                return "capsule (fallback)", [fallback_note] + messages
+        else:
+            messages = _run_pipeline_capturing(
+                run_pipeline, image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth
+            )
+            return method, messages
+
     try:
-        with contextlib.redirect_stdout(captured):
-            if method == "trellis":
-                _trellis_stats["attempts"] += 1
-                try:
-                    run_trellis_pipeline(image_paths[0], str(out_stl), target_height_mm=height_mm)
-                    _trellis_stats["successes"] += 1
-                except Exception as trellis_exc:
-                    # Fall back to this project's own always-available pipeline rather
-                    # than just failing the request -- TRELLIS.2 depends on an external
-                    # service with its own quota/uptime this project doesn't control
-                    # (see trellis_source.py), so a visitor still gets a model instead
-                    # of an error when it's unavailable. Weaker result, but a real one.
-                    _trellis_stats["fallbacks"] += 1
-                    print(f"TRELLIS.2 failed, falling back to the built-in method: {trellis_exc}")
-                    run_pipeline(image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth)
-                    used_method = "capsule (fallback)"
-            else:
-                run_pipeline(image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth)
+        used_method, messages = await run_in_threadpool(_generate_sync)
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
-        messages = [line for line in captured.getvalue().splitlines() if line.strip()]
         raise HTTPException(400, str(exc)) from exc
-
-    messages = [line for line in captured.getvalue().splitlines() if line.strip()]
 
     mesh = trimesh.load(str(out_stl), process=True)
     height_actual = float(mesh.vertices[:, 1].max() - mesh.vertices[:, 1].min())
@@ -260,7 +303,9 @@ async def fit(
 
         out_stl = os.path.join(tmp, "figure.stl")
         try:
-            run_pipeline(image_paths, out_stl, target_height_mm=height_mm, use_depth=use_depth)
+            await run_in_threadpool(
+                _run_pipeline_capturing, run_pipeline, image_paths, out_stl, target_height_mm=height_mm, use_depth=use_depth
+            )
         except Exception as exc:
             raise HTTPException(400, str(exc)) from exc
 
