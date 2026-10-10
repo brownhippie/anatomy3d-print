@@ -23,9 +23,25 @@ const trellisStatusEl = document.getElementById("trellis-status");
 const descriptionField = document.getElementById("description-field");
 const descriptionInput = document.getElementById("description-input");
 const descriptionHint = document.getElementById("description-hint");
+const tabBtns = document.querySelectorAll(".tab-btn");
+const tabPanels = document.querySelectorAll(".tab-panel");
+const emptyResultHint = document.getElementById("empty-result-hint");
 
 let selectedFiles = [];
 let trellisStatusLoaded = false;
+
+function setActiveTab(name) {
+  tabBtns.forEach((btn) => {
+    const active = btn.dataset.tab === name;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  tabPanels.forEach((panel) => {
+    panel.classList.toggle("active", panel.id === `tab-${name}`);
+  });
+}
+
+tabBtns.forEach((btn) => btn.addEventListener("click", () => setActiveTab(btn.dataset.tab)));
 
 // Neither reconstruction method actually consumes this text as a model
 // input right now -- confirmed directly, not assumed: TRELLIS.2's own
@@ -161,6 +177,13 @@ dropzone.addEventListener("drop", (e) => {
 function setStatus(kind, text) {
   statusBox.className = `status-box show ${kind}`;
   statusBox.textContent = text;
+  emptyResultHint.style.display = "none";
+  // Any status (success or error) means there's something to look at —
+  // jump to the Result tab instead of leaving it set on a tab the user
+  // isn't looking at (the exact failure mode the old flat single-panel
+  // layout had: a generate error could land below the fold with no
+  // indication anything happened).
+  setActiveTab("result");
 }
 function clearStatus() {
   statusBox.className = "status-box";
@@ -384,6 +407,7 @@ resetBtn.addEventListener("click", () => {
   renderFileList();
   clearStatus();
   messagesEl.innerHTML = "";
+  emptyResultHint.style.display = "";
   statsBar.style.display = "none";
   downloadBar.innerHTML = "";
   if (currentModel) {
@@ -392,6 +416,7 @@ resetBtn.addEventListener("click", () => {
   }
   currentGlbUrl = null;
   emptyState.style.display = "flex";
+  setActiveTab("photos");
 });
 
 initViewer();

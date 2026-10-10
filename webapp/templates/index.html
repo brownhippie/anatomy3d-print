@@ -32,46 +32,59 @@
 
     <main>
       <section class="panel">
-        <h2>1. Photos</h2>
-        <div class="dropzone" id="dropzone">
-          <div class="icon">&#128247;</div>
-          <div class="main-text">Click or drop photos here</div>
-          <div class="sub-text">One photo for a quick guess, or several (turntable order, front first) for a carved reconstruction</div>
-        </div>
-        <input type="file" id="file-input" accept="image/*" multiple hidden />
-        <div class="file-list" id="file-list"></div>
-        <div class="mode-banner" id="mode-banner">Add a photo to begin.</div>
-
-        <div class="field" id="description-field" style="display:none">
-          <label for="description-input">Describe the photo (optional)</label>
-          <textarea id="description-input" rows="2" placeholder="e.g. standing, arms crossed, wearing a hat"></textarea>
-          <div class="hint" id="description-hint"></div>
+        <div class="tabbar" role="tablist">
+          <button class="tab-btn active" id="tab-btn-photos" role="tab" aria-selected="true" data-tab="photos">Photos</button>
+          <button class="tab-btn" id="tab-btn-settings" role="tab" aria-selected="false" data-tab="settings">Settings</button>
+          <button class="tab-btn" id="tab-btn-result" role="tab" aria-selected="false" data-tab="result">Result</button>
         </div>
 
-        <h2 style="margin-top:26px">2. Settings</h2>
-        <div class="field">
-          <label for="height-mm">Target height (mm)</label>
-          <input type="number" id="height-mm" value="150" min="20" max="1000" />
-        </div>
-        <div class="field">
-          <label for="method-select">Reconstruction method</label>
-          <select id="method-select">
-            <option value="capsule" selected>Capsule body (pose-fitted primitives, any number of photos)</option>
-            <option value="silhouette_relief">Silhouette relief (single photo — follows the photo's own outline directly)</option>
-            <option value="trellis">TRELLIS.2 (external, MIT-licensed — single human photo only; confirmed unreliable on animals, see below)</option>
-          </select>
-          <div class="trellis-status" id="trellis-status" style="display:none"></div>
-        </div>
-        <div class="checkbox-row" id="use-depth-row">
-          <input type="checkbox" id="use-depth" />
-          <label for="use-depth" style="margin:0">Use real depth estimation (single photo, needs the server's optional depth extras)</label>
+        <div class="tab-panel active" id="tab-photos" role="tabpanel">
+          <div class="dropzone" id="dropzone">
+            <div class="icon">&#128247;</div>
+            <div class="main-text">Click or drop photos here</div>
+            <div class="sub-text">One photo for a quick guess, or several (turntable order, front first) for a carved reconstruction</div>
+          </div>
+          <input type="file" id="file-input" accept="image/*" multiple hidden />
+          <div class="file-list" id="file-list"></div>
+          <div class="mode-banner" id="mode-banner">Add a photo to begin.</div>
+
+          <div class="field" id="description-field" style="display:none">
+            <label for="description-input">Describe the photo (optional)</label>
+            <textarea id="description-input" rows="2" placeholder="e.g. standing, arms crossed, wearing a hat"></textarea>
+            <div class="hint" id="description-hint"></div>
+          </div>
         </div>
 
-        <button class="primary" id="generate-btn">Generate model</button>
-        <button class="secondary" id="reset-btn">Start over</button>
+        <div class="tab-panel" id="tab-settings" role="tabpanel">
+          <div class="field">
+            <label for="height-mm">Target height (mm)</label>
+            <input type="number" id="height-mm" value="150" min="20" max="1000" />
+          </div>
+          <div class="field">
+            <label for="method-select">Reconstruction method</label>
+            <select id="method-select">
+              <option value="capsule" selected>Capsule body (pose-fitted primitives, any number of photos)</option>
+              <option value="silhouette_relief">Silhouette relief (single photo — follows the photo's own outline directly)</option>
+              <option value="trellis">TRELLIS.2 (external, MIT-licensed — single human photo only; confirmed unreliable on animals, see below)</option>
+            </select>
+            <div class="trellis-status" id="trellis-status" style="display:none"></div>
+          </div>
+          <div class="checkbox-row" id="use-depth-row">
+            <input type="checkbox" id="use-depth" />
+            <label for="use-depth" style="margin:0">Use real depth estimation (single photo, needs the server's optional depth extras)</label>
+          </div>
+        </div>
 
-        <div class="status-box" id="status-box"></div>
-        <div class="messages" id="messages"></div>
+        <div class="tab-panel" id="tab-result" role="tabpanel">
+          <div class="status-box" id="status-box"></div>
+          <div class="messages" id="messages"></div>
+          <div class="empty-result-hint" id="empty-result-hint">Nothing generated yet — switch to the Photos tab and hit Generate.</div>
+        </div>
+
+        <div class="panel-actions">
+          <button class="primary" id="generate-btn">Generate model</button>
+          <button class="secondary" id="reset-btn">Start over</button>
+        </div>
       </section>
 
       <section class="stage" id="stage">
@@ -87,8 +100,10 @@
           <button id="reset-view-btn">Reset view</button>
         </div>
 
-        <div class="stats-bar" id="stats-bar" style="display:none"></div>
-        <div class="download-bar" id="download-bar"></div>
+        <div class="stage-bottom-bar">
+          <div class="stats-bar" id="stats-bar" style="display:none"></div>
+          <div class="download-bar" id="download-bar"></div>
+        </div>
 
         <div class="loading-overlay" id="loading-overlay">
           <div class="spinner"></div>

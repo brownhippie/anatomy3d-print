@@ -91,24 +91,28 @@ main {
 }
 
 @media (max-width: 860px) {
-  /* Stacked layout: settings on top, viewer below. Without an explicit row
-     split, the settings panel's natural content height (dropzone, file
-     chips, two fields, a select, a checkbox, buttons, status, messages) can
-     exceed a typical phone's viewport height, which would push the 3D
-     viewer below the fold -- not verified against a real device in this
-     session (no browser tool available here), but a real risk given the
-     panel's actual content. Capping the panel and giving the stage a floor
-     keeps both usable without scrolling past the model; worth confirming
-     on a real phone and adjusting the 48vh/320px numbers if needed. */
-  main { grid-template-columns: 1fr; grid-template-rows: auto minmax(320px, 1fr); }
-  .panel { max-height: 48vh; }
+  /* Stacked layout: settings on top, viewer below. BUG FOUND AND FIXED,
+     confirmed directly against a real phone screenshot (not assumed):
+     the previous `auto minmax(320px, 1fr)` row sizing let the panel's
+     row grow to its full natural content height before `.panel`'s own
+     max-height ever got a chance to apply -- `max-height` on a grid
+     item cannot shrink an `auto`-sized track, a real CSS grid gotcha,
+     not a one-off bug. The actual screenshot showed the settings panel
+     (dropzone, fields, status, messages) consuming the ENTIRE viewport,
+     pushing the 3D viewer almost completely off-screen, exactly as that
+     mechanism predicts. Fix: bound the row itself (not just the child)
+     with minmax(0, ...), which forces the panel to scroll its own
+     overflow internally instead of growing the track. */
+  main { grid-template-columns: 1fr; grid-template-rows: minmax(0, 42vh) minmax(260px, 1fr); }
+  .panel { max-height: 100%; }
 }
 
 .panel {
-  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   border-right: 1px solid var(--border);
   background: var(--panel);
-  overflow-y: auto;
 }
 
 @media (max-width: 860px) {
@@ -122,6 +126,57 @@ main {
   color: var(--text-dim);
   margin: 0 0 14px;
 }
+
+/* Three tabs (Photos / Settings / Result) instead of one long stacked
+   scroll -- each tab's own content is short enough to fit a phone
+   screen on its own, which a single flat panel never was (confirmed
+   directly against a real phone screenshot: the old layout's settings
+   panel alone filled the entire viewport). Generate/Start over stay
+   outside the tabs, in their own fixed-height footer, since they're
+   actions, not configuration tied to one tab. */
+.tabbar {
+  flex: none;
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  padding: 13px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab-btn:hover { color: var(--text); }
+
+.tab-panel {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 22px;
+}
+.tab-panel.active { display: block; }
+
+.empty-result-hint {
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+  padding: 30px 10px;
+}
+
+.panel-actions {
+  flex: none;
+  padding: 14px 22px;
+  border-top: 1px solid var(--border);
+}
+.panel-actions button.primary { margin-top: 0; }
 
 .dropzone {
   border: 1.5px dashed var(--border);
@@ -403,10 +458,27 @@ button.secondary:hover { border-color: var(--accent); }
 }
 .viewer-toolbar button:hover { border-color: var(--accent); }
 
-.stats-bar {
+/* A single bottom-anchored flex column holding both bars, so the
+   download bar's own height (it can wrap to two rows on a narrow phone
+   with all 3 links) pushes the stats bar up naturally instead of the
+   two overlapping -- confirmed directly as a real collision against a
+   real mobile screenshot: two independently `position: absolute`
+   elements with a guessed fixed gap between them doesn't account for
+   that wrap actually happening. */
+.stage-bottom-bar {
   position: absolute;
   bottom: 16px;
   left: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: none;
+}
+.stage-bottom-bar > * { pointer-events: auto; }
+
+.stats-bar {
   display: flex;
   gap: 14px;
   background: rgba(22, 25, 34, 0.85);
@@ -420,21 +492,16 @@ button.secondary:hover { border-color: var(--accent); }
 .stats-bar b { color: var(--text); }
 
 .download-bar {
-  position: absolute;
-  bottom: 16px;
-  right: 16px;
   display: flex;
   gap: 8px;
 }
 
 @media (max-width: 480px) {
-  /* Side-by-side (stats bottom-left, downloads bottom-right) risks the two
-     colliding in the middle on a narrow phone, since the download bar alone
-     can hold 3 links. Stack them instead: stats above, downloads at the
-     very bottom, both full-width and centered. */
-  .stats-bar, .download-bar { left: 10px; right: 10px; justify-content: center; flex-wrap: wrap; }
-  .stats-bar { bottom: 62px; }
-  .download-bar { bottom: 10px; }
+  /* Full-width and centered on a narrow phone, both bars, stacked by
+     the flex column above (stats on top, downloads below) rather than
+     a guessed pixel gap. */
+  .stage-bottom-bar { left: 10px; right: 10px; align-items: center; }
+  .stats-bar, .download-bar { justify-content: center; flex-wrap: wrap; }
 }
 .download-bar a {
   background: var(--accent);
