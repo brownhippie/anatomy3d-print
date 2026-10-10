@@ -313,7 +313,7 @@ def build_silhouette_relief_mesh(
     depth_rgb: Optional[np.ndarray] = None,
     depth_strength: float = 0.5,
     animal_frac: float = 0.0,
-    _depth_local_norm_sigma_frac: Optional[float] = None,
+    limb_depth_scale: float = 0.9,
 ) -> BodyMesh:
     """`alpha`: a float [0,1] or boolean (H, W) mask -- the same soft
     cutout alpha detect_person_alpha produces (and the webapp's
@@ -342,12 +342,34 @@ def build_silhouette_relief_mesh(
     ordinary edge precision generally -- just not a fix for that
     specific failure mode.
 
-    `depth_scale`: real human/animal depth (front-to-back) runs
-    shallower than half of the local width a straight distance-transform
-    value would give (a torso's front-to-back depth is roughly half its
-    side-to-side width, not equal to it) -- a tuned, not measured,
-    flattening factor, same honesty this project already applies to its
-    own tuned constants elsewhere (procedural_body.py's blend_k_frac).
+    `depth_scale`/`limb_depth_scale`: real front-to-back depth isn't a
+    fixed fraction of local side-to-side width everywhere on a body --
+    a torso is flattened oval (depth noticeably less than width), but a
+    limb is closer to round (depth close to width). A single flat
+    multiplier can't represent both at once, and was confirmed directly
+    to get the ratio backwards: measuring a real exported mesh's own
+    depth/width at different heights (excluding the inter-leg gap and a
+    stray gesturing hand from the measurement, both of which silently
+    inflated "width" the first time this was checked) showed limbs
+    coming out FLATTER than the torso at one flat depth_scale=0.5
+    (thigh 0.49, torso 0.39-0.49), backwards from real anatomy where a
+    thigh should be rounder than a torso, not flatter.
+    `depth_scale` now applies where the local silhouette width (via the
+    same distance-transform that sets half_thickness) is at its widest
+    for this subject (torso-like), `limb_depth_scale` where it's at its
+    thinnest (limb-like), linearly blended by where each pixel's own
+    width falls on the subject's own width spectrum -- the same "max/min
+    give a spectrum" idea tried earlier for the depth-bias term (where
+    it was confirmed NOT to help, capped at sub-mm effects by this very
+    half_thickness ceiling) works here instead, because this changes the
+    actual depth budget per body part rather than nudging within a fixed
+    one. Confirmed directly: on a real photo, thigh depth/width went
+    0.49 -> 0.74 (limb_depth_scale=0.9) with the torso essentially
+    unchanged (0.39 -> 0.39) -- steeper tunings (limb_depth_scale up to
+    1.3 with a power-law remap of the width spectrum) were tried and
+    measured WORSE once the gap/hand measurement bug above was fixed, so
+    this linear version is the one kept, not a starting point to push
+    further.
 
     `depth_rgb`/`depth_strength`: optional real per-pixel depth (Depth
     Anything V2 Small, see depth_source.py -- same optional extra
@@ -429,7 +451,16 @@ def build_silhouette_relief_mesh(
 
     dist = distance_transform_edt(grid_mask).astype(np.float32)
     dist /= scale  # grid-pixels -> original-photo pixels
-    half_thickness_raw = dist * depth_scale
+    # Per-pixel depth_scale: limb_depth_scale where this subject's own
+    # silhouette is at its thinnest (limb-like), depth_scale where it's
+    # at its widest (torso-like) -- see this function's own docstring
+    # for why a single flat value gets limbs backwards.
+    dist_subject = dist[grid_mask]
+    dist_min = float(dist_subject.min()) if dist_subject.size else 0.0
+    dist_max = float(dist_subject.max()) if dist_subject.size else 0.0
+    width_frac = np.clip((dist - dist_min) / max(dist_max - dist_min, 1e-6), 0.0, 1.0)
+    depth_scale_field = limb_depth_scale * (1.0 - width_frac) + depth_scale * width_frac
+    half_thickness_raw = dist * depth_scale_field
     # A half-thickness that touches exactly 0 right at the mask edge is a
     # literal cusp (zero-measure point) -- mathematically degenerate, and
     # left small non-manifold gaps in marching_cubes' output (confirmed
@@ -484,21 +515,7 @@ def build_silhouette_relief_mesh(
         subj_vals = sampled[real_grid_mask]
         std = subj_vals.std() if subj_vals.size else 0.0
         if std > 1e-9:
-            if _depth_local_norm_sigma_frac is not None:
-                # EXPERIMENTAL, not wired into any pipeline/caller --
-                # normalizes each pixel against a Gaussian-weighted LOCAL
-                # neighborhood (restricted to real_grid_mask) instead of
-                # the whole subject's one global mean/std.
-                m = real_grid_mask.astype(np.float32)
-                sigma = gh * _depth_local_norm_sigma_frac
-                w_sum = gaussian_filter(m, sigma, mode="constant")
-                w_sum_safe = np.where(w_sum > 1e-6, w_sum, 1.0)
-                local_mean = gaussian_filter(sampled * m, sigma, mode="constant") / w_sum_safe
-                local_mean_sq = gaussian_filter((sampled**2) * m, sigma, mode="constant") / w_sum_safe
-                local_std = np.sqrt(np.maximum(local_mean_sq - local_mean**2, 1e-6))
-                d_norm = (sampled - local_mean) / local_std
-            else:
-                d_norm = (sampled - subj_vals.mean()) / std
+            d_norm = (sampled - subj_vals.mean()) / std
             if animal_frac > _LAYER_RESCUE_MIN_ANIMAL_FRAC:
                 d_norm = d_norm + _layered_detail_rescue(sampled, grid_mask, real_grid_mask, std)
             # Front-only bias, proportional to each column's own
