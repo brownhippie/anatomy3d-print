@@ -1092,7 +1092,20 @@ def _get_birefnet_session() -> "ort.InferenceSession":
     global _birefnet_session
     if _birefnet_session is None:
         model_path = _ensure_model(BIREFNET_MODEL_URL, BIREFNET_MODEL_CACHE_PATH)
-        _birefnet_session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        # ORT's default CPU memory arena pre-grows by doubling (next
+        # power of two) and doesn't shrink back down — confirmed directly
+        # as the actual cause of a production OOM crash, not a guess:
+        # profiling one inference call on this exact model measured a
+        # ~7.4GB RSS jump for a single 1024x1024 forward pass. Disabling
+        # the arena and the memory-pattern optimizer trades a bit of
+        # speed for ORT allocating (and freeing) only what each run
+        # actually needs.
+        options = ort.SessionOptions()
+        options.enable_cpu_mem_arena = False
+        options.enable_mem_pattern = False
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        _birefnet_session = ort.InferenceSession(model_path, sess_options=options, providers=["CPUExecutionProvider"])
     return _birefnet_session
 
 
@@ -1161,6 +1174,27 @@ def _birefnet_refine(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "t
     return _hysteresis_mask(new_alpha), new_alpha
 
 
+# Off by default -- confirmed directly, not assumed, as the cause of a
+# real production crash: profiling run_pipeline end-to-end on a small
+# (0.67MP) real photo measured a single _birefnet_alpha call jumping RSS
+# from 660MB to 8030MB (ONNXRuntime's CPU arena/mem-pattern settings
+# clawed back only ~1.3GB of that -- the model's own activations at its
+# fixed 1024x1024 input are the bulk of it, not arena overallocation),
+# against this app's actual 8GB Railway container limit -- an exact match
+# for the repeated clean-restart crashes real users were hitting on every
+# /fit and /api/generate request, not a theoretical risk. BiRefNet is
+# edge refinement on top of a mask _combine_channels already has a
+# working, far cheaper result without it (the person+animal MediaPipe
+# segmenters above) -- same "a failed bonus feature shouldn't fail the
+# run" principle this project already applies to face/hair/depth, just
+# applied before the call instead of around it, since an OOM kill from
+# the container is a SIGKILL, not a catchable Python exception, so a
+# try/except here would not have helped. Set ANATOMY3D_BIREFNET_REFINE=1
+# only on a deployment with real headroom above ~8GB free for this
+# process alone.
+_BIREFNET_REFINE_ENABLED = os.environ.get("ANATOMY3D_BIREFNET_REFINE", "") == "1"
+
+
 def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray, float]]":
     person = _segment_full_person(rgb)
     animal = _segment_full_animal_robust(rgb)
@@ -1180,9 +1214,10 @@ def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray
     mask, alpha = _drop_unvalidated_islands(mask, alpha)
     if not mask.any():
         return None
-    mask, alpha = _birefnet_refine(rgb, mask, alpha)
-    if not mask.any():
-        return None
+    if _BIREFNET_REFINE_ENABLED:
+        mask, alpha = _birefnet_refine(rgb, mask, alpha)
+        if not mask.any():
+            return None
     # What fraction of the FINAL mask's area the ANIMAL channel itself
     # confirms, for callers that need to know whether human anatomy is a
     # safe assumption about a detected subject (e.g. silhouette_relief.py's
