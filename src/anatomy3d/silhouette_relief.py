@@ -460,7 +460,42 @@ def build_silhouette_relief_mesh(
     dist_max = float(dist_subject.max()) if dist_subject.size else 0.0
     width_frac = np.clip((dist - dist_min) / max(dist_max - dist_min, 1e-6), 0.0, 1.0)
     depth_scale_field = limb_depth_scale * (1.0 - width_frac) + depth_scale * width_frac
-    half_thickness_raw = dist * depth_scale_field
+
+    # `dist` itself, scanned across a row, is a near-perfect tent: it rises
+    # ~linearly from 0 at the silhouette edge to a peak at that row's own
+    # widest point, then falls ~linearly back to 0 (the nearest background
+    # pixel for most interior points is just the nearest left/right edge).
+    # Using it directly as half_thickness's shape (as this used to) scales
+    # that straight-line ramp by a constant, which is still a straight
+    # line -- a sharp-edged diamond in cross-section, confirmed directly
+    # by slicing a real exported mesh at a fixed height, not assumed.
+    # Real anatomy doesn't meet its own outline at a sharp wedge; a round
+    # cross-section meets it tangent to the surface, curving smoothly.
+    #
+    # row_ridge below re-expresses each row's own tent as a fraction
+    # 0..1 of ITS OWN local peak (computed per contiguous run within that
+    # row, not the whole row, so e.g. two separate legs sharing a row
+    # each get their own ridge instead of one leg borrowing the other's),
+    # then reshapes that fraction through a quarter-ellipse
+    # (sqrt(1-(1-t)^2)): vertical tangent at t=0 (smooth into the edge,
+    # no wedge) flattening to horizontal at t=1 (a rounded crown, not a
+    # knife-ridge). At the ridge itself (t=1) this reduces to exactly the
+    # old dist*depth_scale_field value, so the peak amplitude -- and
+    # everything depth_scale/limb_depth_scale already control -- is
+    # unchanged; only the transition in between is curved instead of
+    # straight.
+    row_ridge = np.zeros_like(dist)
+    for y in range(dist.shape[0]):
+        row_mask = grid_mask[y]
+        if not row_mask.any():
+            continue
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], row_mask.astype(np.int8), [0]))))
+        for s, e in zip(edges[0::2], edges[1::2]):
+            row_ridge[y, s:e] = dist[y, s:e].max()
+    t = np.divide(dist, row_ridge, out=np.zeros_like(dist), where=row_ridge > 1e-6)
+    t = np.clip(t, 0.0, 1.0)
+    curve_t = np.sqrt(np.clip(1.0 - (1.0 - t) ** 2, 0.0, 1.0))
+    half_thickness_raw = row_ridge * curve_t * depth_scale_field
     # A half-thickness that touches exactly 0 right at the mask edge is a
     # literal cusp (zero-measure point) -- mathematically degenerate, and
     # left small non-manifold gaps in marching_cubes' output (confirmed
