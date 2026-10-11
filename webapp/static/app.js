@@ -325,11 +325,51 @@ function initViewer() {
   animate();
 }
 
+// A plain min/max bounding box (the previous implementation here) frames
+// the camera around EVERY vertex, including a single stray one -- a bad
+// detection, a mis-synthesized leg/hair extension, anything far from the
+// real figure -- which balloons the box and leaves the actual model tiny
+// and pushed off to one side of an otherwise near-empty viewer. Reported
+// directly (a real screenshot: the model sitting small in a corner, most
+// of the viewer dark and empty) but not reproducible against this
+// project's own test photos, so this can't be fixed by chasing one
+// specific cause -- using the 1st-99th percentile of vertex positions per
+// axis instead of their raw extremes makes framing robust to that whole
+// class of outlier regardless of what produced it, at the cost of (at
+// most) a sliver of the true extremes going very slightly out of frame,
+// which Reset view already exists to recover from.
+function _robustRange(values) {
+  if (values.length === 0) return [0, 1];
+  const sorted = [...values].sort((a, b) => a - b);
+  const lo = sorted[Math.floor(sorted.length * 0.01)];
+  const hi = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.99) - 1)];
+  return lo < hi ? [lo, hi] : [sorted[0], sorted[sorted.length - 1]];
+}
+
 function frameCamera(object3d) {
-  const box = new THREE.Box3().setFromObject(object3d);
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  const radius = Math.max(size.x, size.y, size.z) * 0.72;
+  object3d.updateMatrixWorld(true);
+  const xs = [], ys = [], zs = [];
+  const v = new THREE.Vector3();
+  object3d.traverse((child) => {
+    if (!child.isMesh || !child.geometry || !child.geometry.attributes.position) return;
+    const pos = child.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(child.matrixWorld);
+      xs.push(v.x);
+      ys.push(v.y);
+      zs.push(v.z);
+    }
+  });
+
+  const [xlo, xhi] = _robustRange(xs);
+  const [ylo, yhi] = _robustRange(ys);
+  const [zlo, zhi] = _robustRange(zs);
+  const center = new THREE.Vector3((xlo + xhi) / 2, (ylo + yhi) / 2, (zlo + zhi) / 2);
+  const size = new THREE.Vector3(xhi - xlo, yhi - ylo, zhi - zlo);
+  let radius = Math.max(size.x, size.y, size.z) * 0.72;
+  // A degenerate mesh (too few vertices, all coincident) could leave
+  // radius at 0 or NaN -- never let that reach camera.position below.
+  if (!isFinite(radius) || radius <= 0) radius = 100;
 
   controls.target.copy(center);
   const dir = new THREE.Vector3(0.55, 0.42, 0.9).normalize();
