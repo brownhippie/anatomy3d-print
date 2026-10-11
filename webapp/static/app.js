@@ -388,6 +388,99 @@ document.getElementById("reset-view-btn").addEventListener("click", () => {
 });
 
 // ---------------- form submit ----------------
+//
+// /api/generate itself now returns almost immediately (just a job_id --
+// see webapp/app.py's own comment on why), and the actual generation
+// keeps running server-side in its own thread regardless of whether this
+// tab/app is even open. The client's job here is just to poll for it to
+// finish instead of holding one connection open the whole time, which
+// means backgrounding the app (or Android killing it outright) no longer
+// loses the result -- reopening the app finds the saved job_id in
+// localStorage and picks the poll back up, or finds it already done.
+
+const LAST_JOB_KEY = "figuro_pending_job_id";
+let pollTimer = null;
+
+function stopPolling() {
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  localStorage.removeItem(LAST_JOB_KEY);
+}
+
+function finishedGenerating() {
+  generateBtn.disabled = false;
+  loadingOverlay.classList.remove("show");
+}
+
+function showResult(data) {
+  if (data.method_used === "capsule (fallback)") {
+    setStatus("ok", "Model generated — TRELLIS.2 was unavailable, so this used the built-in method instead.");
+  } else {
+    setStatus("ok", "Model generated.");
+  }
+  renderMessages(data.messages);
+  loadModel(data.obj_url);
+  currentGlbUrl = data.glb_url;
+  if (methodSelect.value === "trellis") loadTrellisStatus();
+
+  statsBar.style.display = "flex";
+  statsBar.innerHTML = `
+    <span><b>${data.stats.faces.toLocaleString()}</b> faces</span>
+    <span><b>${data.stats.height_mm.toFixed(1)}mm</b> tall</span>
+    <span><b>${data.stats.watertight ? "watertight" : "needs repair"}</b></span>
+  `;
+  downloadBar.innerHTML = `
+    <a href="${data.stl_url}" download>Download STL</a>
+    <a class="secondary" href="${data.obj_url}" download>Download OBJ</a>
+    <a class="secondary" href="${data.glb_url}" download>Download GLB</a>
+  `;
+}
+
+async function pollJob(jobId) {
+  let res;
+  try {
+    res = await fetch(`/api/jobs/${jobId}/status`);
+  } catch (err) {
+    // likely just coming back from background/offline -- keep trying
+    // rather than giving up on one dropped request.
+    pollTimer = setTimeout(() => pollJob(jobId), 3000);
+    return;
+  }
+  if (res.status === 404) {
+    stopPolling();
+    finishedGenerating();
+    setStatus("error", "That job wasn't found — it may have expired (jobs are kept for 2 hours).");
+    return;
+  }
+  const data = await res.json();
+  if (data.status === "running") {
+    pollTimer = setTimeout(() => pollJob(jobId), 2000);
+    return;
+  }
+  stopPolling();
+  finishedGenerating();
+  if (data.status === "error") {
+    setStatus("error", data.detail || "Something went wrong.");
+    return;
+  }
+  showResult(data);
+}
+
+// A throttled background tab/app can sit on a stale setTimeout for a
+// while before it next fires -- re-poll right away the moment the page
+// is actually visible again instead of waiting that out.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  const jobId = localStorage.getItem(LAST_JOB_KEY);
+  if (!jobId) return;
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  pollJob(jobId);
+});
 
 async function generate() {
   if (selectedFiles.length === 0) {
@@ -430,35 +523,14 @@ async function generate() {
     const data = await res.json();
     if (!res.ok) {
       setStatus("error", data.detail || "Something went wrong.");
-      renderMessages(data.messages);
+      finishedGenerating();
       return;
     }
-    if (data.method_used === "capsule (fallback)") {
-      setStatus("ok", "Model generated — TRELLIS.2 was unavailable, so this used the built-in method instead.");
-    } else {
-      setStatus("ok", "Model generated.");
-    }
-    renderMessages(data.messages);
-    loadModel(data.obj_url);
-    currentGlbUrl = data.glb_url;
-    if (method === "trellis") loadTrellisStatus();
-
-    statsBar.style.display = "flex";
-    statsBar.innerHTML = `
-      <span><b>${data.stats.faces.toLocaleString()}</b> faces</span>
-      <span><b>${data.stats.height_mm.toFixed(1)}mm</b> tall</span>
-      <span><b>${data.stats.watertight ? "watertight" : "needs repair"}</b></span>
-    `;
-    downloadBar.innerHTML = `
-      <a href="${data.stl_url}" download>Download STL</a>
-      <a class="secondary" href="${data.obj_url}" download>Download OBJ</a>
-      <a class="secondary" href="${data.glb_url}" download>Download GLB</a>
-    `;
+    localStorage.setItem(LAST_JOB_KEY, data.job_id);
+    pollJob(data.job_id);
   } catch (err) {
     setStatus("error", "Network error: " + err.message);
-  } finally {
-    generateBtn.disabled = false;
-    loadingOverlay.classList.remove("show");
+    finishedGenerating();
   }
 }
 
@@ -467,6 +539,7 @@ resetBtn.addEventListener("click", () => {
   selectedFiles = [];
   descriptionInput.value = "";
   cropFrac = 1.0;
+  stopPolling();
   renderFileList();
   clearStatus();
   messagesEl.innerHTML = "";
@@ -484,3 +557,19 @@ resetBtn.addEventListener("click", () => {
 
 initViewer();
 renderFileList();
+
+// Resume a job that was still running when this page/app was last closed
+// or backgrounded hard enough to be killed -- the job itself kept running
+// server-side the whole time (see _run_job in webapp/app.py), so there is
+// still a real result to pick back up, not just a lost request. Placed
+// after initViewer/renderFileList so everything pollJob's success path
+// touches (the three.js scene, the file list) is already set up.
+(function resumePendingJob() {
+  const jobId = localStorage.getItem(LAST_JOB_KEY);
+  if (!jobId) return;
+  generateBtn.disabled = true;
+  loadingOverlay.classList.add("show");
+  loadingMsg.textContent = "Picking back up a model that was already generating…";
+  setActiveTab("result");
+  pollJob(jobId);
+})();

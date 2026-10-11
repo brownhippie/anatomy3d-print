@@ -48,6 +48,17 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # falling back a lot" visibility; not a billing-grade audit log.
 _trellis_stats = {"attempts": 0, "successes": 0, "fallbacks": 0}
 
+# In-memory job status, polled by the client instead of held open over one
+# long request -- see /api/generate's own comment for why: a phone app
+# backgrounded (or killed and reopened) mid-generation was losing the
+# result even though the actual work, running in its own thread here,
+# never stopped. Each entry: {"status": "running"} while in flight, then
+# either {"status": "done", **result} or {"status": "error", "detail": ...}
+# once _run_job finishes, plus "created_at" so _sweep_old_jobs can expire
+# it the same way job_dir itself already gets swept.
+_job_state: "dict[str, dict]" = {}
+_job_state_lock = threading.Lock()
+
 # Confirmed directly, not assumed, as the cause of the whole app going
 # unresponsive during a generate call -- not just that one request, but
 # totally unrelated ones too: Railway's own http logs showed plain GET
@@ -88,6 +99,10 @@ def _sweep_old_jobs() -> None:
                 shutil.rmtree(entry, ignore_errors=True)
         except FileNotFoundError:
             pass  # another request already cleaned it up — fine
+    with _job_state_lock:
+        expired = [jid for jid, s in _job_state.items() if now - s.get("created_at", now) > JOB_TTL_SECONDS]
+        for jid in expired:
+            _job_state.pop(jid, None)
 
 
 def _write_cutout(image_path: str, out_path: Path) -> bool:
@@ -196,15 +211,49 @@ async def api_generate(
         image_paths.append(str(path))
 
     out_stl = job_dir / "model.stl"
-    out_obj = job_dir / "model.obj"
-    out_glb = job_dir / "model.glb"
 
-    def _generate_sync() -> "tuple[str, list[str]]":
-        """Runs on a worker thread (see run_in_threadpool below) -- never
-        called directly from the event loop. Dispatches method/fallback
-        and returns (used_method, messages); _trellis_stats updates stay
-        under _run_pipeline_capturing's own lock, same as the pipeline
-        call itself, so concurrent requests can't race on the counters."""
+    with _job_state_lock:
+        _job_state[job_id] = {"status": "running", "created_at": time.time()}
+
+    # Handed off to its own real OS thread, not awaited here -- the point
+    # is that this request can return immediately, before generation even
+    # starts, so the client isn't holding one long-lived connection open
+    # for the whole job. A phone backgrounding the app (or the OS killing
+    # it outright) no longer loses the result: the thread keeps running on
+    # the server regardless of whether anyone is still connected, same as
+    # it always did -- the only thing that changes is the client now polls
+    # /api/jobs/{id}/status for it instead of blocking on one response,
+    # so reopening the app (with the job_id it saved before backgrounding)
+    # picks the finished result straight back up. daemon=True so a server
+    # restart doesn't hang waiting on an orphaned job.
+    threading.Thread(
+        target=_run_job,
+        args=(job_id, method, image_paths, height_mm, use_depth, bust_mode, crop_frac, description, job_dir, out_stl),
+        daemon=True,
+    ).start()
+
+    return {"job_id": job_id, "status": "running"}
+
+
+def _run_job(
+    job_id: str,
+    method: str,
+    image_paths: "list[str]",
+    height_mm: float,
+    use_depth: bool,
+    bust_mode: bool,
+    crop_frac: "Optional[float]",
+    description: str,
+    job_dir: Path,
+    out_stl: Path,
+) -> None:
+    """Runs entirely on its own background thread (see the Thread(...)
+    call in api_generate above) -- never called directly from the event
+    loop, and its caller does not wait on it. Dispatches method/fallback,
+    builds the final result the client's status poll will see, and writes
+    it into _job_state; never raises back into that thread's caller since
+    there is no caller left listening by the time this runs."""
+    try:
         if method == "trellis":
             _trellis_stats["attempts"] += 1
             try:
@@ -212,10 +261,10 @@ async def api_generate(
                     run_trellis_pipeline, image_paths[0], str(out_stl), target_height_mm=height_mm
                 )
                 _trellis_stats["successes"] += 1
-                return method, messages
+                used_method = method
             except Exception as trellis_exc:
                 # Fall back to this project's own always-available pipeline rather
-                # than just failing the request -- TRELLIS.2 depends on an external
+                # than just failing the job -- TRELLIS.2 depends on an external
                 # service with its own quota/uptime this project doesn't control
                 # (see trellis_source.py), so a visitor still gets a model instead
                 # of an error when it's unavailable. Weaker result, but a real one.
@@ -224,7 +273,8 @@ async def api_generate(
                 messages = _run_pipeline_capturing(
                     run_pipeline, image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth
                 )
-                return "capsule (fallback)", [fallback_note] + messages
+                used_method = "capsule (fallback)"
+                messages = [fallback_note] + messages
         elif method == "silhouette_relief":
             messages = _run_pipeline_capturing(
                 run_silhouette_relief_pipeline,
@@ -235,18 +285,17 @@ async def api_generate(
                 bust_mode=bust_mode,
                 crop_frac=crop_frac,
             )
-            return method, messages
+            used_method = method
         else:
             messages = _run_pipeline_capturing(
                 run_pipeline, image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth
             )
-            return method, messages
-
-    try:
-        used_method, messages = await run_in_threadpool(_generate_sync)
+            used_method = method
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(400, str(exc)) from exc
+        with _job_state_lock:
+            _job_state[job_id] = {"status": "error", "detail": str(exc), "created_at": time.time()}
+        return
 
     mesh = trimesh.load(str(out_stl), process=True)
     height_actual = float(mesh.vertices[:, 1].max() - mesh.vertices[:, 1].min())
@@ -257,6 +306,8 @@ async def api_generate(
     has_cutout = _write_cutout(image_paths[0], job_dir / "cutout.png")
 
     result = {
+        "status": "done",
+        "created_at": time.time(),
         "job_id": job_id,
         "obj_url": f"/jobs/{job_id}/model.obj",
         "stl_url": f"/jobs/{job_id}/model.stl",
@@ -273,7 +324,24 @@ async def api_generate(
     }
     if has_cutout:
         result["cutout_url"] = f"/jobs/{job_id}/cutout.png"
-    return result
+    with _job_state_lock:
+        _job_state[job_id] = result
+
+
+@app.get("/api/jobs/{job_id}/status")
+def job_status(job_id: str):
+    """Polled by the client instead of holding one request open for the
+    whole generation (see api_generate) -- "running" while _run_job is
+    still working, then whatever it last wrote: "done" with the full
+    result the old synchronous response used to return directly, or
+    "error" with the failure detail. 404 for a job_id this process never
+    saw (wrong id) or has since swept (see _sweep_old_jobs) -- the client
+    treats either the same way, same as a job_dir 404 already does."""
+    with _job_state_lock:
+        state = _job_state.get(job_id)
+    if state is None:
+        raise HTTPException(404, "Job not found or expired.")
+    return state
 
 
 @app.get("/jobs/{job_id}/model.obj")
