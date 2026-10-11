@@ -598,6 +598,16 @@ resetBtn.addEventListener("click", () => {
 initViewer();
 renderFileList();
 
+// A direct, unambiguous way to confirm a given page load is actually on
+// a given deploy -- see /api/version in webapp/app.py -- instead of
+// having to guess from whether something visibly changed.
+fetch("/api/version")
+  .then((r) => r.json())
+  .then((v) => {
+    document.getElementById("build-tag").textContent = v.commit ? `· build ${v.commit}` : "";
+  })
+  .catch(() => {});
+
 // Resume a job that was still running when this page/app was last closed
 // or backgrounded hard enough to be killed -- the job itself kept running
 // server-side the whole time (see _run_job in webapp/app.py), so there is

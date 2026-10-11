@@ -12,6 +12,7 @@ import io
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -42,6 +43,28 @@ JOBS_DIR = Path(tempfile.gettempdir()) / "anatomy3d-jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 JOB_TTL_SECONDS = 2 * 60 * 60  # 2 hours — generous for someone to come back and re-download
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _detect_commit() -> str:
+    """Computed once at process start, not per-request -- a direct,
+    unambiguous way to confirm a given browser/app session is actually
+    talking to a given deploy (compare against the commit a change was
+    pushed as), instead of guessing from whether the UI looks different.
+    RAILWAY_GIT_COMMIT_SHA is set automatically on Railway; falls back to
+    asking git directly for local/non-Railway runs, and to "unknown"
+    only if neither is available (e.g. a source-less container)."""
+    sha = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
+    if sha:
+        return sha[:7]
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(WEBAPP_DIR), stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+_COMMIT = _detect_commit()
 
 # Process-lifetime counters, not persisted — restarts reset them, same as
 # this process's own JOBS_DIR. Good enough for "is this getting used /
@@ -142,6 +165,11 @@ def index():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/version")
+def version():
+    return {"commit": _COMMIT}
 
 
 @app.get("/api/trellis-status")

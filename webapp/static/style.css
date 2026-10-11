@@ -60,6 +60,12 @@ header.topbar .tagline {
   margin: 0 16px;
 }
 
+.build-tag {
+  opacity: 0.55;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+}
+
 header.topbar .header-actions {
   flex: none;
   display: flex;
