@@ -52,6 +52,16 @@ MIN_CAPSULES = 6
 # (a single mean figure, not a sampled distribution, same choice already
 # made for every other generic ratio in this file).
 HEAD_RADIUS_FRAC_OF_SHOULDER_WIDTH = 0.1914  # headbreadth/2 : biacromialbreadth, std 0.013
+# A head barely narrows from crown to jaw (confirmed directly: rendering
+# the previous single head_top-to-neck capsule in isolation, with no
+# jaw/neck split at all, looked like a cone/cylinder, not a head). These
+# two keep the head itself compact and roughly round, then step down to a
+# visibly thinner neck below the jaw -- no ANSUR jaw/neck-breadth column
+# to calibrate against, so these are reasoned proportions (a head stays
+# close to its own full radius down to the jaw; a neck is noticeably,
+# not subtly, thinner than the head it's attached to), not measured.
+JAW_RADIUS_FRAC_OF_HEAD = 0.88
+NECK_RADIUS_FRAC_OF_HEAD = 0.42
 # Torso/hip radii must reach out to the shoulder/hip landmarks themselves
 # (half the point-to-point width) or the limb capsules attached there end
 # up floating outside the torso's own surface with a visible gap.
@@ -476,7 +486,35 @@ def _build_capsules(
     if "left_hip" in joints and "right_hip" in joints:
         joints["pelvis"] = (joints["left_hip"] + joints["right_hip"]) / 2.0
     if "nose" in joints:
-        joints["head_top"] = joints["nose"] + (joints["nose"] - neck) * 1.1
+        # Straight up from neck, not along the nose-to-neck vector --
+        # confirmed directly as a real bug, not a guess: on a photo where
+        # the head is turned (e.g. to profile, as in a dynamic pose), the
+        # nose sits nearly as far SIDEWAYS from neck as above it, so
+        # extrapolating further along that same vector dragged head_top
+        # diagonally out to the side. The resulting head_top-to-neck
+        # capsule leaned at that same diagonal, which -- combined with
+        # tapering linearly over its whole length, see the jaw split
+        # below -- rendered as a long leaning cylinder, not a head.
+        # Using only the vertical (nose.y - neck.y) component keeps the
+        # same scale this 1.1 multiplier was tuned for on a front-facing
+        # photo, while a turned head no longer drags it sideways. Floored
+        # so a near-zero/negative vertical gap (nose barely above neck,
+        # or face landmarks misdetected) can't collapse the head height
+        # to nothing.
+        head_up = max(joints["nose"][1] - neck[1], shoulder_width * 0.2)
+        head_axis = np.array([0.0, head_up, 0.0])
+        # A real head barely narrows from crown to jaw, then the neck
+        # below it is a distinctly thinner cylinder -- modeling the whole
+        # crown-to-shoulder span as ONE capsule tapering linearly the
+        # entire way (the previous shape here) reads as a cone/cylinder
+        # regardless of which direction it leans, confirmed directly by
+        # rendering it in isolation. jaw_frac/JAW_RADIUS_FRAC_OF_HEAD
+        # below split that into a compact head segment and a thin neck
+        # segment, same "section by section" approach the torso already
+        # uses for chest/waist/hips.
+        jaw_frac = 0.32  # neck gets this fraction of the full head_top-to-neck span
+        joints["head_top"] = neck + head_axis * 2.1
+        joints["jaw"] = neck + head_axis * 2.1 * jaw_frac
     joints["waist"] = neck + (joints["pelvis"] - neck) * WAIST_HEIGHT_FRAC
 
     # Pull limb attachment points inward from the raw landmark toward the
@@ -539,7 +577,8 @@ def _build_capsules(
     # on each end's own radius (see DEPTH_RATIO_LIMB_THIN/THICK above),
     # instead of one flat ratio for every limb regardless of how thick it is.
     segs = [
-        ("head_top", "neck", head_r, head_r * 0.6, DEPTH_RATIO_HEAD, DEPTH_RATIO_HEAD),
+        ("head_top", "jaw", head_r, head_r * JAW_RADIUS_FRAC_OF_HEAD, DEPTH_RATIO_HEAD, DEPTH_RATIO_HEAD),
+        ("jaw", "neck", head_r * JAW_RADIUS_FRAC_OF_HEAD, head_r * NECK_RADIUS_FRAC_OF_HEAD, DEPTH_RATIO_HEAD, DEPTH_RATIO_CHEST),
         ("neck", "waist", torso_r_top, waist_r, DEPTH_RATIO_CHEST, DEPTH_RATIO_WAIST),
         ("waist", "pelvis", waist_r, torso_r_bot, DEPTH_RATIO_WAIST, DEPTH_RATIO_HIPS),
         ("left_shoulder_attach", "left_elbow", upper_arm_r, upper_arm_r_taper, _limb_dr(upper_arm_r), _limb_dr(upper_arm_r_taper)),
