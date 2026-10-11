@@ -309,7 +309,7 @@ def build_silhouette_relief_mesh(
     alpha: np.ndarray,
     target_height_mm: float = 150.0,
     grid_size: int = 360,
-    depth_scale: float = 0.5,
+    depth_scale: float = 0.75,
     depth_rgb: Optional[np.ndarray] = None,
     depth_strength: float = 0.5,
     animal_frac: float = 0.0,
