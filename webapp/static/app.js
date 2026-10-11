@@ -9,6 +9,13 @@ const heightInput = document.getElementById("height-mm");
 const methodSelect = document.getElementById("method-select");
 const useDepthRow = document.getElementById("use-depth-row");
 const useDepthCheckbox = document.getElementById("use-depth");
+const bustModeRow = document.getElementById("bust-mode-row");
+const bustModeCheckbox = document.getElementById("bust-mode");
+const cropBaseField = document.getElementById("crop-base-field");
+const cropPreview = document.getElementById("crop-preview");
+const cropPreviewImg = document.getElementById("crop-preview-img");
+const cropShade = document.getElementById("crop-shade");
+const cropLine = document.getElementById("crop-line");
 const generateBtn = document.getElementById("generate-btn");
 const resetBtn = document.getElementById("reset-btn");
 const statusBox = document.getElementById("status-box");
@@ -42,6 +49,15 @@ function setActiveTab(name) {
 }
 
 tabBtns.forEach((btn) => btn.addEventListener("click", () => setActiveTab(btn.dataset.tab)));
+
+// The Android app's WebView loads this same URL (see android-app/capacitor.config.ts's
+// server.url), so a deploy here is already "live" there with no separate app update --
+// but the WebView (like any browser) can still hold a cached copy of index.html/app.js/
+// style.css for a while. This button forces a real network re-fetch of the page past
+// that cache, landing on whatever is currently deployed.
+document.getElementById("refresh-app-btn").addEventListener("click", () => {
+  window.location.href = window.location.pathname + "?_r=" + Date.now();
+});
 
 // Neither reconstruction method actually consumes this text as a model
 // input right now -- confirmed directly, not assumed: TRELLIS.2's own
@@ -111,13 +127,54 @@ function updateModeBanner() {
 
 function updateMethodUI() {
   useDepthRow.style.display = methodSelect.value === "trellis" ? "none" : "";
+  bustModeRow.style.display = methodSelect.value === "silhouette_relief" ? "" : "none";
   updateModeBanner();
+  updateCropTool();
   if (methodSelect.value === "trellis") {
     loadTrellisStatus();
   } else {
     trellisStatusEl.style.display = "none";
   }
 }
+
+// ---------------- custom base/crop tool ----------------
+// 1.0 = the full photo, nothing cropped away -- the default, matching
+// the backend's own crop_frac=None meaning "use the whole photo".
+let cropFrac = 1.0;
+let cropDragging = false;
+
+function setCropLine(frac) {
+  cropFrac = Math.min(1, Math.max(0.05, frac));
+  const pct = (cropFrac * 100).toFixed(2) + "%";
+  cropLine.style.top = pct;
+  cropShade.style.top = pct;
+}
+
+function updateCropTool() {
+  const show = methodSelect.value === "silhouette_relief" && bustModeCheckbox.checked && selectedFiles.length === 1;
+  cropBaseField.style.display = show ? "" : "none";
+  if (show) {
+    cropPreviewImg.src = URL.createObjectURL(selectedFiles[0]);
+    setCropLine(cropFrac);
+  }
+}
+bustModeCheckbox.addEventListener("change", updateCropTool);
+
+function cropFracFromPointer(e) {
+  const rect = cropPreview.getBoundingClientRect();
+  return (e.clientY - rect.top) / rect.height;
+}
+cropPreview.addEventListener("pointerdown", (e) => {
+  cropDragging = true;
+  cropPreview.setPointerCapture(e.pointerId);
+  setCropLine(cropFracFromPointer(e));
+});
+cropPreview.addEventListener("pointermove", (e) => {
+  if (cropDragging) setCropLine(cropFracFromPointer(e));
+});
+cropPreview.addEventListener("pointerup", () => {
+  cropDragging = false;
+});
 methodSelect.addEventListener("change", updateMethodUI);
 
 function renderFileList() {
@@ -146,6 +203,7 @@ function renderFileList() {
   });
   updateModeBanner();
   updateDescriptionVisibility();
+  updateCropTool();
 }
 
 function addFiles(fileListObj) {
@@ -362,6 +420,10 @@ async function generate() {
   form.append("use_depth", useDepthCheckbox.checked ? "true" : "false");
   form.append("method", method);
   form.append("description", descriptionInput.value || "");
+  form.append("bust_mode", bustModeCheckbox.checked ? "true" : "false");
+  if (cropBaseField.style.display !== "none" && cropFrac < 0.999) {
+    form.append("crop_frac", String(cropFrac));
+  }
 
   try {
     const res = await fetch("/api/generate", { method: "POST", body: form });
@@ -404,6 +466,7 @@ generateBtn.addEventListener("click", generate);
 resetBtn.addEventListener("click", () => {
   selectedFiles = [];
   descriptionInput.value = "";
+  cropFrac = 1.0;
   renderFileList();
   clearStatus();
   messagesEl.innerHTML = "";

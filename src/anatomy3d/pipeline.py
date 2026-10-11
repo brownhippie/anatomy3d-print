@@ -274,8 +274,26 @@ def run_silhouette_relief_pipeline(
     target_faces: Optional[int] = 20000,
     use_depth: bool = False,
     depth_strength: float = 0.5,
+    bust_mode: bool = False,
+    crop_frac: Optional[float] = None,
 ) -> None:
-    """A deliberately different, simpler path than run_pipeline's
+    """`bust_mode`: see build_silhouette_relief_mesh's own docstring --
+    for a photo that was always meant to show only the upper body, not
+    a standing figure cropped by accident. The output still gets a flat
+    base disk to stand on either way (see add_base_disk below).
+
+    `crop_frac`: manual override for exactly where the model ends,
+    independent of what the automatic detection decides (see
+    person_segmenter's animal_frac gate on leg-synthesis -- a real
+    photo can land on either side of that gate in ways a user watching
+    their own result would rather just control directly). Keeps only
+    the top `crop_frac` fraction of the photo's own height (0 < x <=
+    1) before any other processing -- so the rest of the pipeline
+    (mask detection, bust_mode's leg-synthesis skip, the base disk)
+    behaves exactly as if the photo had been cropped to that height to
+    begin with. None (the default) uses the full photo, unchanged.
+
+    A deliberately different, simpler path than run_pipeline's
     single-photo mode: the mesh's own front-on silhouette is built
     directly from the photo's 2D cutout (detect_person_alpha -- the same
     function the webapp's /jobs/{id}/cutout.png serves), not from
@@ -312,6 +330,11 @@ def run_silhouette_relief_pipeline(
     from .person_segmenter import detect_person_alpha_with_source
 
     rgb = load_image_rgb(image_path, max_dimension=None).rgb
+    if crop_frac is not None:
+        if not 0 < crop_frac <= 1:
+            raise ValueError(f"crop_frac must be in (0, 1], got {crop_frac}")
+        keep_rows = max(1, round(rgb.shape[0] * crop_frac))
+        rgb = rgb[:keep_rows, :, :]
     detected = detect_person_alpha_with_source(rgb)
     if detected is None:
         raise RuntimeError(
@@ -326,6 +349,7 @@ def run_silhouette_relief_pipeline(
         depth_rgb=rgb if use_depth else None,
         depth_strength=depth_strength,
         animal_frac=animal_frac,
+        bust_mode=bust_mode,
     )
 
     body = add_base_disk(body, target_height_mm)

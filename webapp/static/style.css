@@ -60,7 +60,15 @@ header.topbar .tagline {
   margin: 0 16px;
 }
 
-header.topbar .get-app-link {
+header.topbar .header-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+header.topbar .get-app-link,
+header.topbar .refresh-link {
   flex: none;
   background: var(--panel-2);
   border: 1px solid var(--border);
@@ -71,8 +79,11 @@ header.topbar .get-app-link {
   font-weight: 500;
   text-decoration: none;
   white-space: nowrap;
+  cursor: pointer;
+  font-family: inherit;
 }
-header.topbar .get-app-link:hover {
+header.topbar .get-app-link:hover,
+header.topbar .refresh-link:hover {
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -308,6 +319,46 @@ main {
   color: var(--text-dim);
   margin-top: 6px;
   line-height: 1.5;
+}
+
+.crop-preview {
+  position: relative;
+  width: 100%;
+  max-height: 320px;
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+  line-height: 0;
+}
+.crop-preview img {
+  display: block;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+}
+.crop-preview .crop-shade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: 100%; /* set inline by JS to the line's own position */
+  background: repeating-linear-gradient(
+    135deg, rgba(0,0,0,0.6) 0 6px, rgba(0,0,0,0.75) 6px 12px
+  );
+  pointer-events: none;
+}
+.crop-preview .crop-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%; /* set inline by JS, 0-100% of the preview's own height */
+  height: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 6px rgba(110, 168, 255, 0.8);
+  pointer-events: none;
 }
 
 .trellis-status {

@@ -27,7 +27,10 @@
         Figuro
       </div>
       <div class="tagline">photo &rarr; 3D-printable figure, built from scratch, no licensed model</div>
-      <a class="get-app-link" href="/static/downloads/figuro.apk" download>&#128241; Get the Android app</a>
+      <div class="header-actions">
+        <button class="refresh-link" id="refresh-app-btn" type="button" title="Force-reload this page past any cached version">&#8635; Refresh</button>
+        <a class="get-app-link" href="/static/downloads/figuro.apk" download>&#128241; Get the Android app</a>
+      </div>
     </header>
 
     <main>
@@ -72,6 +75,19 @@
           <div class="checkbox-row" id="use-depth-row">
             <input type="checkbox" id="use-depth" />
             <label for="use-depth" style="margin:0">Use real depth estimation (single photo, needs the server's optional depth extras)</label>
+          </div>
+          <div class="checkbox-row" id="bust-mode-row" style="display:none">
+            <input type="checkbox" id="bust-mode" />
+            <label for="bust-mode" style="margin:0">This is a bust/half-body photo (don't add legs — ends where the photo ends, on a flat base)</label>
+          </div>
+          <div class="field" id="crop-base-field" style="display:none">
+            <label>Custom base — drag the line to where the model should end</label>
+            <div class="crop-preview" id="crop-preview">
+              <img id="crop-preview-img" alt="" />
+              <div class="crop-shade" id="crop-shade"></div>
+              <div class="crop-line" id="crop-line"></div>
+            </div>
+            <div class="hint">Everything below the line is left out of the model. Leave at the bottom to use the whole photo.</div>
           </div>
         </div>
 

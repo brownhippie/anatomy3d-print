@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import trimesh
@@ -150,7 +150,11 @@ async def api_generate(
     use_depth: bool = Form(False),
     method: str = Form("capsule"),
     description: str = Form(""),
+    bust_mode: bool = Form(False),
+    crop_frac: Optional[float] = Form(None),
 ):
+    if crop_frac is not None and not 0 < crop_frac <= 1:
+        raise HTTPException(400, f"crop_frac must be in (0, 1], got {crop_frac}")
     if method not in ("capsule", "trellis", "silhouette_relief"):
         raise HTTPException(400, f"Unknown method '{method}' -- use 'capsule', 'trellis', or 'silhouette_relief'.")
     if method in ("trellis", "silhouette_relief") and len(images) != 1:
@@ -228,6 +232,8 @@ async def api_generate(
                 str(out_stl),
                 target_height_mm=height_mm,
                 use_depth=use_depth,
+                bust_mode=bust_mode,
+                crop_frac=crop_frac,
             )
             return method, messages
         else:

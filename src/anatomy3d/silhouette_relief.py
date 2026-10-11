@@ -314,8 +314,21 @@ def build_silhouette_relief_mesh(
     depth_strength: float = 0.5,
     animal_frac: float = 0.0,
     limb_depth_scale: float = 0.9,
+    bust_mode: bool = False,
 ) -> BodyMesh:
-    """`alpha`: a float [0,1] or boolean (H, W) mask -- the same soft
+    """`bust_mode`: skip _detect_crop_and_extend's synthetic leg
+    completion -- for a photo that was always meant to show only the
+    upper body (a bust/headshot-style portrait), not a standing figure
+    cropped by accident. Without this, a photo cut off at the waist/
+    chest gets generic tapered legs grafted on by default (see that
+    function's own docstring for why); with it, the mesh ends exactly
+    where the photo's own silhouette does -- closed the same way every
+    other boundary in this mesh already is (the top of the head, a
+    hand, a foot), not a special case. The pipeline still adds a flat
+    base disk underneath either way (see mesh_export.add_base_disk),
+    so a bust still has something to physically stand on when printed.
+
+    `alpha`: a float [0,1] or boolean (H, W) mask -- the same soft
     cutout alpha detect_person_alpha produces (and the webapp's
     /jobs/{id}/cutout.png serves), thresholded at 0.5 to a hard boundary
     for a clean, closed mesh.
@@ -426,7 +439,8 @@ def build_silhouette_relief_mesh(
     if not mask.any():
         raise ValueError("Empty mask -- nothing to build a shape from.")
     orig_h, orig_w = mask.shape  # real photo dimensions, saved before any synthetic extension below
-    mask = _detect_crop_and_extend(mask, animal_frac=animal_frac)
+    if not bust_mode:
+        mask = _detect_crop_and_extend(mask, animal_frac=animal_frac)
 
     ys, xs = np.nonzero(mask)
     y0, y1 = ys.min(), ys.max() + 1
