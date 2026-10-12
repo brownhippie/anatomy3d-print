@@ -282,6 +282,12 @@ function initViewer() {
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.target.set(0, 60, 0);
+  // Inverts drag-to-pan direction (two-finger drag on touch, right-click
+  // drag on desktop) -- directly requested. OrbitControls multiplies its
+  // pan delta by this each frame, so negating it flips the direction
+  // without touching anything else (zoom/rotate speeds are separate
+  // properties, untouched here).
+  controls.panSpeed = -1;
 
   const hemi = new THREE.HemisphereLight(0xaecbff, 0x1a1a1f, 1.1);
   scene.add(hemi);
