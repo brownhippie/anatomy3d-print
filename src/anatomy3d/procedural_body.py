@@ -36,6 +36,11 @@ from .safety import mad_margin_above_minimum
 # longer reachable as a failure path below 6.
 MIN_CAPSULES = 6
 
+
+class HipsNotDetectedError(RuntimeError):
+    """A waist-up/bust photo: the capsule builder can't place a torso without
+    hips, but the webapp can still rebuild it as a bust (see _run_job)."""
+
 # Head/torso/limb radii as a fraction of shoulder or hip width, and the
 # arm/leg tip:base taper ratios — all computed from ANSUR II (the 2012 US
 # Army Anthropometric Survey: 93 real measurements each on 6,068 people,
@@ -458,7 +463,7 @@ def _build_capsules(
     # ~4x the volume of a complete figure. Raw capsule count doesn't catch
     # this (5+ capsules can still be present), so it needs its own gate.
     if "left_hip" not in joints or "right_hip" not in joints:
-        raise RuntimeError(
+        raise HipsNotDetectedError(
             "Hips not detected — need a photo showing the torso down to at "
             "least the hips, or the figure's proportions come out badly wrong."
         )

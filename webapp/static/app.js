@@ -548,6 +548,8 @@ function finishedGenerating() {
 function showResult(data) {
   if (data.method_used === "capsule (fallback)") {
     setStatus("ok", "Model generated — TRELLIS.2 was unavailable, so this used the built-in method instead.");
+  } else if (data.method_used === "silhouette_relief (bust)") {
+    setStatus("ok", "Model generated as a bust — no hips in the photo, so no legs were added.");
   } else {
     setStatus("ok", "Model generated.");
   }

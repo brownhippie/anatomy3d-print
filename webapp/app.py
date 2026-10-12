@@ -32,6 +32,7 @@ from anatomy3d.depth_source import depth_available
 from anatomy3d.pipeline import run_pipeline, run_silhouette_relief_pipeline, run_trellis_pipeline
 from anatomy3d.person_segmenter import detect_person_alpha
 from anatomy3d.preprocess import load_image_rgb
+from anatomy3d.procedural_body import HipsNotDetectedError
 from anatomy3d.trellis_source import get_quota_status, token_configured, token_preview
 
 app = FastAPI(title="anatomy3d-print")
@@ -308,6 +309,39 @@ def _run_job(
                 "created_at": time.time(),
             }
 
+    def run_capsule() -> "tuple[list[str], Optional[str]]":
+        # A waist-up photo has no hips for the capsule builder to anchor a
+        # torso to; rebuild it as a bust instead of failing the job.
+        try:
+            return _run_pipeline_capturing(
+                run_pipeline,
+                image_paths,
+                str(out_stl),
+                target_height_mm=height_mm,
+                use_depth=use_depth,
+                progress_cb=report_progress,
+            ), None
+        except HipsNotDetectedError:
+            if len(image_paths) != 1:
+                raise
+            messages = _run_pipeline_capturing(
+                run_silhouette_relief_pipeline,
+                image_paths[0],
+                str(out_stl),
+                target_height_mm=height_mm,
+                use_depth=use_depth,
+                bust_mode=True,
+                crop_frac=crop_frac,
+                # The hips check fails partway through (at mesh building),
+                # so continue the count from there instead of restarting it.
+                progress_cb=lambda stage, frac: report_progress(f"Rebuilding as a bust: {stage}", 0.5 + 0.5 * frac),
+            )
+            note = (
+                "No hips in this photo, so it was built as a bust: Silhouette relief "
+                "in bust mode (no legs added, flat base where the photo ends)."
+            )
+            return [note] + messages, "silhouette_relief (bust)"
+
     try:
         if method == "trellis":
             _trellis_stats["attempts"] += 1
@@ -329,15 +363,8 @@ def _run_job(
                 # of an error when it's unavailable. Weaker result, but a real one.
                 _trellis_stats["fallbacks"] += 1
                 fallback_note = f"TRELLIS.2 failed, falling back to the built-in method: {trellis_exc}"
-                messages = _run_pipeline_capturing(
-                    run_pipeline,
-                    image_paths,
-                    str(out_stl),
-                    target_height_mm=height_mm,
-                    use_depth=use_depth,
-                    progress_cb=report_progress,
-                )
-                used_method = "capsule (fallback)"
+                messages, bust_method = run_capsule()
+                used_method = bust_method or "capsule (fallback)"
                 messages = [fallback_note] + messages
         elif method == "silhouette_relief":
             messages = _run_pipeline_capturing(
@@ -352,15 +379,8 @@ def _run_job(
             )
             used_method = method
         else:
-            messages = _run_pipeline_capturing(
-                run_pipeline,
-                image_paths,
-                str(out_stl),
-                target_height_mm=height_mm,
-                use_depth=use_depth,
-                progress_cb=report_progress,
-            )
-            used_method = method
+            messages, bust_method = run_capsule()
+            used_method = bust_method or method
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         with _job_state_lock:
