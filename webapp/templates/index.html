@@ -131,6 +131,7 @@
           <div class="lab-controls" id="lab-controls" hidden>
             <select id="lab-sort" aria-label="Sort">
               <option value="score">Best auto-score</option>
+              <option value="held">Holds the parameters best</option>
               <option value="rating">My rating</option>
               <option value="newest">Newest</option>
               <option value="number">Combination #</option>
@@ -198,6 +199,7 @@
             <button type="button" class="lab-info-btn" id="lab-info-btn">Details</button>
           </div>
           <div class="lab-info" id="lab-info" hidden>
+            <div class="lab-params" id="lab-params"></div>
             <ul id="lab-info-list"></ul>
             <label for="lab-note">Note for Claude</label>
             <textarea id="lab-note" rows="2" placeholder="e.g. face is right but arms too thick"></textarea>

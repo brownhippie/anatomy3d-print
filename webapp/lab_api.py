@@ -217,8 +217,10 @@ def space():
             "count": lab.family_size(key),
             "dims": [{"key": k, "label": label, "options": [o[1] for o in opts]} for k, label, opts in fam["dims"]],
         })
+    params = [{"key": k, "label": label, "kind": kind, "how": how, "held_rule": rule} for k, label, kind, how, rule in lab.PARAMS]
     views = len(lab.FINISHES) * len(lab.SHADING)
     return {
+        "params": params,
         "families": fams,
         "total_builds": lab.total_builds(),
         "finishes": [f[1] for f in lab.FINISHES],
@@ -295,7 +297,7 @@ def _item(run_id: str, r: dict, ratings: dict) -> dict:
         "rating": ratings.get(code),
     }
     if r["status"] == "ok":
-        item.update({k: r.get(k) for k in ("score", "shape_iou", "spike_pct", "watertight", "min_wall_mm", "face_found", "face_err_pct", "seconds")})
+        item.update({k: r.get(k) for k in ("score", "shape_iou", "spike_pct", "watertight", "min_wall_mm", "face_found", "face_err_pct", "seconds", "params", "held_mean")})
         item["thumb_url"] = f"/api/lab/runs/{run_id}/thumb/{code}.png"
         item["model_url"] = f"/api/lab/runs/{run_id}/model/{code}.obj" if r.get("model") else None
     else:
@@ -318,6 +320,8 @@ def get_run(run_id: str, sort: str = "score", family: str = "all", offset: int =
         rows = [r for r in rows if r["status"] == "ok"]
     if sort == "score":
         rows.sort(key=lambda r: (r["status"] != "ok", -(r.get("score") or -1e9)))
+    elif sort == "held":
+        rows.sort(key=lambda r: (r["status"] != "ok", -(r.get("held_mean") or -1e9)))
     elif sort == "rating":
         rows.sort(key=lambda r: (-(ratings.get(r["code"], {}).get("stars") or 0), -(r.get("score") or -1e9)))
     elif sort == "newest":

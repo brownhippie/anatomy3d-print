@@ -14,6 +14,7 @@ current production setting.
 import itertools
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -188,6 +189,7 @@ class LabInputs:
     capsule: Optional[dict]
     capsule_unavailable: Optional[str]
     bust_hint: bool
+    pose: Optional[dict] = None  # joint -> (x_px, y_px) on the full-size photo
 
 
 def prepare_inputs(photo_path: str) -> LabInputs:
@@ -229,7 +231,28 @@ def prepare_inputs(photo_path: str) -> LabInputs:
             capsule, unavailable, bust = None, str(exc), True
     except Exception as exc:  # noqa: BLE001 - PoseUnusableError and friends
         capsule, unavailable = None, str(exc)
-    return LabInputs(rgb, alpha_std, alpha_bir, float(animal_frac), depth, face_mesh, mask, capsule, unavailable, bust)
+    try:
+        pose = _photo_pose(rgb)
+    except Exception:  # noqa: BLE001
+        pose = {}
+    return LabInputs(rgb, alpha_std, alpha_bir, float(animal_frac), depth, face_mesh, mask, capsule, unavailable, bust, pose)
+
+
+def _photo_pose(rgb: np.ndarray) -> dict:
+    import mediapipe as mp
+
+    from .landmarks import MEDIAPIPE_JOINT_INDEX, _get_detector
+
+    res = _get_detector().detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb)))
+    if not res.pose_landmarks:
+        return {}
+    h, w = rgb.shape[:2]
+    out = {}
+    for name, idx in MEDIAPIPE_JOINT_INDEX.items():
+        lm = res.pose_landmarks[0][idx]
+        if lm.visibility >= 0.5 and lm.presence >= 0.5 and 0.0 <= lm.y <= 1.0:
+            out[name] = (float(lm.x * w), float(lm.y * h))
+    return out
 
 
 def _capsule_inputs(photo_path: str, rgb_full: np.ndarray) -> dict:
@@ -434,6 +457,7 @@ def score(code: str, body, inputs: LabInputs) -> "tuple[dict, trimesh.Trimesh, I
     thumb = _three_views(preview, floor, sil, zf, px)
 
     m["face_found"] = None
+    got, head = None, None
     if inputs.face_mesh is not None:
         ys = np.nonzero(inputs.photo_mask)[0]
         my0, my1 = ys.min(), ys.max() + 1
@@ -454,10 +478,23 @@ def score(code: str, body, inputs: LabInputs) -> "tuple[dict, trimesh.Trimesh, I
     if m.get("face_err_pct") is not None:
         s += max(0.0, 30.0 - m["face_err_pct"])
     m["score"] = round(s, 1)
+    try:
+        params = _parameters(m, inputs, preview, floor, sil, got, head)
+        m["params"] = {k: v for k, v in params.items()}
+        m["held_mean"] = round(float(np.mean([v[2] for v in params.values()])), 1)
+    except Exception as exc:  # noqa: BLE001 - a measuring problem shouldn't lose the build
+        m["params_error"] = f"{type(exc).__name__}: {exc}"[:200]
     return m, preview, thumb
 
 
 def _aligned_iou(sil: np.ndarray, mask: np.ndarray) -> float:
+    canvas = _aligned_canvas(sil, mask)
+    return 100.0 * float((canvas & mask).sum()) / float((canvas | mask).sum())
+
+
+def _aligned_canvas(sil: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """The model's front outline scaled to the photo subject's height and
+    centred on it, in the photo's own pixel frame."""
     ys, xs = np.nonzero(mask)
     my0, my1, mx0, mx1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
     sy, sx = np.nonzero(sil)
@@ -469,7 +506,208 @@ def _aligned_iou(sil: np.ndarray, mask: np.ndarray) -> float:
     left = (mx0 + mx1) // 2 - tw // 2
     a0, a1 = max(0, left), min(mask.shape[1], left + tw)
     canvas[my0:my1, a0:a1] = sil_r[:, a0 - left:a1 - left]
-    return 100.0 * float((canvas & mask).sum()) / float((canvas | mask).sum())
+    return canvas
+
+# ---------------------------------------------------------------- parameters
+# Each combination is checked against these. "detected" ones are measured on
+# the photo itself and on the model's front view (2D from the 3D model, same
+# frame); "common" ones are what any printable human figure should hold.
+# held = how well the model keeps it, 0-100 (rule per parameter below).
+PARAMS = [
+    ("outline", "Outline", "detected", "front view of the model over the photo's cutout", "overlap %"),
+    ("aspect", "Height : width", "detected", "whole figure, model vs photo", "100 − % off"),
+    ("w_head", "Head width", "detected", "outline width at the eyes, model vs photo", "100 − % off"),
+    ("w_shoulder", "Shoulder width", "detected", "outline width at the shoulder joints", "100 − % off"),
+    ("w_chest", "Chest width", "detected", "outline width a quarter of the way from shoulders to hips", "100 − % off"),
+    ("w_waist", "Waist width", "detected", "outline width 70% of the way from shoulders to hips", "100 − % off"),
+    ("face_shape", "Face shape (468 points)", "detected", "face points found on the model vs the photo's, error % of eye distance", "100 − 5 × error"),
+    ("eye_span", "Eye spacing", "detected", "outer eye corners ÷ face width", "100 − % off"),
+    ("nose_len", "Nose length", "detected", "bridge to nose base ÷ face height", "100 − % off"),
+    ("mouth_w", "Mouth width", "detected", "mouth corners ÷ face width", "100 − % off"),
+    ("jaw_w", "Jaw width", "detected", "jaw angles ÷ face width", "100 − % off"),
+    ("face_hw", "Face height : width", "detected", "forehead–chin ÷ cheek–cheek", "100 − % off"),
+    ("face_id", "Face embedding match", "detected", "SFace (Apache-2.0) cosine, model's face render vs the photo's face", "100 × cosine"),
+    ("d_head", "Head depth", "common", "front-to-back ÷ side-to-side at the eyes; ANSUR II 1.29", "100 − % off"),
+    ("d_chest", "Chest depth", "common", "front-to-back ÷ side-to-side at the chest; ANSUR II 0.89", "100 − % off"),
+    ("d_waist", "Waist depth", "common", "front-to-back ÷ side-to-side at the waist; ANSUR II 0.72", "100 − % off"),
+    ("sealed", "Sealed", "common", "mesh is watertight", "100 or 0"),
+    ("wall", "Thinnest wall", "common", "2nd-percentile wall thickness; printable at 0.8 mm", "100 × wall ÷ 0.8, max 100"),
+    ("smooth_ok", "No spikes", "common", "share of folds sharper than 60°", "100 − 20 × %"),
+]
+_ANSUR_DEPTH = {"d_head": 1.2914, "d_chest": 0.8907, "d_waist": 0.7212}
+_FACE_IDX = {"eye": (33, 263), "cheek": (234, 454), "brow_chin": (10, 152), "nose": (168, 2), "mouth": (61, 291), "jaw": (172, 397)}
+
+
+def _held_ratio(model: float, target: float) -> int:
+    return int(round(max(0.0, 100.0 * (1.0 - abs(model / target - 1.0))))) if target else 0
+
+
+def _face_props(lm: np.ndarray) -> dict:
+    d = lambda a, b: float(np.linalg.norm(lm[a, :2] - lm[b, :2]))  # noqa: E731
+    fw, fh = d(*_FACE_IDX["cheek"]), d(*_FACE_IDX["brow_chin"])
+    return {"eye_span": d(*_FACE_IDX["eye"]) / fw, "nose_len": d(*_FACE_IDX["nose"]) / fh, "mouth_w": d(*_FACE_IDX["mouth"]) / fw,
+            "jaw_w": d(*_FACE_IDX["jaw"]) / fw, "face_hw": fh / fw}
+
+
+def _levels(inputs: "LabInputs") -> dict:
+    """Photo rows where the widths and depths are measured."""
+    ys = np.nonzero(inputs.photo_mask)[0]
+    my0, my1 = ys.min(), ys.max() + 1
+    pose = inputs.pose or {}
+    lv = {}
+    if inputs.face_mesh is not None:
+        lv["head"] = (float((inputs.face_mesh[33, 1] + inputs.face_mesh[263, 1]) / 2), float(inputs.face_mesh[:468, 0].mean()))
+    sh = [pose[k] for k in ("left_shoulder", "right_shoulder") if k in pose]
+    hp = [pose[k] for k in ("left_hip", "right_hip") if k in pose]
+    if sh:
+        sy, sx = float(np.mean([p[1] for p in sh])), float(np.mean([p[0] for p in sh]))
+        lv["shoulder"] = (sy, sx)
+        if hp:
+            hy = float(np.mean([p[1] for p in hp]))
+            lv["chest"] = (sy + 0.25 * (hy - sy), sx)
+            lv["waist"] = (sy + 0.70 * (hy - sy), sx)
+        else:
+            lv["chest"] = (sy + 0.25 * (my1 - sy), sx)
+    return {k: v for k, v in lv.items() if my0 < v[0] < my1 - 1}
+
+
+def _run_width(row: np.ndarray, col: float) -> int:
+    on = np.flatnonzero(row)
+    if not len(on):
+        return 0
+    c = int(round(col))
+    if not row[min(max(c, 0), len(row) - 1)]:
+        c = int(on[np.argmin(np.abs(on - col))])
+    l = c
+    while l > 0 and row[l - 1]:
+        l -= 1
+    r = c
+    while r < len(row) - 1 and row[r + 1]:
+        r += 1
+    return r - l + 1
+
+
+def _depth_ratio(mesh: trimesh.Trimesh, y: float, x_mid: float) -> Optional[float]:
+    sec = mesh.section(plane_origin=[0.0, y, 0.0], plane_normal=[0.0, 1.0, 0.0])
+    if sec is None:
+        return None
+    best = None
+    for loop in sec.discrete:
+        x0, x1 = loop[:, 0].min(), loop[:, 0].max()
+        if x0 <= x_mid <= x1:
+            area = (x1 - x0) * np.ptp(loop[:, 2])
+            if best is None or area > best[0]:
+                best = (area, x1 - x0, float(np.ptp(loop[:, 2])))
+    return best[2] / best[1] if best and best[1] > 1e-6 else None
+
+
+_sface = {}
+
+
+def _face_embedding(rgb: np.ndarray):
+    """SFace (OpenCV Zoo, Apache-2.0) with YuNet (MIT) to find the face.
+    Downloaded once from the OpenCV Zoo mirror; None if unavailable."""
+    import cv2
+
+    if "rec" not in _sface:
+        try:
+            cache = Path.home() / ".cache" / "anatomy3d-print"
+            cache.mkdir(parents=True, exist_ok=True)
+            paths = {}
+            for key, rel in (("rec", "face_recognition_sface/face_recognition_sface_2021dec.onnx"),
+                             ("det", "face_detection_yunet/face_detection_yunet_2023mar.onnx")):
+                dst = cache / rel.split("/")[-1]
+                if not dst.exists():
+                    import urllib.request
+
+                    tmp = dst.with_suffix(".part")
+                    urllib.request.urlretrieve(f"https://huggingface.co/opencv/opencv_zoo/resolve/main/models/{rel}", tmp)
+                    tmp.rename(dst)
+                paths[key] = str(dst)
+            _sface["rec"] = cv2.FaceRecognizerSF.create(paths["rec"], "")
+            _sface["det"] = cv2.FaceDetectorYN.create(paths["det"], "", (320, 320), 0.6)
+        except Exception as exc:  # noqa: BLE001 - an optional check
+            print(f"Note: face embedding check unavailable ({exc}).")
+            _sface["rec"] = None
+    if _sface["rec"] is None:
+        return None
+    bgr = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)
+    _sface["det"].setInputSize((bgr.shape[1], bgr.shape[0]))
+    _, faces = _sface["det"].detect(bgr)
+    if faces is None or not len(faces):
+        return None
+    f = faces[np.argmax(faces[:, 2] * faces[:, 3])]
+    return _sface["rec"].feature(_sface["rec"].alignCrop(bgr, f))
+
+
+def _photo_face_crop(rgb: np.ndarray, lm: np.ndarray) -> np.ndarray:
+    x0, x1, y0, y1 = lm[:468, 0].min(), lm[:468, 0].max(), lm[:468, 1].min(), lm[:468, 1].max()
+    cx, cy, side = (x0 + x1) / 2, (y0 + y1) / 2, 1.9 * max(x1 - x0, y1 - y0)
+    h, w = rgb.shape[:2]
+    crop = rgb[int(max(0, cy - side / 2)):int(min(h, cy + side / 2)), int(max(0, cx - side / 2)):int(min(w, cx + side / 2))]
+    im = Image.fromarray(crop)
+    zoom = 560.0 / max(im.size)
+    return np.asarray(im.resize((max(1, int(im.width * zoom)), max(1, int(im.height * zoom))), Image.LANCZOS))
+
+
+def _parameters(m: dict, inputs: "LabInputs", preview: trimesh.Trimesh, floor: float, sil: np.ndarray, render_face, head_img) -> dict:
+    """{key: [model value, photo/target value, held 0-100]}; a key is left
+    out when it can't apply to this photo (no face, no hips, ...)."""
+    out = {}
+    mask = inputs.photo_mask
+    ys, xs = np.nonzero(mask)
+    my0, my1, mx0, mx1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    canvas = _aligned_canvas(sil, mask)
+    out["outline"] = [m["shape_iou"], 100.0, int(round(m["shape_iou"]))]
+    cy, cx = np.nonzero(canvas)
+    if len(cx):
+        ma, pa = (cy.max() - cy.min() + 1) / (cx.max() - cx.min() + 1), (my1 - my0) / (mx1 - mx0)
+        out["aspect"] = [round(ma, 3), round(pa, 3), _held_ratio(ma, pa)]
+    lv = _levels(inputs)
+    for part in ("head", "shoulder", "chest", "waist"):
+        if part in lv:
+            row, col = lv[part]
+            r = int(round(row))
+            pw, mw = _run_width(mask[r], col), _run_width(canvas[r], col)
+            if pw:
+                out[f"w_{part}"] = [mw, pw, _held_ratio(mw, pw) if mw else 0]
+    if inputs.face_mesh is not None:
+        if render_face is None:
+            for k in ("face_shape", "eye_span", "nose_len", "mouth_w", "jaw_w", "face_hw"):
+                out[k] = [None, None, 0]
+        else:
+            nme = m.get("face_err_pct")
+            out["face_shape"] = [nme, 0.0, int(round(max(0.0, 100.0 - 5.0 * nme)))]
+            mp_, pp = _face_props(render_face), _face_props(inputs.face_mesh)
+            for k in mp_:
+                out[k] = [round(mp_[k], 3), round(pp[k], 3), _held_ratio(mp_[k], pp[k])]
+        key = id(inputs)
+        if key not in _sface:
+            _sface[key] = _face_embedding(_photo_face_crop(inputs.rgb, inputs.face_mesh))
+        pe = _sface.get(key)
+        re_ = _face_embedding(head_img) if head_img is not None and pe is not None else None
+        if pe is not None:
+            import cv2
+
+            cos = float(_sface["rec"].match(pe, re_, cv2.FaceRecognizerSF_FR_COSINE)) if re_ is not None else None
+            out["face_id"] = [None if cos is None else round(cos, 3), 1.0, int(round(100 * max(0.0, cos))) if cos is not None else 0]
+    if inputs.animal_frac <= 0.15:
+        top = float(preview.vertices[:, 1].max())
+        above = preview.vertices[preview.vertices[:, 1] > floor]
+        mx_c, px_c = (above[:, 0].min() + above[:, 0].max()) / 2, (mx0 + mx1) / 2
+        scale = (top - floor) / (my1 - my0)
+        for part, key in (("head", "d_head"), ("chest", "d_chest"), ("waist", "d_waist")):
+            if part in lv:
+                row, col = lv[part]
+                ratio = _depth_ratio(preview, top - (row - my0) * scale, mx_c + (col - px_c) * scale)
+                if ratio is not None:
+                    t = _ANSUR_DEPTH[key]
+                    out[key] = [round(ratio, 2), t, _held_ratio(ratio, t)]
+    out["sealed"] = [m["watertight"], True, 100 if m["watertight"] else 0]
+    out["wall"] = [m["min_wall_mm"], 0.8, int(round(min(100.0, 100.0 * max(0.0, m["min_wall_mm"]) / 0.8)))]
+    out["smooth_ok"] = [m["spike_pct"], 0.0, int(round(max(0.0, 100.0 - 20.0 * m["spike_pct"])))]
+    return out
+
 
 SCORE_FORMULA = (
     "score = shape match % − 4 × spikes % − 25 if not sealed − 20 if thinnest wall < 0.8 mm "

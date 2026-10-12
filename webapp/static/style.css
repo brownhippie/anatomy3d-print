@@ -740,3 +740,15 @@ button.secondary:hover { border-color: var(--accent); }
 .seg button { flex: 1; min-width: 0; padding: 8px 4px; background: transparent; color: inherit; border: 0; border-left: 1px solid var(--border); font: inherit; font-size: 13px; cursor: pointer; }
 .seg button:first-child { border-left: 0; }
 .seg button[aria-pressed="true"] { background: var(--accent); color: #0b1220; font-weight: 600; }
+
+/* Lab: parameters held */
+.lab-params { display: grid; gap: 3px; }
+.lab-params-head { font-weight: 600; color: var(--text); margin-bottom: 2px; }
+.lab-param { display: grid; grid-template-columns: minmax(0, 9.5em) minmax(0, 1fr) 2.2em; grid-template-areas: "n b v" "n r r"; gap: 0 8px; align-items: center; }
+.lab-param-name { grid-area: n; color: var(--text); font-size: 12px; }
+.lab-param-name em { display: block; font-style: normal; font-size: 10.5px; color: var(--text-dim); }
+.lab-param-bar { grid-area: b; height: 7px; background: var(--border); border-radius: 4px; overflow: hidden; }
+.lab-param-bar i { display: block; height: 100%; border-radius: 4px; }
+.lab-param-bar i.good { background: var(--ok); } .lab-param-bar i.mid { background: var(--warn); } .lab-param-bar i.bad { background: var(--err); }
+.lab-param-val { grid-area: v; text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+.lab-param-raw { grid-area: r; font-size: 10.5px; font-variant-numeric: tabular-nums; }

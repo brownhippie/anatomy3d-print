@@ -1035,6 +1035,24 @@ function labPaintStars(n) {
   document.querySelectorAll("#lab-stars button").forEach((b) => b.classList.toggle("on", Number(b.dataset.star) <= n));
 }
 
+// How well this build holds each parameter (detected from the photo, or
+// common to any printable figure), as a bar per parameter.
+function labParamsHtml(item) {
+  const spec = (labState.space && labState.space.params) || [];
+  if (!item.params || !spec.length) return "";
+  const show = (v) => (v === null || v === undefined ? "–" : typeof v === "boolean" ? (v ? "yes" : "no") : String(v));
+  const rows = spec.filter((p) => item.params[p.key]).map((p) => {
+    const [model, target, held] = item.params[p.key];
+    const cls = held >= 85 ? "good" : held >= 60 ? "mid" : "bad";
+    return `<div class="lab-param" title="${escapeHtml(p.how)} · held = ${escapeHtml(p.held_rule)}">`
+      + `<span class="lab-param-name">${escapeHtml(p.label)}<em>${p.kind === "detected" ? "photo" : "common"}</em></span>`
+      + `<span class="lab-param-bar"><i class="${cls}" style="width:${Math.max(2, held)}%"></i></span>`
+      + `<span class="lab-param-val">${held}</span>`
+      + `<span class="lab-param-raw">${escapeHtml(show(model))} vs ${escapeHtml(show(target))}</span></div>`;
+  }).join("");
+  return `<div class="lab-params-head">Parameters held${item.held_mean != null ? ` · average ${item.held_mean}` : ""}</div>${rows}`;
+}
+
 async function labOpen(i) {
   if (i >= labState.items.length && labState.items.length < labState.count) await labLoadItems(false);
   const item = labState.items[i];
@@ -1045,6 +1063,7 @@ async function labOpen(i) {
   document.getElementById("lab-bar-sub").textContent = item.status === "ok"
     ? `score ${item.score} · shape ${item.shape_iou}% · spikes ${item.spike_pct}% · wall ${item.min_wall_mm}mm${item.face_found === null ? "" : item.face_found ? ` · face ${item.face_err_pct}%` : " · no face found"}`
     : `failed: ${item.error || ""}`;
+  document.getElementById("lab-params").innerHTML = labParamsHtml(item);
   document.getElementById("lab-info-list").innerHTML = (item.template ? `<li><b>${escapeHtml(item.template)}</b></li>` : "")
     + item.options.map((o) => `<li>${escapeHtml(o)}</li>`).join("");
   document.getElementById("lab-note").value = item.rating ? item.rating.note : "";
