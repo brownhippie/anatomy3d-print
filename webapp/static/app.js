@@ -41,6 +41,8 @@ const settingsDrawerClose = document.getElementById("settings-drawer-close");
 let selectedFiles = [];
 let trellisStatusLoaded = false;
 
+const mainEl = document.querySelector("main");
+
 function setActiveTab(name) {
   tabBtns.forEach((btn) => {
     const active = btn.dataset.tab === name;
@@ -50,6 +52,19 @@ function setActiveTab(name) {
   tabPanels.forEach((panel) => {
     panel.classList.toggle("active", panel.id === `tab-${name}`);
   });
+  // On a phone, "Viewer" takes over the full screen (the panel collapses to
+  // just its tab bar) instead of the 3D model living in a sliver below an
+  // upload/settings form -- see the main.viewer-active rules in style.css.
+  mainEl.classList.toggle("viewer-active", name === "viewer");
+  // #stage is `display:none` on a phone until this tab is active (that's
+  // the whole fix above), which means its own size was 0x0 for however
+  // long it sat hidden -- including at page load, when initViewer()'s own
+  // first resize() ran. Nothing re-measures it just because CSS display
+  // flips, so without this the canvas stays stuck at that stale 0x0 size
+  // (confirmed directly: the model loads fine but the canvas paints
+  // nothing, a blank Viewer tab) -- piggyback on the resize listener
+  // initViewer() already wires up, now that #stage actually has a size.
+  if (name === "viewer") window.dispatchEvent(new Event("resize"));
 }
 
 tabBtns.forEach((btn) => btn.addEventListener("click", () => setActiveTab(btn.dataset.tab)));
@@ -276,12 +291,12 @@ function setStatus(kind, text) {
   statusBox.className = `status-box show ${kind}`;
   statusBox.textContent = text;
   emptyResultHint.style.display = "none";
-  // Any status (success or error) means there's something to look at —
-  // jump to the Result tab instead of leaving it set on a tab the user
-  // isn't looking at (the exact failure mode the old flat single-panel
-  // layout had: a generate error could land below the fold with no
-  // indication anything happened).
-  setActiveTab("result");
+  // A generated model is what someone actually wants to see -- jump
+  // straight to the Viewer tab for it. An error has no model to show, so
+  // it still jumps to Result (the exact failure mode the old flat
+  // single-panel layout had: a generate error could land below the fold
+  // with no indication anything happened).
+  setActiveTab(kind === "ok" ? "viewer" : "result");
 }
 function clearStatus() {
   statusBox.className = "status-box";
@@ -666,6 +681,8 @@ fetch("/api/version")
   generateBtn.disabled = true;
   loadingOverlay.classList.add("show");
   loadingMsg.textContent = "Picking back up a model that was already generating…";
-  setActiveTab("result");
+  // The loading spinner itself lives inside .stage (the Viewer tab's
+  // content), so that's the tab that needs to be active to see it.
+  setActiveTab("viewer");
   pollJob(jobId);
 })();

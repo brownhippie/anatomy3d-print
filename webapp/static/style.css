@@ -125,21 +125,26 @@ main {
 }
 
 @media (max-width: 860px) {
-  /* Stacked layout: upload panel on top, viewer below. A %-of-vh grid
-     row (the previous fix) still came up short on a real device:
-     confirmed directly against a real phone screenshot, build 0586ac9,
-     showing the panel eating past half the screen and the 3D model
-     reduced to a sliver in the corner. `vh` on a phone is the layout
-     viewport, not necessarily what's actually visible -- it can run
-     taller than the real drawable area (status bar, WebView chrome),
-     so a row sized as a fraction of it can still overflow. Flex instead
-     of a vh-sized grid row: the panel is capped at max-height and the
-     stage gets `flex: 1 1 auto`, which resolves against main's real,
-     already-laid-out box -- not a separately recomputed vh -- so the
-     viewer reliably gets whatever room the panel didn't use. */
+  /* A vh-based split (the previous two fixes, build 0586ac9) still put
+     the viewer on uneven footing with the upload/settings panel sharing
+     one screen -- on a real device the panel could still end up most of
+     what's visible, same complaint, same screenshot proof as before.
+     Stop splitting the screen at all: "Viewer" is its own tab, same as
+     Photos and Result, so each one gets the FULL screen when selected
+     instead of a fraction of it. The stage stays hidden until that tab
+     is active (main.viewer-active, toggled in app.js's setActiveTab). */
   main { display: flex; flex-direction: column; }
-  .panel { flex: 0 1 auto; max-height: 40vh; min-height: 0; }
-  .stage { flex: 1 1 320px; min-height: 280px; }
+  .panel { flex: 1 1 auto; min-height: 0; }
+  .stage { display: none; }
+  main.viewer-active .panel { flex: 0 0 auto; }
+  main.viewer-active .stage { display: block; flex: 1 1 auto; min-height: 60vh; }
+}
+
+@media (min-width: 861px) {
+  /* Desktop never had this complaint -- the viewer already sits in its
+     own always-visible pane next to the panel -- so the Viewer tab (a
+     phone-only concept here) has nothing to do there. */
+  #tab-btn-viewer { display: none; }
 }
 
 .panel {

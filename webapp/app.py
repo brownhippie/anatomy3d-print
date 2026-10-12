@@ -159,7 +159,19 @@ def _job_dir(job_id: str) -> Path:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (WEBAPP_DIR / "templates" / "index.html").read_text()
+    # style.css/app.js are referenced by plain /static/... URLs with no
+    # cache-busting of their own, so a browser (or an Android WebView,
+    # which tends to cache harder) can keep serving an old cached copy of
+    # them even once a fresh index.html has landed -- a real, confirmed
+    # cause of a deploy visibly not taking effect on a phone (the page
+    # loads, the build tag even updates since that's a live fetch, but
+    # the old CSS/JS is still what's actually running). Tagging both URLs
+    # with the current commit makes them a new URL on every deploy, so
+    # the stale cached copy is simply never asked for again.
+    html = (WEBAPP_DIR / "templates" / "index.html").read_text()
+    html = html.replace('href="/static/style.css"', f'href="/static/style.css?v={_COMMIT}"')
+    html = html.replace('src="/static/app.js"', f'src="/static/app.js?v={_COMMIT}"')
+    return html
 
 
 @app.get("/health")
