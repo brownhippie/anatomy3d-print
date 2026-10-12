@@ -20,10 +20,13 @@ from typing import Optional
 import numpy as np
 import trimesh
 from PIL import Image
+from scipy import sparse
 from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinates
+from scipy.sparse.linalg import spsolve
 from skimage.measure import marching_cubes
 
 from .mesh_types import BodyMesh
+from .procedural_body import smooth_grid_terracing
 
 # A rough, illustrative figure-proportion convention (legs roughly as
 # long as the subject's own visible height, times this factor) -- NOT
@@ -305,6 +308,33 @@ def _layered_detail_rescue(sampled, grid_mask, real_grid_mask, global_std):
     return rescue * _LAYER_RESCUE_STRENGTH
 
 
+def _inflation_height(mask: np.ndarray) -> np.ndarray:
+    """Half-thickness (in grid cells) of a smooth, rounded inflation of
+    `mask`: solves the Poisson equation lap(h) = -1 inside the outline with
+    h = 0 outside, then returns sqrt(2h). For a strip of half-width a that
+    is exactly a half-circle cross-section of depth a; for a disc it is a
+    flattened dome. The solution is smooth everywhere, so it has no seams
+    where one part of the outline (an arm) joins another (the torso).
+    `mask` must have at least one False cell on every side (callers pad)."""
+    ys, xs = np.nonzero(mask)
+    n = len(ys)
+    index = np.full(mask.shape, -1, dtype=np.int64)
+    index[ys, xs] = np.arange(n)
+    rows, cols, vals = [np.arange(n)], [np.arange(n)], [np.full(n, 4.0)]
+    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        neighbour = index[ys + dy, xs + dx]
+        inside = neighbour >= 0
+        rows.append(np.arange(n)[inside])
+        cols.append(neighbour[inside])
+        vals.append(np.full(int(inside.sum()), -1.0))
+    laplacian = sparse.csr_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n)
+    )
+    h = np.zeros(mask.shape, dtype=np.float64)
+    h[ys, xs] = spsolve(laplacian, np.ones(n))
+    return np.sqrt(2.0 * np.maximum(h, 0.0)).astype(np.float32)
+
+
 def build_silhouette_relief_mesh(
     alpha: np.ndarray,
     target_height_mm: float = 150.0,
@@ -475,53 +505,13 @@ def build_silhouette_relief_mesh(
     width_frac = np.clip((dist - dist_min) / max(dist_max - dist_min, 1e-6), 0.0, 1.0)
     depth_scale_field = limb_depth_scale * (1.0 - width_frac) + depth_scale * width_frac
 
-    # `dist` itself, scanned across a row, is a near-perfect tent: it rises
-    # ~linearly from 0 at the silhouette edge to a peak at that row's own
-    # widest point, then falls ~linearly back to 0 (the nearest background
-    # pixel for most interior points is just the nearest left/right edge).
-    # Using it directly as half_thickness's shape (as this used to) scales
-    # that straight-line ramp by a constant, which is still a straight
-    # line -- a sharp-edged diamond in cross-section, confirmed directly
-    # by slicing a real exported mesh at a fixed height, not assumed.
-    # Real anatomy doesn't meet its own outline at a sharp wedge; a round
-    # cross-section meets it tangent to the surface, curving smoothly.
-    #
-    # row_ridge below re-expresses each row's own tent as a fraction
-    # 0..1 of ITS OWN local peak (computed per contiguous run within that
-    # row, not the whole row, so e.g. two separate legs sharing a row
-    # each get their own ridge instead of one leg borrowing the other's),
-    # then reshapes that fraction through a quarter-ellipse
-    # (sqrt(1-(1-t)^2)): vertical tangent at t=0 (smooth into the edge,
-    # no wedge) flattening to horizontal at t=1 (a rounded crown, not a
-    # knife-ridge). At the ridge itself (t=1) this reduces to exactly the
-    # old dist*depth_scale_field value, so the peak amplitude -- and
-    # everything depth_scale/limb_depth_scale already control -- is
-    # unchanged; only the transition in between is curved instead of
-    # straight.
-    row_ridge = np.zeros_like(dist)
-    for y in range(dist.shape[0]):
-        row_mask = grid_mask[y]
-        if not row_mask.any():
-            continue
-        edges = np.flatnonzero(np.diff(np.concatenate(([0], row_mask.astype(np.int8), [0]))))
-        for s, e in zip(edges[0::2], edges[1::2]):
-            row_ridge[y, s:e] = dist[y, s:e].max()
-    t = np.divide(dist, row_ridge, out=np.zeros_like(dist), where=row_ridge > 1e-6)
-    t = np.clip(t, 0.0, 1.0)
-    curve_t = np.sqrt(np.clip(1.0 - (1.0 - t) ** 2, 0.0, 1.0))
-    half_thickness_raw = row_ridge * curve_t * depth_scale_field
-    # A half-thickness that touches exactly 0 right at the mask edge is a
-    # literal cusp (zero-measure point) -- mathematically degenerate, and
-    # left small non-manifold gaps in marching_cubes' output (confirmed
-    # directly: dozens of open boundary edges on a real test mesh). A
-    # HARD floor (np.maximum) fixed the cusp but introduced a sharp
-    # discontinuity in half_thickness right at the mask boundary instead,
-    # which made the gap problem worse, not better (confirmed directly).
-    # A smooth soft-floor -- sqrt(raw^2 + floor^2) -- has no
-    # discontinuity anywhere (continuous at the true edge too, same as
-    # the unfloored version) while still never reaching exactly 0.
-    min_half_thickness = max(1.0 / scale, 0.5)
-    half_thickness = np.where(grid_mask, np.sqrt(half_thickness_raw**2 + min_half_thickness**2), 0.0)
+    # Round cross-sections from one smooth 2D field. A per-row version
+    # (each row scaled to its own widest point) stacked into horizontal
+    # ripples, since neighbouring rows' peaks differ, and cut grooves where
+    # an arm's row-run merged into the torso's.
+    half_thickness_raw = _inflation_height(grid_mask) / scale * depth_scale_field
+    half_thickness = np.where(grid_mask, half_thickness_raw, 0.0)
+    min_half_thickness = 1.0 / scale  # one grid cell, used by the depth bias floor below
 
     # mid/half_span generalize the symmetric lens (front = +half_thickness,
     # back = -half_thickness) to an optionally asymmetric one -- with no
@@ -590,23 +580,27 @@ def build_silhouette_relief_mesh(
     # point is itself a small degenerate case, same family of problem as
     # the edge cusp above.
     z_max = true_max * 1.05
-    # z-resolution must be fine enough to resolve the THINNEST region
-    # (the floor thickness on arms/legs), not just coarse enough for the
-    # overall depth -- a global step size set only from z_max left a
-    # limb's own thin cross-section spanning less than one z-step, which
-    # marching_cubes could not close into a clean tube (confirmed
-    # directly: open boundary edges concentrated entirely on thin-limb
-    # regions, not the torso, before this fix). At least 3 steps across
-    # the floor thickness closes it.
-    dz_needed = min_half_thickness / 3.0
-    gz = max(4, round(2 * z_max / dz_needed) + 4)
+    # Depth steps the size of the grid cells (slightly finer), so voxels
+    # are about cube-shaped and the rounded edges resolve evenly.
+    dz_target = 0.6 / scale
+    gz = max(4, round(2 * z_max / dz_target) + 4)
+
+    # The solid is (z - mid)^2 <= G. Inside the outline G = half_span^2,
+    # which falls linearly to ~0 at the edge; outside it continues below
+    # zero at that same rate instead of being cut off by the hard mask,
+    # so the front and back surfaces meet in a rounded edge rather than a
+    # seam-like wall around the whole outline.
+    span_sq = np.where(grid_mask, half_span.astype(np.float64) ** 2, 0.0)
+    dist_grid = distance_transform_edt(grid_mask)
+    near_edge = grid_mask & (dist_grid <= 2.0)
+    edge_slope = float(np.median(span_sq[near_edge] / dist_grid[near_edge])) if near_edge.any() else 1.0
+    G = np.where(grid_mask, span_sq, -edge_slope * distance_transform_edt(~grid_mask)).astype(np.float32)
 
     zs = np.linspace(-z_max, z_max, gz)
     dz = zs[1] - zs[0]
     field = np.empty((gz, gh, gw), dtype=np.float32)
     for i, z in enumerate(zs):
-        field[i] = (z - mid) ** 2 - half_span**2
-    field[:, ~grid_mask] = 1.0
+        field[i] = (z - mid) ** 2 - G
 
     verts, faces, _, _ = marching_cubes(field, level=0.0, spacing=(dz, 1.0 / scale, 1.0 / scale))
 
@@ -626,6 +620,7 @@ def build_silhouette_relief_mesh(
     components = mesh.split(only_watertight=False)
     if len(components) > 1:
         mesh = max(components, key=lambda c: c.vertices.shape[0])
+    smooth_grid_terracing(mesh)
     verts, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
 
     vz, vrow, vcol = verts[:, 0], verts[:, 1], verts[:, 2]

@@ -388,10 +388,10 @@ function initViewer() {
     light.target = aimAhead;
     camera.add(light);
   };
-  addCameraLight(0xfff1e0, 2.4, -0.7, 0.9, 0.3); // key: upper left, warm
-  addCameraLight(0xcfe0ff, 0.6, 0.9, 0.1, 0.2); // fill: right, cool
-  addCameraLight(0xffffff, 1.8, 0.6, 0.8, -3); // rim: from behind, outlines the figure
-  scene.add(new THREE.HemisphereLight(0xe8eefc, 0x2a2622, 0.55));
+  addCameraLight(0xfff0e0, 1.9, -0.7, 0.9, 0.3); // key: upper left, warm
+  addCameraLight(0xffe9d8, 0.9, 0.9, 0.1, 0.2); // fill: right, keeps shadows soft
+  addCameraLight(0xffffff, 1.2, 0.6, 0.8, -3); // rim: from behind, outlines the figure
+  scene.add(new THREE.HemisphereLight(0xfff6ee, 0x6b5a4c, 1.0));
 
   const groundGeo = new THREE.PlaneGeometry(2000, 2000);
   const groundMat = new THREE.MeshStandardMaterial({
@@ -483,14 +483,17 @@ function frameCamera(object3d) {
   controls.update();
 }
 
-// Ivory resin: warm off-white, a soft satin sheen from the clearcoat, so
-// form reads from light and shadow alone without any photo colour.
+// Soft sand clay: a warm, light, mostly matte finish so form reads from
+// gentle light and shadow without any photo colour.
 const FIGURE_MATERIAL = new THREE.MeshPhysicalMaterial({
-  color: 0xe6dccb,
-  roughness: 0.5,
+  color: 0xf0d6bd,
+  roughness: 0.62,
   metalness: 0,
-  clearcoat: 0.35,
-  clearcoatRoughness: 0.4,
+  clearcoat: 0.12,
+  clearcoatRoughness: 0.6,
+  sheen: 0.4,
+  sheenColor: new THREE.Color(0xfff0e0),
+  sheenRoughness: 0.8,
 });
 
 // The exported OBJs carry no normals, so OBJLoader shades every triangle
@@ -502,13 +505,20 @@ function smoothShade(geometry, creaseDeg = 50) {
   const pos = geometry.attributes.position;
   const corners = pos.count;
   const faces = corners / 3;
+  // fn: unit face normals (for the crease test); fw: the same normals
+  // scaled by face area (for the average). Grid-extracted meshes are full
+  // of thin sliver triangles laid out in rows; giving each an equal vote
+  // skews the normals row by row and shades as horizontal bands.
   const fn = new Float32Array(faces * 3);
+  const fw = new Float32Array(faces * 3);
   const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
   for (let f = 0; f < faces; f++) {
     a.fromBufferAttribute(pos, 3 * f);
     b.fromBufferAttribute(pos, 3 * f + 1).sub(a);
     c.fromBufferAttribute(pos, 3 * f + 2).sub(a);
-    b.cross(c).normalize();
+    b.cross(c);
+    fw[3 * f] = b.x; fw[3 * f + 1] = b.y; fw[3 * f + 2] = b.z;
+    b.normalize();
     fn[3 * f] = b.x; fn[3 * f + 1] = b.y; fn[3 * f + 2] = b.z;
   }
   const byPoint = new Map();
@@ -526,8 +536,9 @@ function smoothShade(geometry, creaseDeg = 50) {
     const fx = fn[3 * f], fy = fn[3 * f + 1], fz = fn[3 * f + 2];
     let sx = 0, sy = 0, sz = 0;
     for (const g of byPoint.get(keys[i])) {
-      const gx = fn[3 * g], gy = fn[3 * g + 1], gz = fn[3 * g + 2];
-      if (fx * gx + fy * gy + fz * gz >= cosCrease) { sx += gx; sy += gy; sz += gz; }
+      if (fx * fn[3 * g] + fy * fn[3 * g + 1] + fz * fn[3 * g + 2] >= cosCrease) {
+        sx += fw[3 * g]; sy += fw[3 * g + 1]; sz += fw[3 * g + 2];
+      }
     }
     const len = Math.hypot(sx, sy, sz) || 1;
     normals[3 * i] = sx / len; normals[3 * i + 1] = sy / len; normals[3 * i + 2] = sz / len;

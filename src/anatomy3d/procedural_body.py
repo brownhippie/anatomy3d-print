@@ -16,6 +16,7 @@ This trades realism for being entirely free of third-party model weights
 or training data licensing — everything here is either measured directly
 from the input photo or a well-known, unencumbered formula.
 """
+import itertools
 from typing import Optional
 
 import numpy as np
@@ -289,6 +290,47 @@ def _capsule_sdf(
     return dist - radius
 
 
+def _group_sdf(points: np.ndarray, pieces: list) -> np.ndarray:
+    """One segment's field. A silhouette chain's pieces run end to end
+    along one straight segment; unioning them as separate capsules left a
+    shallow crease at every join (each piece's rounded end cap doesn't line
+    up with the next piece's taper), which shaded as rings around the waist
+    and limbs. Evaluate the chain as one capsule whose radius and depth
+    ratio are interpolated along its length instead: no joins, no rings.
+    Anything that isn't a clean end-to-end chain falls back to a union."""
+    if len(pieces) == 1:
+        a, b, ra, rb, dra, drb, _ = pieces[0]
+        return _capsule_sdf(points, a, b, ra, rb, dra, drb)
+    joined = all(np.allclose(pieces[i][1], pieces[i + 1][0]) for i in range(len(pieces) - 1))
+    if not joined:
+        sdf = None
+        for a, b, ra, rb, dra, drb, _ in pieces:
+            piece = _capsule_sdf(points, a, b, ra, rb, dra, drb)
+            sdf = piece if sdf is None else np.minimum(sdf, piece)
+        return sdf
+    knots = [pieces[0][0]] + [p[1] for p in pieces]
+    a, b = knots[0], knots[-1]
+    ba = b - a
+    ba_dot = float(np.dot(ba, ba))
+    along = np.cumsum([0.0] + [float(np.linalg.norm(knots[i + 1] - knots[i])) for i in range(len(pieces))])
+    ts = along / along[-1] if along[-1] > 1e-9 else np.linspace(0.0, 1.0, len(knots))
+    radii = [p[2] for p in pieces] + [pieces[-1][3]]
+    depth_ratios = [p[4] for p in pieces] + [pieces[-1][5]]
+    h = np.clip(((points - a) @ ba) / ba_dot, 0.0, 1.0) if ba_dot > 1e-9 else np.zeros(len(points))
+    offset = points - (a + h[:, None] * ba)
+    offset[:, 2] = offset[:, 2] / np.interp(h, ts, depth_ratios)
+    return np.linalg.norm(offset, axis=1) - np.interp(h, ts, radii)
+
+
+def smooth_grid_terracing(mesh: trimesh.Trimesh, iterations: int = 8) -> None:
+    """Marching cubes puts every vertex on a grid line, so near-vertical
+    surfaces (a torso, a limb) come out as faint horizontal terraces, one
+    per grid layer, that read as rings once shaded smoothly. Taubin
+    smoothing irons those out without shrinking the body the way plain
+    Laplacian smoothing would. Modifies `mesh` in place."""
+    trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=0.53, iterations=iterations)
+
+
 def _smooth_min(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
     hh = np.maximum(k - np.abs(a - b), 0.0) / k
     return np.minimum(a, b) - hh * hh * k * 0.25
@@ -343,12 +385,11 @@ def _chain_from_silhouette(
     per photo) — each sample's radius is a direct lookup into it, not a
     ray-march. See SILHOUETTE_RADIUS_MIN_FRAC/MAX_FRAC's for the safety
     clamp still applied on top. Every piece shares `group` so
-    build_body_mesh's SDF accumulation hard-unions them together (they
-    already meet exactly at shared endpoints with matching radius — no
-    seam to smooth over) instead of smooth-min'ing each of the n_samples
-    joints, which would otherwise compound a small fillet-bulge at every
-    one of them into a visibly fatter limb than any individual
-    measurement called for."""
+    build_body_mesh evaluates the whole chain as one continuous shape (see
+    _group_sdf) instead of smooth-min'ing each of the n_samples joints,
+    which would otherwise compound a small fillet-bulge at every one of
+    them into a visibly fatter limb than any individual measurement
+    called for."""
     ba = b - a
     length = np.linalg.norm(ba)
     if length < 1e-6:
@@ -369,6 +410,14 @@ def _chain_from_silhouette(
             measured_r = float(np.clip(measured_r, lo, hi))
         points.append(pt)
         radii.append(measured_r)
+
+    # Each sample is a raw lookup along the segment's centre line, so small
+    # pixel-level noise makes the radius profile zig-zag; every kink shades
+    # as a ring around the limb or waist. Smooth along the chain (ends kept)
+    # so broad changes like a narrower waist survive and the jitter doesn't.
+    radii = np.asarray(radii, dtype=float)
+    for _ in range(3):
+        radii[1:-1] = 0.25 * radii[:-2] + 0.5 * radii[1:-1] + 0.25 * radii[2:]
 
     chain = []
     for i in range(n_samples):
@@ -1047,27 +1096,11 @@ def build_body_mesh(
     # limb's own radius distorts and can fragment that limb.
     blend_k = min(all_radii) * blend_k_frac * 5.0
     field = None
-    group_field = None
-    current_group = None
-    for a, b, ra, rb, dra, drb, grp in capsules:
-        sdf = _capsule_sdf(points, a, b, ra, rb, dra, drb)
-        if grp == current_group:
-            # Same logical segment (a silhouette chain's own pieces, or a
-            # single-capsule segment on its own): these already meet
-            # exactly at a shared endpoint with matching radius, so a
-            # plain hard union is already seamless — smooth-min would only
-            # add an unwanted fillet-bulge at every one of these joints,
-            # which compounds across a 6-piece chain into a visibly fatter
-            # limb than any individual measurement called for (measured
-            # directly: this was the actual cause of limbs ballooning and
-            # fusing into the torso on a real test photo before this fix).
-            group_field = np.minimum(group_field, sdf)
-        else:
-            if group_field is not None:
-                field = group_field if field is None else _smooth_min(field, group_field, blend_k)
-            group_field = sdf
-            current_group = grp
-    if group_field is not None:
+    # Pieces of one logical segment (a silhouette chain) are evaluated as a
+    # single shape, not unioned piece by piece -- see _group_sdf. Different
+    # segments still blend into each other with smooth-min.
+    for _grp, pieces in itertools.groupby(capsules, key=lambda cap: cap[6]):
+        group_field = _group_sdf(points, list(pieces))
         field = group_field if field is None else _smooth_min(field, group_field, blend_k)
 
     if face_capsules:
@@ -1122,6 +1155,7 @@ def build_body_mesh(
     components = mesh.split(only_watertight=False)
     if len(components) > 1:
         mesh = max(components, key=lambda c: c.vertices.shape[0])
+    smooth_grid_terracing(mesh)
     verts, faces = mesh.vertices, mesh.faces
 
     if depth_rgb is not None:
