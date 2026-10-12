@@ -22,6 +22,7 @@ from typing import List, Optional
 
 import numpy as np
 import trimesh
+from trimesh.exchange.obj import export_obj
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -127,6 +128,29 @@ def _sweep_old_jobs() -> None:
         expired = [jid for jid, s in _job_state.items() if now - s.get("created_at", now) > JOB_TTL_SECONDS]
         for jid in expired:
             _job_state.pop(jid, None)
+
+
+# The full-detail OBJ (kept for download) can run ~1M triangles / 40MB on
+# Silhouette relief -- far too much for a phone to fetch just to preview.
+PREVIEW_MAX_FACES = 100_000
+
+
+def _write_preview(obj_path: Path, out_path: Path) -> bool:
+    """A lighter copy of the OBJ for the in-app viewer only, when the full
+    one is over PREVIEW_MAX_FACES. Shape only: the viewer applies its own
+    material and computes its own smooth normals. Returns False (viewer
+    falls back to the full OBJ) when no preview is needed or it fails."""
+    try:
+        full = trimesh.load(str(obj_path), process=False, force="mesh")
+        if len(full.faces) <= PREVIEW_MAX_FACES:
+            return False
+        preview = full.simplify_quadric_decimation(face_count=PREVIEW_MAX_FACES)
+        out_path.write_text(
+            export_obj(preview, include_normals=False, include_color=False, include_texture=False, digits=4)
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _write_cutout(image_path: str, out_path: Path) -> bool:
@@ -395,11 +419,15 @@ def _run_job(
     # multi-photo visual-hull mode.
     has_cutout = _write_cutout(image_paths[0], job_dir / "cutout.png")
 
+    report_progress("Preparing 3D preview", 0.99)
+    has_preview = _write_preview(job_dir / "model.obj", job_dir / "preview.obj")
+
     result = {
         "status": "done",
         "created_at": time.time(),
         "job_id": job_id,
         "obj_url": f"/jobs/{job_id}/model.obj",
+        "preview_url": f"/jobs/{job_id}/preview.obj" if has_preview else f"/jobs/{job_id}/model.obj",
         "stl_url": f"/jobs/{job_id}/model.stl",
         "glb_url": f"/jobs/{job_id}/model.glb",
         "messages": messages,
@@ -440,6 +468,14 @@ def get_obj(job_id: str):
     if not path.exists():
         raise HTTPException(404, "Not found.")
     return FileResponse(path, media_type="text/plain", filename="figure.obj")
+
+
+@app.get("/jobs/{job_id}/preview.obj")
+def get_preview(job_id: str):
+    path = _job_dir(job_id) / "preview.obj"
+    if not path.exists():
+        raise HTTPException(404, "Not found.")
+    return FileResponse(path, media_type="text/plain")
 
 
 @app.get("/jobs/{job_id}/model.stl")

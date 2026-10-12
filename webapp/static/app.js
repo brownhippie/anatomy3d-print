@@ -372,14 +372,26 @@ function initViewer() {
     }
   });
 
-  const hemi = new THREE.HemisphereLight(0xaecbff, 0x1a1a1f, 1.1);
-  scene.add(hemi);
-  const dir = new THREE.DirectionalLight(0xffffff, 1.6);
-  dir.position.set(120, 220, 140);
-  scene.add(dir);
-  const fill = new THREE.DirectionalLight(0x6ea8ff, 0.35);
-  fill.position.set(-150, 80, -100);
-  scene.add(fill);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+
+  // Studio lighting that travels with the camera, so whichever side you
+  // orbit to is lit the same way instead of falling into shadow. Positions
+  // are in camera space; each light aims at a point straight ahead.
+  scene.add(camera);
+  const aimAhead = new THREE.Object3D();
+  aimAhead.position.set(0, 0, -1);
+  camera.add(aimAhead);
+  const addCameraLight = (color, intensity, x, y, z) => {
+    const light = new THREE.DirectionalLight(color, intensity);
+    light.position.set(x, y, z);
+    light.target = aimAhead;
+    camera.add(light);
+  };
+  addCameraLight(0xfff1e0, 2.4, -0.7, 0.9, 0.3); // key: upper left, warm
+  addCameraLight(0xcfe0ff, 0.6, 0.9, 0.1, 0.2); // fill: right, cool
+  addCameraLight(0xffffff, 1.8, 0.6, 0.8, -3); // rim: from behind, outlines the figure
+  scene.add(new THREE.HemisphereLight(0xe8eefc, 0x2a2622, 0.55));
 
   const groundGeo = new THREE.PlaneGeometry(2000, 2000);
   const groundMat = new THREE.MeshStandardMaterial({
@@ -471,6 +483,58 @@ function frameCamera(object3d) {
   controls.update();
 }
 
+// Ivory resin: warm off-white, a soft satin sheen from the clearcoat, so
+// form reads from light and shadow alone without any photo colour.
+const FIGURE_MATERIAL = new THREE.MeshPhysicalMaterial({
+  color: 0xe6dccb,
+  roughness: 0.5,
+  metalness: 0,
+  clearcoat: 0.35,
+  clearcoatRoughness: 0.4,
+});
+
+// The exported OBJs carry no normals, so OBJLoader shades every triangle
+// flat, which turns each small step in the mesh into a visible facet.
+// Average each corner's normal over the faces that meet at that point,
+// skipping faces that bend more than creaseDeg away, so curved surfaces
+// shade smoothly while real edges (the base disk's rim) stay sharp.
+function smoothShade(geometry, creaseDeg = 50) {
+  const pos = geometry.attributes.position;
+  const corners = pos.count;
+  const faces = corners / 3;
+  const fn = new Float32Array(faces * 3);
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  for (let f = 0; f < faces; f++) {
+    a.fromBufferAttribute(pos, 3 * f);
+    b.fromBufferAttribute(pos, 3 * f + 1).sub(a);
+    c.fromBufferAttribute(pos, 3 * f + 2).sub(a);
+    b.cross(c).normalize();
+    fn[3 * f] = b.x; fn[3 * f + 1] = b.y; fn[3 * f + 2] = b.z;
+  }
+  const byPoint = new Map();
+  const keys = new Array(corners);
+  for (let i = 0; i < corners; i++) {
+    const k = `${Math.round(pos.getX(i) * 1000)},${Math.round(pos.getY(i) * 1000)},${Math.round(pos.getZ(i) * 1000)}`;
+    keys[i] = k;
+    const list = byPoint.get(k);
+    if (list) list.push(Math.floor(i / 3)); else byPoint.set(k, [Math.floor(i / 3)]);
+  }
+  const cosCrease = Math.cos((creaseDeg * Math.PI) / 180);
+  const normals = new Float32Array(corners * 3);
+  for (let i = 0; i < corners; i++) {
+    const f = Math.floor(i / 3);
+    const fx = fn[3 * f], fy = fn[3 * f + 1], fz = fn[3 * f + 2];
+    let sx = 0, sy = 0, sz = 0;
+    for (const g of byPoint.get(keys[i])) {
+      const gx = fn[3 * g], gy = fn[3 * g + 1], gz = fn[3 * g + 2];
+      if (fx * gx + fy * gy + fz * gz >= cosCrease) { sx += gx; sy += gy; sz += gz; }
+    }
+    const len = Math.hypot(sx, sy, sz) || 1;
+    normals[3 * i] = sx / len; normals[3 * i + 1] = sy / len; normals[3 * i + 2] = sz / len;
+  }
+  geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+}
+
 function loadModel(objUrl) {
   if (currentModel) {
     scene.remove(currentModel);
@@ -484,21 +548,11 @@ function loadModel(objUrl) {
   loader.load(objUrl, (obj) => {
     obj.traverse((child) => {
       if (child.isMesh) {
-        // OBJLoader already parses the extended "v x y z r g b" vertex-color
-        // lines the pipeline now writes (real colors baked from the source
-        // photo — see procedural_body._bake_photo_colors) into
-        // geometry.attributes.color; vertexColors just has to be turned on
-        // to actually use them instead of a flat guessed color. Falls back
-        // to the old flat tint automatically when a mesh has no baked
-        // colors (geometry.attributes.color is then unset).
-        const hasVertexColors = !!child.geometry.attributes.color;
-        child.material = new THREE.MeshStandardMaterial({
-          color: hasVertexColors ? 0xffffff : 0x9fb3d9,
-          vertexColors: hasVertexColors,
-          roughness: 0.55,
-          metalness: 0.05,
-        });
-        child.castShadow = false;
+        // Every model shows in the same uncoloured finish; photo colours
+        // (still in the OBJ/GLB downloads) aren't used for the preview.
+        if (child.geometry.attributes.color) child.geometry.deleteAttribute("color");
+        smoothShade(child.geometry);
+        child.material = FIGURE_MATERIAL;
       }
     });
 
@@ -554,7 +608,7 @@ function showResult(data) {
     setStatus("ok", "Model generated.");
   }
   renderMessages(data.messages);
-  loadModel(data.obj_url);
+  loadModel(data.preview_url || data.obj_url);
   currentGlbUrl = data.glb_url;
   if (methodSelect.value === "trellis") loadTrellisStatus();
 
