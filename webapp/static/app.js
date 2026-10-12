@@ -317,6 +317,11 @@ function renderMessages(messages) {
 // ---------------- three.js viewer ----------------
 
 let scene, camera, renderer, controls, currentModel, groundPlane;
+// The object's own center/radius (set by frameCamera below), used to keep
+// pan from carrying the view's focus away from the model -- see the
+// controls "change" listener in initViewer.
+const modelCenter = new THREE.Vector3();
+let modelRadius = 100;
 // The GLB download link (see loadModel's OBJ-based preview below) — a
 // general-purpose colored-mesh export other tools can consume, not tied
 // to any particular viewer or display feature.
@@ -351,6 +356,21 @@ function initViewer() {
   // a pinch feel like drift; panSpeed is left at its default direction
   // here; if panning itself turns out backwards, that's the one line to
   // flip, not a reason to disable it again.)
+  //
+  // Pan still shouldn't be able to carry the view arbitrarily far from
+  // the model, though -- zoom dollies toward/away from controls.target,
+  // so a target that's drifted away from the object makes zoom feel
+  // like it's no longer centered on it -- directly requested ("keep
+  // everything focused towards the object, even zoom"). Clamp target to
+  // a radius around the model's own center on every control change
+  // (pan, rotate, or dolly all fire this) instead of only on Reset view.
+  controls.addEventListener("change", () => {
+    const maxDrift = modelRadius * 0.6;
+    const offset = controls.target.clone().sub(modelCenter);
+    if (offset.length() > maxDrift) {
+      controls.target.copy(modelCenter).add(offset.setLength(maxDrift));
+    }
+  });
 
   const hemi = new THREE.HemisphereLight(0xaecbff, 0x1a1a1f, 1.1);
   scene.add(hemi);
@@ -440,6 +460,8 @@ function frameCamera(object3d) {
   // radius at 0 or NaN -- never let that reach camera.position below.
   if (!isFinite(radius) || radius <= 0) radius = 100;
 
+  modelCenter.copy(center);
+  modelRadius = radius;
   controls.target.copy(center);
   const dir = new THREE.Vector3(0.55, 0.42, 0.9).normalize();
   camera.position.copy(center).add(dir.multiplyScalar(radius * 2.6));
