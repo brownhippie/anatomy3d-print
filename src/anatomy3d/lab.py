@@ -374,21 +374,28 @@ def _shade(sil, zf, px, size=None) -> Image.Image:
     return im
 
 
-def _front_and_side(mesh: trimesh.Trimesh, floor: float, sil, zf, px, size: int = 320) -> Image.Image:
-    """Front view and right-side view next to each other at the SAME scale,
-    so a model that's too thin front-to-back shows it at a glance."""
-    side_mesh = mesh.copy()
-    # turn the figure 90 degrees about the vertical so its right side faces the camera
-    side_mesh.vertices = np.column_stack([side_mesh.vertices[:, 2], side_mesh.vertices[:, 1], -side_mesh.vertices[:, 0]])
-    s_sil, s_zf, _ = _front_heightmap(side_mesh, floor)
-    front, side = _shade(sil, zf, px), _shade(s_sil, s_zf, px)
-    gap = max(8, front.height // 30)
-    both = Image.new("RGB", (front.width + gap + side.width, max(front.height, side.height)), (20, 24, 32))
-    both.paste(front, (0, 0))
-    both.paste(side, (front.width + gap, 0))
-    both.thumbnail((size, size), Image.LANCZOS)
-    canvas = Image.new("RGB", (size, size), (20, 24, 32))
-    canvas.paste(both, ((size - both.width) // 2, (size - both.height) // 2))
+def _three_views(mesh: trimesh.Trimesh, floor: float, sil, zf, px, size: "tuple[int, int]" = (480, 320)) -> Image.Image:
+    """Front, right side and rear next to each other at the SAME scale, so
+    a model that's too thin front-to-back shows it at a glance."""
+    v = mesh.vertices
+    shots = [_shade(sil, zf, px)]
+    for turned in (
+        np.column_stack([v[:, 2], v[:, 1], -v[:, 0]]),  # right side to camera
+        np.column_stack([-v[:, 0], v[:, 1], -v[:, 2]]),  # back to camera
+    ):
+        other = mesh.copy()
+        other.vertices = turned
+        o_sil, o_zf, _ = _front_heightmap(other, floor)
+        shots.append(_shade(o_sil, o_zf, px))
+    gap = max(8, shots[0].height // 30)
+    strip = Image.new("RGB", (sum(im.width for im in shots) + gap * 2, max(im.height for im in shots)), (20, 24, 32))
+    x = 0
+    for im in shots:
+        strip.paste(im, (x, 0))
+        x += im.width + gap
+    strip.thumbnail(size, Image.LANCZOS)
+    canvas = Image.new("RGB", size, (20, 24, 32))
+    canvas.paste(strip, ((size[0] - strip.width) // 2, (size[1] - strip.height) // 2))
     return canvas
 
 
@@ -424,7 +431,7 @@ def score(code: str, body, inputs: LabInputs) -> "tuple[dict, trimesh.Trimesh, I
 
     sil, zf, px = _front_heightmap(preview, floor)
     m["shape_iou"] = round(_aligned_iou(sil, inputs.photo_mask), 1)
-    thumb = _front_and_side(preview, floor, sil, zf, px)
+    thumb = _three_views(preview, floor, sil, zf, px)
 
     m["face_found"] = None
     if inputs.face_mesh is not None:
