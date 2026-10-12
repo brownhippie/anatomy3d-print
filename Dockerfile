@@ -12,7 +12,7 @@ WORKDIR /app
 
 COPY requirements.txt requirements-trellis.txt ./
 # requirements-trellis.txt (which itself pulls in requirements.txt) installed
-# here by default -- unlike requirements-depth.txt/requirements-smplx.txt,
+# here by default -- unlike requirements-smplx.txt,
 # which stay opt-in: the webapp exposes TRELLIS.2 as a regular method option
 # in its UI, not an explicit opt-in flag the way body_fit.py's SMPL-X mode
 # is, so its dependency needs to actually be present for that option to do

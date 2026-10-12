@@ -8,7 +8,7 @@ _NO_PROGRESS: Callable[[str, float], None] = lambda stage, frac: None
 
 import numpy as np
 
-from .face_features import detect_face_landmarks
+from .face_features import detect_face_landmarks, detect_face_mesh
 from .hair_features import detect_hair_mask
 from .landmarks import detect_pose_landmarks
 from .mesh_export import add_base_disk, export_glb, export_obj, to_trimesh
@@ -101,11 +101,8 @@ def run_pipeline(
 
     `use_depth`: single-photo mode only. Sculpts the front surface using
     real per-pixel depth (Depth Anything V2 Small, see depth_source.py)
-    instead of the flat symmetric-thickness guess. Opt-in and off by
-    default, same as the SMPL-X path — it's a real, sizeable extra
-    dependency (torch + transformers), not something that should change
-    behavior just because it happens to be installed in a given
-    environment. Requires `pip install -r requirements-depth.txt`.
+    instead of the flat symmetric-thickness guess. Runs through
+    onnxruntime (a base dependency); the webapp turns it on by default.
 
     `bake_color`: single-photo mode only (multi-photo visual-hull mode
     carries no per-vertex color regardless — see carve_visual_hull). Set
@@ -324,8 +321,7 @@ def run_silhouette_relief_pipeline(
     mode (run_pipeline) is the existing option when multiple viewing
     angles are available instead.
 
-    `use_depth`: same optional extra and reasoning as run_pipeline's own
-    use_depth (requires `pip install -r requirements-depth.txt`). Pure
+    `use_depth`: same depth model as run_pipeline's own use_depth. Pure
     silhouette extrusion has no way to tell a region is angled toward
     the camera -- confirmed directly as a real gap, not a guess: a
     turned head came out just as symmetric as a straight-on torso. Real
@@ -360,6 +356,13 @@ def run_silhouette_relief_pipeline(
         )
     alpha, animal_frac = detected
 
+    progress_cb("Shaping the face", 0.38)
+    face_mesh = None
+    try:
+        face_mesh = detect_face_mesh(rgb)
+    except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
+        print(f"Note: face shaping skipped ({exc}).")
+
     progress_cb("Building relief mesh", 0.45)
     body = build_silhouette_relief_mesh(
         alpha,
@@ -368,6 +371,7 @@ def run_silhouette_relief_pipeline(
         depth_strength=depth_strength,
         animal_frac=animal_frac,
         bust_mode=bust_mode,
+        face_mesh=face_mesh,
     )
 
     progress_cb("Finishing mesh", 0.78)

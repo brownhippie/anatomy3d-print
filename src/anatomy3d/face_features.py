@@ -22,6 +22,7 @@ from typing import Optional
 from urllib.request import urlretrieve
 
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
@@ -108,3 +109,18 @@ def detect_face_landmarks(image_path: str, max_dimension: "int | None" = None) -
         points[idx] = (lm.x * width, lm.y * height, lm.z)
 
     return FaceKeypoints(image_width=width, image_height=height, points=points)
+
+
+def detect_face_mesh(rgb: np.ndarray) -> Optional[np.ndarray]:
+    """All 478 face landmarks as an (N, 3) array of (x_px, y_px, z_px) in
+    `rgb`'s own pixel frame, z_px negative toward the camera (MediaPipe's z
+    is on the same scale as x, so it's multiplied by the image width).
+    This is the face's real shape -- brow, nose, lips, cheekbones, jaw --
+    rather than the handful of points detect_face_landmarks keeps. None
+    if no face is found."""
+    h, w = rgb.shape[:2]
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+    result = _get_detector().detect(mp_image)
+    if not result.face_landmarks:
+        return None
+    return np.array([(lm.x * w, lm.y * h, lm.z * w) for lm in result.face_landmarks[0]], dtype=np.float64)

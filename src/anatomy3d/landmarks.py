@@ -28,6 +28,12 @@ from mediapipe.tasks.python import vision as mp_vision
 from .preprocess import load_image_rgb
 from .safety import mad_margin_above_minimum
 
+
+class PoseUnusableError(RuntimeError):
+    """No usable human pose in the photo (no person, too few joints, or an
+    implausible skeleton). The capsule builder can't run, but the webapp can
+    still build the subject from its outline instead (see _run_job)."""
+
 # Hard floor: fitting falls apart below this. Also doubles as the MAD
 # margin's reference point, so "just barely enough" (margin 0) and "not
 # enough" (raise) share one number instead of two unrelated constants.
@@ -169,7 +175,7 @@ def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5, min_pres
     result = _get_detector().detect(mp_image)
 
     if not result.pose_landmarks:
-        raise RuntimeError(
+        raise PoseUnusableError(
             "No person detected in the image. Use a clear, front-facing full-body photo."
         )
 
@@ -191,7 +197,7 @@ def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5, min_pres
         joints[name] = (lm.x * width, lm.y * height, lm.visibility)
 
     if len(joints) < MIN_KEYPOINTS:
-        raise RuntimeError(
+        raise PoseUnusableError(
             f"Too few confident keypoints detected ({len(joints)}, need at least "
             f"{MIN_KEYPOINTS}) — use a photo where the full body (shoulders, hips, "
             "knees) is visible and unobstructed."
@@ -206,14 +212,14 @@ def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5, min_pres
         )
 
     if not _pose_vertically_ordered(joints):
-        raise RuntimeError(
+        raise PoseUnusableError(
             "Detected pose fails an anatomical plausibility check (joints out of "
             "top-to-bottom order — e.g. a knee above a hip). This usually means "
             "the detector hallucinated a skeleton rather than finding a real one; "
             "use a clearer, unobstructed full-body photo."
         )
     if not _pose_shoulders_level(joints):
-        raise RuntimeError(
+        raise PoseUnusableError(
             "Detected pose fails an anatomical plausibility check (shoulder line "
             f"more than {_POSE_MAX_SHOULDER_ANGLE_DEG:.0f} degrees from horizontal). "
             "This usually means the detector hallucinated a skeleton rather than "

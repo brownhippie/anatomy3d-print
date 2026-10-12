@@ -48,7 +48,7 @@ class App(tk.Tk):
         ttk.Label(row, text="Height (mm):", width=12).pack(side="left")
         ttk.Entry(row, textvariable=self.height_mm, width=10).pack(side="left")
         ttk.Checkbutton(
-            row, text="Use real depth (single photo, needs requirements-depth.txt)",
+            row, text="Use real depth (single photo)",
             variable=self.use_depth,
         ).pack(side="left", padx=10)
 

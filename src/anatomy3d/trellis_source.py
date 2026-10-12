@@ -47,6 +47,18 @@ import trimesh
 from .mesh_types import BodyMesh
 
 _TRELLIS_SPACE = "microsoft/TRELLIS.2"
+# Per-call deadlines. Without them a stalled Space (queue never drains, a
+# dropped stream) left the job "running" forever instead of falling back to
+# the built-in method. Generation gets the long one: ZeroGPU queueing plus
+# the model itself can legitimately take minutes.
+_TIMEOUT_SHORT_S = 90.0
+_TIMEOUT_GENERATE_S = 300.0
+
+
+def _call(client, timeout_s: float, **kwargs):
+    """client.predict with a deadline; raises TimeoutError past it."""
+    return client.submit(**kwargs).result(timeout=timeout_s)
+
 
 # The Space's own UI defaults, confirmed working directly against real test
 # photos -- not re-tuned, just carried over as-is.
@@ -146,11 +158,13 @@ def generate_mesh_via_trellis(
     token = os.environ.get("HF_TOKEN")
     client = Client(_TRELLIS_SPACE, token=token)
 
-    client.predict(api_name="/start_session")
-    preprocessed = client.predict(input=handle_file(image_path), api_name="/preprocess_image")
+    _call(client, _TIMEOUT_SHORT_S, api_name="/start_session")
+    preprocessed = _call(client, _TIMEOUT_SHORT_S, input=handle_file(image_path), api_name="/preprocess_image")
     preprocessed_path = preprocessed if isinstance(preprocessed, str) else preprocessed["path"]
 
-    client.predict(
+    _call(
+        client,
+        _TIMEOUT_GENERATE_S,
         image=handle_file(preprocessed_path),
         seed=seed,
         resolution=resolution,
@@ -169,8 +183,8 @@ def generate_mesh_via_trellis(
         api_name="/image_to_3d",
     )
 
-    glb_path, _ = client.predict(
-        decimation_target=decimation_target, texture_size=texture_size, api_name="/extract_glb"
+    glb_path, _ = _call(
+        client, _TIMEOUT_SHORT_S * 2, decimation_target=decimation_target, texture_size=texture_size, api_name="/extract_glb"
     )
 
     scene = trimesh.load(glb_path)

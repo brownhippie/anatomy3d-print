@@ -21,6 +21,7 @@ import numpy as np
 import trimesh
 from PIL import Image
 from scipy import sparse
+from scipy.interpolate import griddata
 from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinates
 from scipy.sparse.linalg import spsolve
 from skimage.measure import marching_cubes
@@ -308,6 +309,52 @@ def _layered_detail_rescue(sampled, grid_mask, real_grid_mask, global_std):
     return rescue * _LAYER_RESCUE_STRENGTH
 
 
+# Features fade to nothing over this fraction of the face's width at its
+# outer edge, so the relief doesn't end in a step at the hairline or jaw.
+_FACE_RELIEF_FADE_FRAC = 0.2
+_FACE_RELIEF_SMOOTH_FRAC = 0.018
+_FACE_SURFACE_POINTS = 468
+_FACE_RELIEF_WITH_DEPTH = 0.45
+
+
+def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
+    """Front-surface offset (photo pixels) carrying the face's own shape --
+    brow, eye sockets, nose, lips, cheekbones, jaw -- from the 478 face
+    landmarks (face_features.detect_face_mesh). The face's overall
+    curvature is removed first with a quadratic fit, since the inflated
+    head already supplies a rounded front; only what's left over (the
+    features themselves) is added, interpolated across the face and faded
+    out toward its edge. Zero outside the face."""
+    # The last 10 of MediaPipe's 478 points are irises; their depth isn't
+    # reliable and spikes the eyes.
+    face_mesh = face_mesh[:_FACE_SURFACE_POINTS]
+    rows = (face_mesh[:, 1] - y0) * scale + pad
+    cols = (face_mesh[:, 0] - x0) * scale + pad
+    toward_camera = -face_mesh[:, 2]
+    basis = np.stack([np.ones_like(rows), rows, cols, rows**2, rows * cols, cols**2], axis=1)
+    coef, *_ = np.linalg.lstsq(basis, toward_camera, rcond=None)
+    features = toward_camera - basis @ coef
+
+    gh, gw = grid_shape
+    grid_rows, grid_cols = np.mgrid[0:gh, 0:gw]
+    relief = griddata((rows, cols), features, (grid_rows, grid_cols), method="cubic")
+    inside = ~np.isnan(relief)
+    if not inside.any():
+        return np.zeros(grid_shape, dtype=np.float32)
+    face_width = float(cols.max() - cols.min())
+    # Interpolating ~470 scattered points leaves the surface crumpled
+    # between them (and a hard crease where the lips meet); a blur scaled
+    # to the face keeps the features and drops that noise. Normalised so
+    # the face's edge doesn't get dragged toward zero.
+    sigma = max(face_width * _FACE_RELIEF_SMOOTH_FRAC, 0.5)
+    filled = np.where(inside, relief, 0.0)
+    weight = gaussian_filter(inside.astype(np.float64), sigma)
+    relief = np.divide(gaussian_filter(filled, sigma), weight, out=np.zeros_like(filled), where=weight > 1e-6)
+    fade = np.clip(distance_transform_edt(inside) / max(face_width * _FACE_RELIEF_FADE_FRAC, 1.0), 0.0, 1.0)
+    fade = fade * fade * (3.0 - 2.0 * fade)
+    return np.where(inside, relief * fade, 0.0).astype(np.float32)
+
+
 def _inflation_height(mask: np.ndarray) -> np.ndarray:
     """Half-thickness (in grid cells) of a smooth, rounded inflation of
     `mask`: solves the Poisson equation lap(h) = -1 inside the outline with
@@ -345,6 +392,7 @@ def build_silhouette_relief_mesh(
     animal_frac: float = 0.0,
     limb_depth_scale: float = 0.9,
     bust_mode: bool = False,
+    face_mesh: Optional[np.ndarray] = None,
 ) -> BodyMesh:
     """`bust_mode`: skip _detect_crop_and_extend's synthetic leg
     completion -- for a photo that was always meant to show only the
@@ -571,6 +619,18 @@ def build_silhouette_relief_mesh(
             apply_bias = grid_mask & real_pixel
             mid = np.where(apply_bias, (front + back) / 2.0, 0.0)
             half_span = np.where(apply_bias, (front - back) / 2.0, half_thickness)
+
+    if face_mesh is not None:
+        # Real depth already carries much of the face's shape; full-strength
+        # landmark relief on top of it double-counts (deep groove at the mouth).
+        strength = _FACE_RELIEF_WITH_DEPTH if depth_rgb is not None else 1.0
+        face_add = np.where(grid_mask, _face_relief(face_mesh, (gh, gw), y0, x0, scale, pad) * strength, 0.0)
+        front = mid + half_span + face_add
+        back = mid - half_span
+        mid = (front + back) / 2.0
+        # Eye sockets push the front back; never let that thin the head
+        # below the floor used elsewhere.
+        half_span = np.where(grid_mask, np.maximum((front - back) / 2.0, min_half_thickness * 0.3), half_span)
 
     true_max = float((np.abs(mid) + half_span).max())
     if true_max <= 0:

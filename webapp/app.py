@@ -29,10 +29,10 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from starlette.concurrency import run_in_threadpool
 
-from anatomy3d.depth_source import depth_available
 from anatomy3d.pipeline import run_pipeline, run_silhouette_relief_pipeline, run_trellis_pipeline
 from anatomy3d.person_segmenter import detect_person_alpha
 from anatomy3d.preprocess import load_image_rgb
+from anatomy3d.landmarks import PoseUnusableError
 from anatomy3d.procedural_body import HipsNotDetectedError
 from anatomy3d.trellis_source import get_quota_status, token_configured, token_preview
 
@@ -239,13 +239,6 @@ async def api_generate(
         raise HTTPException(400, f"Unknown method '{method}' -- use 'capsule', 'trellis', or 'silhouette_relief'.")
     if method in ("trellis", "silhouette_relief") and len(images) != 1:
         raise HTTPException(400, f"The {method} method takes exactly one photo -- it has no multi-view mode.")
-    if use_depth and not depth_available():
-        raise HTTPException(
-            400,
-            "Real depth estimation needs this server's optional depth extras "
-            "(pip install -r requirements-depth.txt), which aren't installed here -- "
-            "uncheck 'use real depth estimation' or ask the server operator to add them.",
-        )
 
     # Not yet consumed by either reconstruction method -- confirmed
     # directly, not assumed: TRELLIS.2's own Space API has no text
@@ -337,34 +330,46 @@ def _run_job(
         # A waist-up photo has no hips for the capsule builder to anchor a
         # torso to; rebuild it as a bust instead of failing the job.
         try:
+            # Depth stays off for capsules: measured on a real full-body photo,
+            # it pulled the face into a beak and broke the hand into spikes.
+            # It's used by the outline-based builds below instead.
             return _run_pipeline_capturing(
                 run_pipeline,
                 image_paths,
                 str(out_stl),
                 target_height_mm=height_mm,
-                use_depth=use_depth,
+                use_depth=False,
                 progress_cb=report_progress,
             ), None
-        except HipsNotDetectedError:
+        except (HipsNotDetectedError, PoseUnusableError) as exc:
+            # A waist-up photo (no hips) or one with no usable human pose at
+            # all -- an animal, most often -- can't be built from capsules,
+            # but its outline still can. Real depth is always on here: it's
+            # what gives an outline-based model its arms, clothing and face.
             if len(image_paths) != 1:
                 raise
+            is_bust = isinstance(exc, HipsNotDetectedError)
+            label = "Rebuilding as a bust" if is_bust else "Building from the outline"
             messages = _run_pipeline_capturing(
                 run_silhouette_relief_pipeline,
                 image_paths[0],
                 str(out_stl),
                 target_height_mm=height_mm,
-                use_depth=use_depth,
-                bust_mode=True,
+                use_depth=True,
+                bust_mode=is_bust,
                 crop_frac=crop_frac,
-                # The hips check fails partway through (at mesh building),
-                # so continue the count from there instead of restarting it.
-                progress_cb=lambda stage, frac: report_progress(f"Rebuilding as a bust: {stage}", 0.5 + 0.5 * frac),
+                # Continue the count from where the capsule attempt stopped
+                # instead of restarting it.
+                progress_cb=lambda stage, frac: report_progress(f"{label}: {stage}", 0.5 + 0.5 * frac),
             )
-            note = (
-                "No hips in this photo, so it was built as a bust: Silhouette relief "
-                "in bust mode (no legs added, flat base where the photo ends)."
-            )
-            return [note] + messages, "silhouette_relief (bust)"
+            if is_bust:
+                note = (
+                    "No hips in this photo, so it was built as a bust: Silhouette relief "
+                    "in bust mode (no legs added, flat base where the photo ends)."
+                )
+                return [note] + messages, "silhouette_relief (bust)"
+            note = f"The body builder couldn't use this photo ({exc}), so it was built from the photo's outline instead."
+            return [note] + messages, "silhouette_relief (outline)"
 
     try:
         if method == "trellis":

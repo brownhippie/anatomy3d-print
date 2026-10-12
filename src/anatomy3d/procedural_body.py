@@ -837,10 +837,10 @@ def _sculpt_front_surface_from_depth(
     symmetric guess. The back half (z < 0) is left untouched — we have no
     photo information about it either way.
 
-    Requires `anatomy3d.depth_source` (optional extra, see
-    requirements-depth.txt); raises a clear error if it's not installed
-    rather than silently no-op'ing, since a caller that explicitly asked
-    for depth sculpting should know it didn't happen.
+    Uses `anatomy3d.depth_source` (Depth Anything V2 Small via
+    onnxruntime); a failure raises rather than silently no-op'ing, since a
+    caller that explicitly asked for depth sculpting should know it didn't
+    happen.
     """
     from .depth_source import estimate_relative_depth
 

@@ -35,8 +35,7 @@ def main():
         "--use-depth",
         action="store_true",
         help="Single-photo mode only: sculpt the front surface with real per-pixel depth "
-        "(Depth Anything V2 Small) instead of the flat symmetric guess. Needs "
-        "`pip install -r requirements-depth.txt`.",
+        "(Depth Anything V2 Small, via onnxruntime) instead of the flat symmetric guess.",
     )
     parser.add_argument(
         "--target-faces",

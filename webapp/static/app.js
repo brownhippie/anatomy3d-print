@@ -474,6 +474,10 @@ function frameCamera(object3d) {
 
   modelCenter.copy(center);
   modelRadius = radius;
+  // Close enough to inspect a face, never inside the model; far enough to
+  // see it whole, never so far it's lost in the scene.
+  controls.minDistance = radius * 0.45;
+  controls.maxDistance = radius * 8;
   controls.target.copy(center);
   const dir = new THREE.Vector3(0.55, 0.42, 0.9).normalize();
   camera.position.copy(center).add(dir.multiplyScalar(radius * 2.6));
@@ -615,6 +619,8 @@ function showResult(data) {
     setStatus("ok", "Model generated — TRELLIS.2 was unavailable, so this used the built-in method instead.");
   } else if (data.method_used === "silhouette_relief (bust)") {
     setStatus("ok", "Model generated as a bust — no hips in the photo, so no legs were added.");
+  } else if (data.method_used === "silhouette_relief (outline)") {
+    setStatus("ok", "Model generated from the photo's outline — no usable human pose was found (an animal, or a person too hidden to read).");
   } else {
     setStatus("ok", "Model generated.");
   }
