@@ -1,6 +1,10 @@
 import concurrent.futures
 import os
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
+
+# A no-op default so every call site below can unconditionally call
+# `progress_cb(...)` without an `if progress_cb` guard at every checkpoint.
+_NO_PROGRESS: Callable[[str, float], None] = lambda stage, frac: None
 
 import numpy as np
 
@@ -85,6 +89,7 @@ def run_pipeline(
     use_depth: bool = False,
     target_faces: Optional[int] = 20000,
     bake_color: bool = True,
+    progress_cb: Callable[[str, float], None] = _NO_PROGRESS,
 ) -> None:
     """One photo -> the capsule/SDF body builder (a geometric guess).
     Two or more photos (different angles around the subject) -> visual hull
@@ -129,6 +134,7 @@ def run_pipeline(
     file. Pass None to export at full detail.
     """
     os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
+    progress_cb("Loading photo", 0.03)
 
     paths = [images] if isinstance(images, str) else list(images)
     if not paths:
@@ -160,6 +166,7 @@ def run_pipeline(
             face_future = pool.submit(_detect_face)
             keypoints = pose_future.result()
             face_keypoints = face_future.result()
+        progress_cb("Detecting pose & face", 0.18)
 
         def _extract_silhouette():
             try:
@@ -205,6 +212,7 @@ def run_pipeline(
             hair_future = pool.submit(_detect_hair)
             silhouette_rgb, silhouette_mask = silhouette_future.result()
             hair_mask = hair_future.result()
+        progress_cb("Analyzing silhouette & hair", 0.4)
 
         if silhouette_mask is not None:
             # Diagnostic only — not used to change the mesh yet. Measures
@@ -226,6 +234,7 @@ def run_pipeline(
         texture_rgb = None
         if bake_color:
             texture_rgb = silhouette_rgb if silhouette_mask is not None else load_image_rgb(paths[0]).rgb
+        progress_cb("Building body mesh", 0.5)
         body = build_body_mesh(
             keypoints,
             target_height_mm=target_height_mm,
@@ -242,15 +251,18 @@ def run_pipeline(
             raise ValueError("angles_deg must have one entry per image.")
 
         views = []
-        for path, angle in zip(paths, angles_deg):
+        for i, (path, angle) in enumerate(zip(paths, angles_deg)):
+            progress_cb(f"Extracting silhouette {i + 1}/{len(paths)}", 0.1 + 0.3 * i / len(paths))
             # Full resolution here — unlike pose detection, boundary
             # precision in the silhouette directly limits carving accuracy.
             prepared = load_image_rgb(path, max_dimension=None)
             mask = extract_silhouette(prepared.rgb)
             views.append(SilhouetteView(mask=mask, angle_deg=angle))
 
+        progress_cb("Carving visual hull", 0.5)
         body = carve_visual_hull(views, target_height_mm=target_height_mm)
 
+    progress_cb("Finishing mesh", 0.78)
     body = add_base_disk(body, target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
@@ -261,8 +273,10 @@ def run_pipeline(
     glb_path = os.path.splitext(out_stl_path)[0] + ".glb"
     export_glb(body, glb_path)
 
+    progress_cb("Exporting print file", 0.92)
     mesh = to_trimesh(body)
     export_stl(mesh, out_stl_path, target_faces=target_faces)
+    progress_cb("Done", 1.0)
 
     print(f"Wrote {out_stl_path} (printing), {obj_path} (render/animation), and {glb_path} (glTF, for other tools).")
 
@@ -276,6 +290,7 @@ def run_silhouette_relief_pipeline(
     depth_strength: float = 0.5,
     bust_mode: bool = False,
     crop_frac: Optional[float] = None,
+    progress_cb: Callable[[str, float], None] = _NO_PROGRESS,
 ) -> None:
     """`bust_mode`: see build_silhouette_relief_mesh's own docstring --
     for a photo that was always meant to show only the upper body, not
@@ -326,6 +341,7 @@ def run_silhouette_relief_pipeline(
     STL smooths a good deal of the fine bumps back out, same as it would
     for any other fine surface detail."""
     os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
+    progress_cb("Loading photo", 0.05)
 
     from .person_segmenter import detect_person_alpha_with_source
 
@@ -335,6 +351,7 @@ def run_silhouette_relief_pipeline(
             raise ValueError(f"crop_frac must be in (0, 1], got {crop_frac}")
         keep_rows = max(1, round(rgb.shape[0] * crop_frac))
         rgb = rgb[:keep_rows, :, :]
+    progress_cb("Detecting subject outline", 0.25)
     detected = detect_person_alpha_with_source(rgb)
     if detected is None:
         raise RuntimeError(
@@ -343,6 +360,7 @@ def run_silhouette_relief_pipeline(
         )
     alpha, animal_frac = detected
 
+    progress_cb("Building relief mesh", 0.45)
     body = build_silhouette_relief_mesh(
         alpha,
         target_height_mm=target_height_mm,
@@ -352,6 +370,7 @@ def run_silhouette_relief_pipeline(
         bust_mode=bust_mode,
     )
 
+    progress_cb("Finishing mesh", 0.78)
     body = add_base_disk(body, target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
@@ -359,8 +378,10 @@ def run_silhouette_relief_pipeline(
     glb_path = os.path.splitext(out_stl_path)[0] + ".glb"
     export_glb(body, glb_path)
 
+    progress_cb("Exporting print file", 0.92)
     mesh = to_trimesh(body)
     export_stl(mesh, out_stl_path, target_faces=target_faces)
+    progress_cb("Done", 1.0)
 
     print(f"Wrote {out_stl_path} (printing), {obj_path} (render/animation), and {glb_path} (glTF, for other tools).")
 
@@ -370,6 +391,7 @@ def run_trellis_pipeline(
     out_stl_path: str,
     target_height_mm: float = 150.0,
     target_faces: Optional[int] = 20000,
+    progress_cb: Callable[[str, float], None] = _NO_PROGRESS,
 ) -> None:
     """A third, genuinely different path from both run_pipeline (capsules
     fit to detected joints) and run_silhouette_relief_pipeline (this
@@ -400,6 +422,7 @@ def run_trellis_pipeline(
     from .trellis_source import generate_mesh_via_trellis
 
     os.makedirs(os.path.dirname(out_stl_path) or ".", exist_ok=True)
+    progress_cb("Checking the photo", 0.05)
 
     rgb = load_image_rgb(image_path, max_dimension=None).rgb
     detected = detect_person_alpha_with_source(rgb)
@@ -418,6 +441,10 @@ def run_trellis_pipeline(
             "subjects for now."
         )
 
+    # No real sub-progress available here -- it's one blocking call to an
+    # external service (see trellis_source.py) with no stage callbacks of
+    # its own, so this just sits at one value for however long that takes.
+    progress_cb("Waiting for TRELLIS.2 (external service)", 0.2)
     body = generate_mesh_via_trellis(image_path)
     # Scale to the requested height exactly, same convention every other
     # pipeline mode here follows -- TRELLIS.2's own output is in an
@@ -426,6 +453,7 @@ def run_trellis_pipeline(
     if height > 1e-6:
         body.vertices = body.vertices * (target_height_mm / height)
 
+    progress_cb("Finishing mesh", 0.78)
     body = add_base_disk(body, target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
@@ -433,7 +461,9 @@ def run_trellis_pipeline(
     glb_path = os.path.splitext(out_stl_path)[0] + ".glb"
     export_glb(body, glb_path)
 
+    progress_cb("Exporting print file", 0.92)
     mesh = to_trimesh(body)
     export_stl(mesh, out_stl_path, target_faces=target_faces)
+    progress_cb("Done", 1.0)
 
     print(f"Wrote {out_stl_path} (printing), {obj_path} (render/animation), and {glb_path} (glTF, for other tools).")

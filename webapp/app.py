@@ -293,12 +293,31 @@ def _run_job(
     builds the final result the client's status poll will see, and writes
     it into _job_state; never raises back into that thread's caller since
     there is no caller left listening by the time this runs."""
+    def report_progress(stage: str, frac: float) -> None:
+        # Overwrites the "running" entry _job_state already has for this
+        # job with its stage/progress added -- the status poll (and
+        # resumePendingJob after an app restart) reads this same key, so
+        # this is the one place a percentage/countdown in the UI comes
+        # from. Harmless if a job finishes between this read and write:
+        # the "done"/"error" write that follows replaces it entirely.
+        with _job_state_lock:
+            _job_state[job_id] = {
+                "status": "running",
+                "stage": stage,
+                "progress": frac,
+                "created_at": time.time(),
+            }
+
     try:
         if method == "trellis":
             _trellis_stats["attempts"] += 1
             try:
                 messages = _run_pipeline_capturing(
-                    run_trellis_pipeline, image_paths[0], str(out_stl), target_height_mm=height_mm
+                    run_trellis_pipeline,
+                    image_paths[0],
+                    str(out_stl),
+                    target_height_mm=height_mm,
+                    progress_cb=report_progress,
                 )
                 _trellis_stats["successes"] += 1
                 used_method = method
@@ -311,7 +330,12 @@ def _run_job(
                 _trellis_stats["fallbacks"] += 1
                 fallback_note = f"TRELLIS.2 failed, falling back to the built-in method: {trellis_exc}"
                 messages = _run_pipeline_capturing(
-                    run_pipeline, image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth
+                    run_pipeline,
+                    image_paths,
+                    str(out_stl),
+                    target_height_mm=height_mm,
+                    use_depth=use_depth,
+                    progress_cb=report_progress,
                 )
                 used_method = "capsule (fallback)"
                 messages = [fallback_note] + messages
@@ -324,11 +348,17 @@ def _run_job(
                 use_depth=use_depth,
                 bust_mode=bust_mode,
                 crop_frac=crop_frac,
+                progress_cb=report_progress,
             )
             used_method = method
         else:
             messages = _run_pipeline_capturing(
-                run_pipeline, image_paths, str(out_stl), target_height_mm=height_mm, use_depth=use_depth
+                run_pipeline,
+                image_paths,
+                str(out_stl),
+                target_height_mm=height_mm,
+                use_depth=use_depth,
+                progress_cb=report_progress,
             )
             used_method = method
     except Exception as exc:

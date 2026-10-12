@@ -587,7 +587,17 @@ async function pollJob(jobId) {
   }
   const data = await res.json();
   if (data.status === "running") {
-    pollTimer = setTimeout(() => pollJob(jobId), 2000);
+    // stage/progress are written by the pipeline's own progress_cb calls
+    // (see report_progress in webapp/app.py's _run_job) -- a real
+    // countdown of where generation actually is, not a guessed timer.
+    // Absent on the very first poll or two, before the background thread
+    // has reached its first checkpoint, so fall back to the generic
+    // message rather than showing a blank/stale percentage.
+    if (typeof data.progress === "number") {
+      const pct = Math.round(data.progress * 100);
+      loadingMsg.textContent = `${data.stage || "Working"}… ${pct}%`;
+    }
+    pollTimer = setTimeout(() => pollJob(jobId), 1200);
     return;
   }
   stopPolling();
