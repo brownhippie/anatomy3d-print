@@ -65,12 +65,25 @@ document.getElementById("refresh-app-btn").addEventListener("click", () => {
 // for what someone in that position actually wants -- confirmation they're on
 // the latest deploy -- by relabeling the existing Refresh button (it already
 // does exactly that, see above) instead of adding a second, separate control.
-// In an ordinary mobile/desktop browser, window.Capacitor is undefined and
+// In an ordinary mobile/desktop browser, window.Capacitor stays undefined and
 // both buttons stay as they are.
-if (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
-  document.getElementById("get-app-link").style.display = "none";
-  document.getElementById("refresh-app-btn").textContent = "⟲ Check for updates";
-}
+//
+// window.Capacitor isn't guaranteed to exist the instant this (deferred
+// module) script runs -- confirmed directly as a real bug, not a guess:
+// reported as the header visibly flickering between "Get the Android app"
+// and "Check for updates" rather than settling on one. A single check-once
+// could miss the bridge still initializing and wrongly keep the browser UI
+// for that whole page load, then catch it on the next (e.g. after tapping
+// the refresh/update button itself) -- flipping between the two across
+// reloads, not within one. Retries briefly instead of checking once.
+(function detectNativeApp(attemptsLeft = 20) {
+  if (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+    document.getElementById("get-app-link").style.display = "none";
+    document.getElementById("refresh-app-btn").textContent = "⟲ Check for updates";
+  } else if (attemptsLeft > 0) {
+    setTimeout(() => detectNativeApp(attemptsLeft - 1), 50);
+  }
+})();
 
 // Neither reconstruction method actually consumes this text as a model
 // input right now -- confirmed directly, not assumed: TRELLIS.2's own
