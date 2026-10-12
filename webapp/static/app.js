@@ -337,12 +337,23 @@ function initViewer() {
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.target.set(0, 60, 0);
-  // Inverts drag-to-pan direction (two-finger drag on touch, right-click
-  // drag on desktop) -- directly requested. OrbitControls multiplies its
-  // pan delta by this each frame, so negating it flips the direction
-  // without touching anything else (zoom/rotate speeds are separate
-  // properties, untouched here).
-  controls.panSpeed = -1;
+  // One-finger drag orbits the model; that's the drag gesture someone on
+  // a phone actually uses, and it was going the unintuitive way -- flip
+  // it (rotateSpeed, not panSpeed: the earlier panSpeed=-1 fix inverted
+  // a gesture -- two-finger drag/right-click pan -- that one-finger
+  // orbiting never actually used).
+  controls.rotateSpeed = -1;
+  // Panning is also what was behind the model appearing to drift away
+  // from center while zooming: OrbitControls' default two-finger touch
+  // gesture is DOLLY_PAN, pinch-to-zoom combined with whatever pan the
+  // two fingers' average movement implies -- any asymmetry in a real
+  // pinch gesture bleeds into a pan, worse once it was inverted, and the
+  // "it's not where I left it" effect reported directly off a real
+  // phone is exactly that pan drifting the target. This viewer has no
+  // real use for off-center panning anyway (orbit + zoom is enough to
+  // inspect a print), so disabling it outright removes the drift at the
+  // source instead of just tuning its direction.
+  controls.enablePan = false;
 
   const hemi = new THREE.HemisphereLight(0xaecbff, 0x1a1a1f, 1.1);
   scene.add(hemi);
