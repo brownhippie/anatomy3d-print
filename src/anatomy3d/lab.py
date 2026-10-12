@@ -618,11 +618,13 @@ def _face_embedding(rgb: np.ndarray):
                              ("det", "face_detection_yunet/face_detection_yunet_2023mar.onnx")):
                 dst = cache / rel.split("/")[-1]
                 if not dst.exists():
+                    import os
                     import urllib.request
 
-                    tmp = dst.with_suffix(".part")
+                    # per-process temp name: several Lab workers may fetch at once
+                    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.part")
                     urllib.request.urlretrieve(f"https://huggingface.co/opencv/opencv_zoo/resolve/main/models/{rel}", tmp)
-                    tmp.rename(dst)
+                    os.replace(tmp, dst)
                 paths[key] = str(dst)
             _sface["rec"] = cv2.FaceRecognizerSF.create(paths["rec"], "")
             _sface["det"] = cv2.FaceDetectorYN.create(paths["det"], "", (320, 320), 0.6)
