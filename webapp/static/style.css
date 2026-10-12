@@ -670,6 +670,7 @@ button.secondary:hover { border-color: var(--accent); }
 .lab-breakdown h4 { margin: 14px 0 6px; color: var(--text); font-size: 13px; }
 .lab-breakdown ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
 
+[hidden] { display: none !important; }
 .lab-run { margin-top: 16px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel-2); display: grid; gap: 10px; }
 .lab-run-head { display: flex; gap: 10px; align-items: center; }
 .lab-run-head img { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; }
