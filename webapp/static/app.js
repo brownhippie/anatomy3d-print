@@ -59,6 +59,19 @@ document.getElementById("refresh-app-btn").addEventListener("click", () => {
   window.location.href = window.location.pathname + "?_r=" + Date.now();
 });
 
+// Inside the actual Android app's WebView (Capacitor injects window.Capacitor
+// into every page it loads, remote URL or not -- see android-app/capacitor.config.ts),
+// a "Get the Android app" link makes no sense: you're already in it. Swap it
+// for what someone in that position actually wants -- confirmation they're on
+// the latest deploy -- by relabeling the existing Refresh button (it already
+// does exactly that, see above) instead of adding a second, separate control.
+// In an ordinary mobile/desktop browser, window.Capacitor is undefined and
+// both buttons stay as they are.
+if (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+  document.getElementById("get-app-link").style.display = "none";
+  document.getElementById("refresh-app-btn").textContent = "⟲ Check for updates";
+}
+
 // Neither reconstruction method actually consumes this text as a model
 // input right now -- confirmed directly, not assumed: TRELLIS.2's own
 // Space API (inspected via gradio_client.Client(...).view_api()) exposes
