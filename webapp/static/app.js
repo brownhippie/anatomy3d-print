@@ -343,17 +343,14 @@ function initViewer() {
   // a gesture -- two-finger drag/right-click pan -- that one-finger
   // orbiting never actually used).
   controls.rotateSpeed = -1;
-  // Panning is also what was behind the model appearing to drift away
-  // from center while zooming: OrbitControls' default two-finger touch
-  // gesture is DOLLY_PAN, pinch-to-zoom combined with whatever pan the
-  // two fingers' average movement implies -- any asymmetry in a real
-  // pinch gesture bleeds into a pan, worse once it was inverted, and the
-  // "it's not where I left it" effect reported directly off a real
-  // phone is exactly that pan drifting the target. This viewer has no
-  // real use for off-center panning anyway (orbit + zoom is enough to
-  // inspect a print), so disabling it outright removes the drift at the
-  // source instead of just tuning its direction.
-  controls.enablePan = false;
+  // Two-finger pinch keeps OrbitControls' default DOLLY_PAN touch gesture
+  // -- finger-distance change zooms, the two fingers' average movement
+  // pans -- directly requested as "pinch for movement" alongside
+  // one-finger rotate. (An earlier attempt disabled panning outright
+  // because an *inverted* panSpeed was making any incidental pan inside
+  // a pinch feel like drift; panSpeed is left at its default direction
+  // here; if panning itself turns out backwards, that's the one line to
+  // flip, not a reason to disable it again.)
 
   const hemi = new THREE.HemisphereLight(0xaecbff, 0x1a1a1f, 1.1);
   scene.add(hemi);
