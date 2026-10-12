@@ -678,7 +678,10 @@ function showResult(data) {
   }
   renderMessages(data.messages);
   labBar.hidden = true;
-  loadModel(data.preview_url || data.obj_url);
+  bakedThickness = (data.tweaks && data.tweaks.thickness) || 1;
+  adjustPanel.hidden = false;
+  updateAdjustHint();
+  loadModel(data.preview_url || data.obj_url, applyLiveThickness);
   currentGlbUrl = data.glb_url;
   if (methodSelect.value === "trellis") loadTrellisStatus();
 
@@ -749,6 +752,85 @@ document.addEventListener("visibilitychange", () => {
   pollJob(jobId);
 });
 
+// ---- Quick adjustments (Result tab) ----
+// Thickness previews live by stretching the shown model front to back
+// (the base disk stays as it is); the server bakes it into the STL on the
+// next generate. Face detail and photo depth need a rebuild.
+const ADJUST_KEY = "figuro_adjust";
+const adjust = { thickness: 1, face_detail: "normal", photo_depth: "normal" };
+try { Object.assign(adjust, JSON.parse(localStorage.getItem(ADJUST_KEY) || "{}")); } catch (e) { /* defaults */ }
+let bakedThickness = null; // thickness the shown result was built with; null = not a result (e.g. a Lab build)
+const adjustPanel = document.getElementById("adjust");
+const adjustHint = document.getElementById("adjust-hint");
+const adjustRegen = document.getElementById("adjust-regen");
+
+function syncAdjustButtons() {
+  document.querySelectorAll(".seg[data-adjust]").forEach((seg) => {
+    const key = seg.dataset.adjust;
+    seg.querySelectorAll("button").forEach((b) => {
+      const on = key === "thickness" ? Number(b.dataset.value) === Number(adjust[key]) : b.dataset.value === adjust[key];
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  });
+}
+
+function updateAdjustHint() {
+  adjustRegen.disabled = selectedFiles.length === 0;
+  adjustHint.textContent = selectedFiles.length === 0
+    ? "Add the photo again in the Photos tab to regenerate."
+    : bakedThickness !== null && Number(adjust.thickness) !== bakedThickness
+    ? "Thickness preview only — regenerate to put it in the STL."
+    : "";
+}
+
+function applyLiveThickness() {
+  if (!currentModel || bakedThickness === null) return;
+  const factor = Number(adjust.thickness) / bakedThickness;
+  currentModel.traverse((child) => {
+    if (!child.isMesh) return;
+    const pos = child.geometry.attributes.position;
+    if (!child.userData.basePositions) child.userData.basePositions = Float32Array.from(pos.array);
+    const src = child.userData.basePositions;
+    let minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (let i = 0; i < src.length; i += 3) {
+      minY = Math.min(minY, src[i + 1]); maxY = Math.max(maxY, src[i + 1]);
+    }
+    // Base disk thickness, same rule as mesh_export.add_base_disk.
+    const baseTop = minY + Math.min(Math.max(0.05 * (maxY - minY), 2), 10);
+    for (let i = 0; i < src.length; i += 3) {
+      if (src[i + 1] > baseTop + 1) { minZ = Math.min(minZ, src[i + 2]); maxZ = Math.max(maxZ, src[i + 2]); }
+    }
+    const midZ = (minZ + maxZ) / 2;
+    for (let i = 0; i < src.length; i += 3) {
+      // ramp in over 2 mm above the base so the seam doesn't tear
+      const t = Math.min(Math.max((src[i + 1] - baseTop) / 2, 0), 1);
+      const f = 1 + (factor - 1) * t;
+      pos.array[i] = src[i];
+      pos.array[i + 1] = src[i + 1];
+      pos.array[i + 2] = midZ + (src[i + 2] - midZ) * f;
+    }
+    pos.needsUpdate = true;
+    smoothShade(child.geometry);
+    child.geometry.computeBoundingBox();
+    child.geometry.computeBoundingSphere();
+  });
+}
+
+document.querySelectorAll(".seg[data-adjust]").forEach((seg) => {
+  seg.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    const key = seg.dataset.adjust;
+    adjust[key] = key === "thickness" ? Number(b.dataset.value) : b.dataset.value;
+    try { localStorage.setItem(ADJUST_KEY, JSON.stringify(adjust)); } catch (err) { /* not saved */ }
+    syncAdjustButtons();
+    updateAdjustHint();
+    if (key === "thickness") applyLiveThickness();
+  });
+});
+adjustRegen.addEventListener("click", () => generate());
+syncAdjustButtons();
+
 async function generate() {
   if (selectedFiles.length === 0) {
     setStatus("error", "Add at least one photo first.");
@@ -781,6 +863,9 @@ async function generate() {
   form.append("method", method);
   form.append("description", descriptionInput.value || "");
   form.append("bust_mode", bustModeCheckbox.checked ? "true" : "false");
+  form.append("thickness", String(adjust.thickness));
+  form.append("face_detail", adjust.face_detail);
+  form.append("photo_depth", adjust.photo_depth);
   if (cropBaseField.style.display !== "none" && cropFrac < 0.999) {
     form.append("crop_frac", String(cropFrac));
   }
@@ -805,6 +890,8 @@ generateBtn.addEventListener("click", generate);
 resetBtn.addEventListener("click", () => {
   selectedFiles = [];
   descriptionInput.value = "";
+  adjustPanel.hidden = true;
+  bakedThickness = null;
   cropFrac = 1.0;
   stopPolling();
   renderFileList();
@@ -967,6 +1054,8 @@ async function labOpen(i) {
     ? `<a href="/api/lab/runs/${labState.runId}/stl/${item.code}" download>Download STL</a>`
     : "";
   setActiveTab("viewer");
+  bakedThickness = null; // Lab builds are shown exactly as built
+  adjustPanel.hidden = true;
   if (item.model_url) loadModel(item.model_url);
 }
 

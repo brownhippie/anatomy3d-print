@@ -729,3 +729,14 @@ button.secondary:hover { border-color: var(--accent); }
   border-radius: 8px; padding: 8px; font-size: 16px; font-family: inherit;
 }
 .lab-info button { margin-top: 0; }
+
+/* Result tab: quick adjustments */
+.adjust { margin-top: 16px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel-2); display: grid; gap: 12px; }
+.adjust-title { font-weight: 600; }
+.adjust-row { display: grid; gap: 6px; }
+.adjust-label { font-size: 13px; }
+.adjust-label span { color: var(--text-dim); font-size: 12px; margin-left: 4px; }
+.seg { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg button { flex: 1; min-width: 0; padding: 8px 4px; background: transparent; color: inherit; border: 0; border-left: 1px solid var(--border); font: inherit; font-size: 13px; cursor: pointer; }
+.seg button:first-child { border-left: 0; }
+.seg button[aria-pressed="true"] { background: var(--accent); color: #0b1220; font-weight: 600; }

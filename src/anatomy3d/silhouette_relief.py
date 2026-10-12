@@ -25,6 +25,7 @@ from scipy.interpolate import griddata
 from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinates
 from scipy.sparse.linalg import spsolve
 from skimage.measure import marching_cubes
+from skimage.morphology import medial_axis
 
 from .mesh_types import BodyMesh
 from .procedural_body import smooth_grid_terracing
@@ -317,6 +318,73 @@ _FACE_SURFACE_POINTS = 468
 _FACE_RELIEF_WITH_DEPTH = 0.45
 
 
+# Front-to-back : side-to-side ratio for the head. ANSUR II puts head
+# length : head breadth at 1.29 (procedural_body.DEPTH_RATIO_HEAD), but
+# the photo's head outline also carries hair and ears, so it's measured
+# wider than ANSUR's breadth; 1.15 lands the depth near the real one.
+_HEAD_DEPTH_RATIO = 1.15
+_THICKNESS_BLUR_FRAC = 0.015  # smoothing of the width/gain fields, as a fraction of the grid
+
+
+def _masked_blur(values: np.ndarray, mask: np.ndarray, sigma: float) -> np.ndarray:
+    weight = gaussian_filter(mask.astype(np.float32), sigma)
+    blurred = gaussian_filter(np.where(mask, values, 0.0).astype(np.float32), sigma)
+    return np.where(mask, blurred / np.maximum(weight, 1e-6), 0.0)
+
+
+def _head_weight(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
+    """1 over the head (an ellipse around the face landmarks, extended up
+    past the forehead to the crown), fading to 0 just outside it."""
+    pts = face_mesh[:_FACE_SURFACE_POINTS]
+    rows = (pts[:, 1] - y0) * scale + pad
+    cols = (pts[:, 0] - x0) * scale + pad
+    face_h = float(rows.max() - rows.min())
+    crown = float(rows.min()) - 0.35 * face_h
+    chin = float(rows.max())
+    cy, ry = (crown + chin) / 2.0, max((chin - crown) / 2.0, 1.0)
+    cx, rx = float(cols.mean()), max(0.7 * float(np.ptp(cols)), 1.0)
+    gr, gc = np.mgrid[0 : grid_shape[0], 0 : grid_shape[1]]
+    rn = np.sqrt(((gr - cy) / ry) ** 2 + ((gc - cx) / rx) ** 2)
+    return np.clip((1.25 - rn) / 0.35, 0.0, 1.0).astype(np.float32)
+
+
+def _proportioned_thickness(
+    grid_mask: np.ndarray,
+    inflation: np.ndarray,
+    torso_ratio: float,
+    limb_ratio: float,
+    head_weight: Optional[np.ndarray],
+) -> np.ndarray:
+    """Half-thickness (grid pixels) with real body proportions.
+
+    The inflation alone only reaches a part's own half-width on long thin
+    shapes; on compact ones (head, torso) it stops at about 0.7 of it, so
+    with the ratio on top every head came out a thin blade and every
+    torso an almond from the side. Here the inflation is rescaled along
+    the outline's medial axis so its peak equals the local half-width,
+    then multiplied by the front-to-back : side-to-side ratio for that
+    part: limbs where the outline is narrowest, torso where it's widest,
+    head over the face."""
+    dist = distance_transform_edt(grid_mask).astype(np.float32)
+    skel = medial_axis(grid_mask) & (inflation > 1e-6)
+    if not skel.any():
+        return inflation * torso_ratio
+    gain_on_axis = np.zeros_like(dist)
+    gain_on_axis[skel] = np.clip(dist[skel] / inflation[skel], 0.8, 1.6)
+    width_on_axis = np.where(skel, dist, 0.0)
+    _, (ri, ci) = distance_transform_edt(~skel, return_indices=True)
+    sigma = max(_THICKNESS_BLUR_FRAC * max(grid_mask.shape), 1.0)
+    gain = _masked_blur(gain_on_axis[ri, ci], grid_mask, sigma)
+    half_width = _masked_blur(width_on_axis[ri, ci], grid_mask, sigma)
+    inside = half_width[grid_mask]
+    lo, hi = float(inside.min()), float(inside.max())
+    width_frac = np.clip((half_width - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    ratio = limb_ratio * (1.0 - width_frac) + torso_ratio * width_frac
+    if head_weight is not None:
+        ratio = ratio * (1.0 - head_weight) + _HEAD_DEPTH_RATIO * head_weight
+    return inflation * gain * ratio
+
+
 def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
     """Front-surface offset (photo pixels) carrying the face's own shape --
     brow, eye sockets, nose, lips, cheekbones, jaw -- from the 478 face
@@ -589,7 +657,27 @@ def build_silhouette_relief_mesh(
         t = np.clip(np.divide(dist, row_ridge, out=np.zeros_like(dist), where=row_ridge > 1e-6), 0.0, 1.0)
         half_thickness_raw = row_ridge * np.sqrt(np.clip(1.0 - (1.0 - t) ** 2, 0.0, 1.0)) * depth_scale_field
     else:
-        half_thickness_raw = _inflation_height(grid_mask) / scale * depth_scale_field
+        head_weight = _head_weight(face_mesh, grid_mask.shape, y0, x0, scale, pad) if face_mesh is not None else None
+        cut_row = pad + round(h * scale) - 1  # last row of the subject
+        if bust_mode and grid_mask[min(cut_row, gh - 1)].any():
+            # A bust ends where the photo ends: mirror the outline below
+            # the cut so the shape keeps its full thickness down to the
+            # base instead of pinching to an edge there.
+            upper = grid_mask[: cut_row + 1]
+            mirrored = np.vstack([upper, upper[::-1]])
+            mirrored_head = None
+            if head_weight is not None:
+                mirrored_head = np.vstack([head_weight[: cut_row + 1], np.zeros_like(head_weight[: cut_row + 1])])
+            thick = _proportioned_thickness(
+                mirrored, _inflation_height(mirrored), depth_scale, limb_depth_scale, mirrored_head
+            )[: cut_row + 1]
+            half_thickness_raw = np.zeros_like(dist)
+            half_thickness_raw[: cut_row + 1] = thick / scale
+        else:
+            half_thickness_raw = (
+                _proportioned_thickness(grid_mask, _inflation_height(grid_mask), depth_scale, limb_depth_scale, head_weight)
+                / scale
+            )
     if edge == "hard":
         # Original edge: a soft floor so thickness never reaches 0, with the
         # mask cutting the volume off hard (see the field below).
@@ -653,6 +741,14 @@ def build_silhouette_relief_mesh(
             # never let the front cross back past a small positive
             # floor, matching that function's own "never cross the
             # centerline" safety.
+            # Only the fine detail may push the front in: a whole part that
+            # sits further back than the body's average (a head behind
+            # crossed arms) kept getting thinner instead of just sitting
+            # back -- measured, it cut the head's depth from 1.01 to 0.84
+            # of its width. Parts nearer than average still bulge forward.
+            if profile == "poisson":
+                broad = _masked_blur(d_norm, real_grid_mask, max(0.05 * max(gh, gw), 1.0))
+                d_norm = np.maximum(broad, 0.0) + (d_norm - broad)
             front = np.maximum(half_thickness * (1.0 + d_norm * depth_strength), min_half_thickness * 0.3)
             back = -half_thickness
             # Synthetic extension rows keep the plain symmetric guess

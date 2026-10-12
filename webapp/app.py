@@ -236,6 +236,13 @@ def trellis_status():
     }
 
 
+# The three quick adjustments the Result tab offers (see app.js). Face
+# detail and photo depth shape outline-based builds; thickness stretches
+# any model front-to-back. None = photo depth off.
+_FACE_DETAIL = {"off": 0.0, "normal": None, "strong": 1.0}
+_PHOTO_DEPTH = {"off": None, "normal": 0.5, "strong": 1.0}
+
+
 @app.post("/api/generate")
 async def api_generate(
     images: List[UploadFile] = File(...),
@@ -245,9 +252,17 @@ async def api_generate(
     description: str = Form(""),
     bust_mode: bool = Form(False),
     crop_frac: Optional[float] = Form(None),
+    thickness: float = Form(1.0),
+    face_detail: str = Form("normal"),
+    photo_depth: str = Form("normal"),
 ):
     if crop_frac is not None and not 0 < crop_frac <= 1:
         raise HTTPException(400, f"crop_frac must be in (0, 1], got {crop_frac}")
+    if not 0.5 <= thickness <= 2.0:
+        raise HTTPException(400, f"thickness must be between 0.5 and 2.0, got {thickness}")
+    if face_detail not in _FACE_DETAIL or photo_depth not in _PHOTO_DEPTH:
+        raise HTTPException(400, "face_detail and photo_depth must each be 'off', 'normal' or 'strong'.")
+    tweaks = {"thickness": thickness, "face_detail": face_detail, "photo_depth": photo_depth}
     if method not in ("capsule", "trellis", "silhouette_relief"):
         raise HTTPException(400, f"Unknown method '{method}' -- use 'capsule', 'trellis', or 'silhouette_relief'.")
     if method in ("trellis", "silhouette_relief") and len(images) != 1:
@@ -299,7 +314,7 @@ async def api_generate(
     # restart doesn't hang waiting on an orphaned job.
     threading.Thread(
         target=_run_job,
-        args=(job_id, method, image_paths, height_mm, use_depth, bust_mode, crop_frac, description, job_dir, out_stl),
+        args=(job_id, method, image_paths, height_mm, use_depth, bust_mode, crop_frac, description, job_dir, out_stl, tweaks),
         daemon=True,
     ).start()
 
@@ -317,6 +332,7 @@ def _run_job(
     description: str,
     job_dir: Path,
     out_stl: Path,
+    tweaks: Optional[dict] = None,
 ) -> None:
     """Runs entirely on its own background thread (see the Thread(...)
     call in api_generate above) -- never called directly from the event
@@ -324,6 +340,11 @@ def _run_job(
     builds the final result the client's status poll will see, and writes
     it into _job_state; never raises back into that thread's caller since
     there is no caller left listening by the time this runs."""
+    tweaks = tweaks or {"thickness": 1.0, "face_detail": "normal", "photo_depth": "normal"}
+    thickness = tweaks["thickness"]
+    face_strength = _FACE_DETAIL[tweaks["face_detail"]]
+    depth_strength = _PHOTO_DEPTH[tweaks["photo_depth"]]
+
     def report_progress(stage: str, frac: float) -> None:
         # Overwrites the "running" entry _job_state already has for this
         # job with its stage/progress added -- the status poll (and
@@ -353,6 +374,7 @@ def _run_job(
                 target_height_mm=height_mm,
                 use_depth=False,
                 progress_cb=report_progress,
+                thickness=thickness,
             ), None
         except (HipsNotDetectedError, PoseUnusableError) as exc:
             # A waist-up photo (no hips) or one with no usable human pose at
@@ -368,7 +390,10 @@ def _run_job(
                 image_paths[0],
                 str(out_stl),
                 target_height_mm=height_mm,
-                use_depth=True,
+                use_depth=depth_strength is not None,
+                depth_strength=depth_strength or 0.5,
+                thickness=thickness,
+                face_strength=face_strength,
                 bust_mode=is_bust,
                 crop_frac=crop_frac,
                 # Continue the count from where the capsule attempt stopped
@@ -394,6 +419,7 @@ def _run_job(
                     str(out_stl),
                     target_height_mm=height_mm,
                     progress_cb=report_progress,
+                    thickness=thickness,
                 )
                 _trellis_stats["successes"] += 1
                 used_method = method
@@ -414,7 +440,10 @@ def _run_job(
                 image_paths[0],
                 str(out_stl),
                 target_height_mm=height_mm,
-                use_depth=use_depth,
+                use_depth=use_depth and depth_strength is not None,
+                depth_strength=depth_strength or 0.5,
+                thickness=thickness,
+                face_strength=face_strength,
                 bust_mode=bust_mode,
                 crop_frac=crop_frac,
                 progress_cb=report_progress,
@@ -451,6 +480,7 @@ def _run_job(
         "messages": messages,
         "method_used": used_method,
         "description": description or None,
+        "tweaks": tweaks,
         "stats": {
             "faces": int(len(mesh.faces)),
             "vertices": int(len(mesh.vertices)),

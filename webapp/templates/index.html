@@ -64,6 +64,36 @@
           <div class="status-box" id="status-box"></div>
           <div class="messages" id="messages"></div>
           <div class="empty-result-hint" id="empty-result-hint">Nothing generated yet — switch to the Photos tab and hit Generate.</div>
+          <div class="adjust" id="adjust" hidden>
+            <div class="adjust-title">Adjust</div>
+            <div class="adjust-row">
+              <div class="adjust-label">Thickness <span>front to back · updates live</span></div>
+              <div class="seg" data-adjust="thickness">
+                <button type="button" data-value="0.8">80%</button>
+                <button type="button" data-value="1">100%</button>
+                <button type="button" data-value="1.2">120%</button>
+                <button type="button" data-value="1.4">140%</button>
+              </div>
+            </div>
+            <div class="adjust-row">
+              <div class="adjust-label">Face detail <span>outline builds · on regenerate</span></div>
+              <div class="seg" data-adjust="face_detail">
+                <button type="button" data-value="off">Off</button>
+                <button type="button" data-value="normal">Normal</button>
+                <button type="button" data-value="strong">Strong</button>
+              </div>
+            </div>
+            <div class="adjust-row">
+              <div class="adjust-label">Photo depth <span>outline builds · on regenerate</span></div>
+              <div class="seg" data-adjust="photo_depth">
+                <button type="button" data-value="off">Off</button>
+                <button type="button" data-value="normal">Normal</button>
+                <button type="button" data-value="strong">Strong</button>
+              </div>
+            </div>
+            <button type="button" class="primary" id="adjust-regen">Regenerate with these</button>
+            <div class="hint" id="adjust-hint"></div>
+          </div>
         </div>
 
         <div class="tab-panel" id="tab-lab" role="tabpanel">

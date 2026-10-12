@@ -374,6 +374,24 @@ def _shade(sil, zf, px, size=None) -> Image.Image:
     return im
 
 
+def _front_and_side(mesh: trimesh.Trimesh, floor: float, sil, zf, px, size: int = 320) -> Image.Image:
+    """Front view and right-side view next to each other at the SAME scale,
+    so a model that's too thin front-to-back shows it at a glance."""
+    side_mesh = mesh.copy()
+    # turn the figure 90 degrees about the vertical so its right side faces the camera
+    side_mesh.vertices = np.column_stack([side_mesh.vertices[:, 2], side_mesh.vertices[:, 1], -side_mesh.vertices[:, 0]])
+    s_sil, s_zf, _ = _front_heightmap(side_mesh, floor)
+    front, side = _shade(sil, zf, px), _shade(s_sil, s_zf, px)
+    gap = max(8, front.height // 30)
+    both = Image.new("RGB", (front.width + gap + side.width, max(front.height, side.height)), (20, 24, 32))
+    both.paste(front, (0, 0))
+    both.paste(side, (front.width + gap, 0))
+    both.thumbnail((size, size), Image.LANCZOS)
+    canvas = Image.new("RGB", (size, size), (20, 24, 32))
+    canvas.paste(both, ((size - both.width) // 2, (size - both.height) // 2))
+    return canvas
+
+
 def _procrustes_nme(src: np.ndarray, dst: np.ndarray) -> float:
     a, b = src - src.mean(0), dst - dst.mean(0)
     u, s, vt = np.linalg.svd(a.T @ b)
@@ -406,7 +424,7 @@ def score(code: str, body, inputs: LabInputs) -> "tuple[dict, trimesh.Trimesh, I
 
     sil, zf, px = _front_heightmap(preview, floor)
     m["shape_iou"] = round(_aligned_iou(sil, inputs.photo_mask), 1)
-    thumb = _shade(sil, zf, px, size=320)
+    thumb = _front_and_side(preview, floor, sil, zf, px)
 
     m["face_found"] = None
     if inputs.face_mesh is not None:

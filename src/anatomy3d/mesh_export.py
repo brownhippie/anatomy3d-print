@@ -26,6 +26,18 @@ _BASE_DISK_SECTIONS = 64
 _BASE_DISK_COLOR = np.array([150, 150, 155], dtype=np.uint8)  # neutral stone-grey plinth
 
 
+def scale_depth(body: BodyMesh, factor: float) -> BodyMesh:
+    """Stretch the figure front-to-back (Z) about its own middle by
+    `factor`; 1.0 returns it unchanged. Applied before the base disk so
+    the disk stays round."""
+    if abs(factor - 1.0) < 1e-6:
+        return body
+    verts = body.vertices.copy()
+    mid = (verts[:, 2].min() + verts[:, 2].max()) / 2.0
+    verts[:, 2] = mid + (verts[:, 2] - mid) * factor
+    return BodyMesh(vertices=verts, faces=body.faces, colors=body.colors)
+
+
 def add_base_disk(body: BodyMesh, target_height_mm: float) -> BodyMesh:
     """Returns a new BodyMesh with a flat cylindrical disk unioned beneath
     `body`, centered under its own horizontal footprint. Y is this

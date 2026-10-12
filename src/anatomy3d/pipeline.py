@@ -11,7 +11,7 @@ import numpy as np
 from .face_features import detect_face_landmarks, detect_face_mesh
 from .hair_features import detect_hair_mask
 from .landmarks import detect_pose_landmarks
-from .mesh_export import add_base_disk, export_glb, export_obj, to_trimesh
+from .mesh_export import add_base_disk, export_glb, export_obj, scale_depth, to_trimesh
 from .preprocess import load_image_rgb
 from .print_prep import export_stl
 from .procedural_body import build_body_mesh
@@ -90,6 +90,7 @@ def run_pipeline(
     target_faces: Optional[int] = 20000,
     bake_color: bool = True,
     progress_cb: Callable[[str, float], None] = _NO_PROGRESS,
+    thickness: float = 1.0,
 ) -> None:
     """One photo -> the capsule/SDF body builder (a geometric guess).
     Two or more photos (different angles around the subject) -> visual hull
@@ -260,7 +261,7 @@ def run_pipeline(
         body = carve_visual_hull(views, target_height_mm=target_height_mm)
 
     progress_cb("Finishing mesh", 0.78)
-    body = add_base_disk(body, target_height_mm)
+    body = add_base_disk(scale_depth(body, thickness), target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
 
@@ -282,12 +283,14 @@ def run_silhouette_relief_pipeline(
     image_path: str,
     out_stl_path: str,
     target_height_mm: float = 150.0,
-    target_faces: Optional[int] = 20000,
+    target_faces: Optional[int] = 200_000,
     use_depth: bool = False,
     depth_strength: float = 0.5,
     bust_mode: bool = False,
     crop_frac: Optional[float] = None,
     progress_cb: Callable[[str, float], None] = _NO_PROGRESS,
+    thickness: float = 1.0,
+    face_strength: Optional[float] = None,
 ) -> None:
     """`bust_mode`: see build_silhouette_relief_mesh's own docstring --
     for a photo that was always meant to show only the upper body, not
@@ -372,10 +375,11 @@ def run_silhouette_relief_pipeline(
         animal_frac=animal_frac,
         bust_mode=bust_mode,
         face_mesh=face_mesh,
+        face_strength=face_strength,
     )
 
     progress_cb("Finishing mesh", 0.78)
-    body = add_base_disk(body, target_height_mm)
+    body = add_base_disk(scale_depth(body, thickness), target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
 
@@ -396,6 +400,7 @@ def run_trellis_pipeline(
     target_height_mm: float = 150.0,
     target_faces: Optional[int] = 20000,
     progress_cb: Callable[[str, float], None] = _NO_PROGRESS,
+    thickness: float = 1.0,
 ) -> None:
     """A third, genuinely different path from both run_pipeline (capsules
     fit to detected joints) and run_silhouette_relief_pipeline (this
@@ -458,7 +463,7 @@ def run_trellis_pipeline(
         body.vertices = body.vertices * (target_height_mm / height)
 
     progress_cb("Finishing mesh", 0.78)
-    body = add_base_disk(body, target_height_mm)
+    body = add_base_disk(scale_depth(body, thickness), target_height_mm)
     obj_path = os.path.splitext(out_stl_path)[0] + ".obj"
     export_obj(body, obj_path)
 

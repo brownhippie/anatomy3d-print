@@ -16,6 +16,9 @@ import trimesh
 from .safety import mad_margin_above_minimum
 
 
+_RAY_BATCH = 50
+
+
 def estimate_min_wall_thickness(
     mesh: trimesh.Trimesh, sample_count: int = 1500, seed: int = 0, percentile: float = 2.0
 ) -> float:
@@ -57,13 +60,19 @@ def estimate_min_wall_thickness(
     origins = points - normals * eps
     directions = -normals
 
-    locations, index_ray, _index_tri = mesh.ray.intersects_location(origins, directions)
-    if len(index_ray) == 0:
-        return float("nan")
-
-    dists = np.linalg.norm(locations - origins[index_ray], axis=1)
+    # In batches: without embree, trimesh tests every ray against every
+    # triangle in a box around it, and slanted rays through a full-bodied
+    # figure cover nearly the whole mesh -- all 1500 at once allocated
+    # ~37M ray/triangle pairs and took the server past 13 GB.
     min_per_ray = np.full(len(points), np.inf)
-    np.minimum.at(min_per_ray, index_ray, dists)
+    for start in range(0, len(points), _RAY_BATCH):
+        sl = slice(start, start + _RAY_BATCH)
+        locations, index_ray, _index_tri = mesh.ray.intersects_location(origins[sl], directions[sl])
+        if len(index_ray) == 0:
+            continue
+        index_ray = index_ray + start
+        dists = np.linalg.norm(locations - origins[index_ray], axis=1)
+        np.minimum.at(min_per_ray, index_ray, dists)
     valid = min_per_ray[np.isfinite(min_per_ray)]
     return float(np.percentile(valid, percentile)) if len(valid) else float("nan")
 
@@ -99,19 +108,21 @@ def simplify_for_output(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Tri
     a joint) for the same target count."""
     if len(mesh.faces) <= target_faces:
         return mesh
-    simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
-    simplified.merge_vertices()
-    trimesh.repair.fill_holes(simplified)
-    simplified.fix_normals()
-    if not simplified.is_watertight:
-        # Measured directly: decimation can introduce a handful of
-        # non-manifold edges that the repair pass above doesn't always
-        # close, especially on thin limbs where collapsing edges can
-        # pinch a wall shut. A smaller file isn't worth shipping a mesh
-        # that's worse than the one before decimation — keep the
-        # un-decimated (but still repaired) mesh instead.
-        return mesh
-    return simplified
+    # Measured directly: decimation can leave a single non-manifold edge
+    # that the repair pass doesn't close, and one is enough to fail the
+    # watertight test -- which used to ship the full 700k-face mesh
+    # instead. A slightly different target count collapses different
+    # edges, so try a few before giving up.
+    for factor in (1.0, 1.15, 1.3, 1.6, 2.0):
+        simplified = mesh.simplify_quadric_decimation(face_count=int(target_faces * factor))
+        simplified.merge_vertices()
+        trimesh.repair.fill_holes(simplified)
+        simplified.fix_normals()
+        if simplified.is_watertight:
+            return simplified
+    # A smaller file isn't worth shipping a mesh that's worse than the
+    # one before decimation -- keep the un-decimated (but repaired) one.
+    return mesh
 
 
 def export_stl(
