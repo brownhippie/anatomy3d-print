@@ -33,6 +33,10 @@ const descriptionHint = document.getElementById("description-hint");
 const tabBtns = document.querySelectorAll(".tab-btn");
 const tabPanels = document.querySelectorAll(".tab-panel");
 const emptyResultHint = document.getElementById("empty-result-hint");
+const settingsGearBtn = document.getElementById("settings-gear-btn");
+const settingsDrawer = document.getElementById("settings-drawer");
+const settingsDrawerBackdrop = document.getElementById("settings-drawer-backdrop");
+const settingsDrawerClose = document.getElementById("settings-drawer-close");
 
 let selectedFiles = [];
 let trellisStatusLoaded = false;
@@ -49,6 +53,16 @@ function setActiveTab(name) {
 }
 
 tabBtns.forEach((btn) => btn.addEventListener("click", () => setActiveTab(btn.dataset.tab)));
+
+// Settings (method, height, bust mode, crop tool) live in a gear-icon drawer
+// instead of a tab, so the Photos/Result tabs stay short and the 3D viewer
+// below them keeps most of the screen on a phone instead of being squeezed
+// out by an inline settings form.
+function openSettingsDrawer() { settingsDrawer.classList.add("open"); }
+function closeSettingsDrawer() { settingsDrawer.classList.remove("open"); }
+settingsGearBtn.addEventListener("click", openSettingsDrawer);
+settingsDrawerBackdrop.addEventListener("click", closeSettingsDrawer);
+settingsDrawerClose.addEventListener("click", closeSettingsDrawer);
 
 // The Android app's WebView loads this same URL (see android-app/capacitor.config.ts's
 // server.url), so a deploy here is already "live" there with no separate app update --

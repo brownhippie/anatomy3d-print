@@ -94,6 +94,23 @@ header.topbar .refresh-link:hover {
   color: var(--accent);
 }
 
+.icon-btn {
+  flex: none;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 7px;
+  width: 34px;
+  height: 34px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+
 @media (max-width: 860px) {
   header.topbar { flex-wrap: wrap; row-gap: 8px; }
   header.topbar .tagline { order: 3; flex: 1 0 100%; margin: 0; }
@@ -108,20 +125,21 @@ main {
 }
 
 @media (max-width: 860px) {
-  /* Stacked layout: settings on top, viewer below. BUG FOUND AND FIXED,
-     confirmed directly against a real phone screenshot (not assumed):
-     the previous `auto minmax(320px, 1fr)` row sizing let the panel's
-     row grow to its full natural content height before `.panel`'s own
-     max-height ever got a chance to apply -- `max-height` on a grid
-     item cannot shrink an `auto`-sized track, a real CSS grid gotcha,
-     not a one-off bug. The actual screenshot showed the settings panel
-     (dropzone, fields, status, messages) consuming the ENTIRE viewport,
-     pushing the 3D viewer almost completely off-screen, exactly as that
-     mechanism predicts. Fix: bound the row itself (not just the child)
-     with minmax(0, ...), which forces the panel to scroll its own
-     overflow internally instead of growing the track. */
-  main { grid-template-columns: 1fr; grid-template-rows: minmax(0, 42vh) minmax(260px, 1fr); }
-  .panel { max-height: 100%; }
+  /* Stacked layout: upload panel on top, viewer below. A %-of-vh grid
+     row (the previous fix) still came up short on a real device:
+     confirmed directly against a real phone screenshot, build 0586ac9,
+     showing the panel eating past half the screen and the 3D model
+     reduced to a sliver in the corner. `vh` on a phone is the layout
+     viewport, not necessarily what's actually visible -- it can run
+     taller than the real drawable area (status bar, WebView chrome),
+     so a row sized as a fraction of it can still overflow. Flex instead
+     of a vh-sized grid row: the panel is capped at max-height and the
+     stage gets `flex: 1 1 auto`, which resolves against main's real,
+     already-laid-out box -- not a separately recomputed vh -- so the
+     viewer reliably gets whatever room the panel didn't use. */
+  main { display: flex; flex-direction: column; }
+  .panel { flex: 0 1 auto; max-height: 40vh; min-height: 0; }
+  .stage { flex: 1 1 320px; min-height: 280px; }
 }
 
 .panel {
@@ -575,3 +593,53 @@ button.secondary:hover { border-color: var(--accent); }
   border: 1px solid var(--border);
   font-weight: 500;
 }
+
+.settings-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: none;
+}
+.settings-drawer.open { display: block; }
+
+.settings-drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(5, 7, 11, 0.6);
+}
+
+.settings-drawer-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 360px;
+  max-width: 88vw;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  /* Closed state sits just off-screen so opening can simply be a
+     transform away, giving the drawer a slide-in rather than a snap. */
+  transform: translateX(100%);
+  transition: transform 0.2s ease;
+}
+.settings-drawer.open .settings-drawer-panel { transform: translateX(0); }
+
+.settings-drawer-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-drawer-head h3 { margin: 0; font-size: 15px; }
+
+.settings-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 20px 28px;
+}
+.settings-drawer-body .field:first-child { margin-top: 0; }

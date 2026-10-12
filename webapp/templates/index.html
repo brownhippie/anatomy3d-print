@@ -28,6 +28,7 @@
       </div>
       <div class="tagline">photo &rarr; 3D-printable figure, built from scratch, no licensed model <span class="build-tag" id="build-tag"></span></div>
       <div class="header-actions">
+        <button class="icon-btn" id="settings-gear-btn" type="button" title="Settings" aria-label="Settings">&#9881;</button>
         <button class="refresh-link" id="refresh-app-btn" type="button" title="Force-reload this page past any cached version">&#8635; Refresh</button>
         <a class="get-app-link" id="get-app-link" href="/static/downloads/figuro.apk" download>&#128241; Get the Android app</a>
       </div>
@@ -37,7 +38,6 @@
       <section class="panel">
         <div class="tabbar" role="tablist">
           <button class="tab-btn active" id="tab-btn-photos" role="tab" aria-selected="true" data-tab="photos">Photos</button>
-          <button class="tab-btn" id="tab-btn-settings" role="tab" aria-selected="false" data-tab="settings">Settings</button>
           <button class="tab-btn" id="tab-btn-result" role="tab" aria-selected="false" data-tab="result">Result</button>
         </div>
 
@@ -55,39 +55,6 @@
             <label for="description-input">Describe the photo (optional)</label>
             <textarea id="description-input" rows="2" placeholder="e.g. standing, arms crossed, wearing a hat"></textarea>
             <div class="hint" id="description-hint"></div>
-          </div>
-        </div>
-
-        <div class="tab-panel" id="tab-settings" role="tabpanel">
-          <div class="field">
-            <label for="height-mm">Target height (mm)</label>
-            <input type="number" id="height-mm" value="150" min="20" max="1000" />
-          </div>
-          <div class="field">
-            <label for="method-select">Reconstruction method</label>
-            <select id="method-select">
-              <option value="capsule" selected>Capsule body (pose-fitted primitives, any number of photos)</option>
-              <option value="silhouette_relief">Silhouette relief (single photo — follows the photo's own outline directly)</option>
-              <option value="trellis">TRELLIS.2 (external, MIT-licensed — single human photo only; confirmed unreliable on animals, see below)</option>
-            </select>
-            <div class="trellis-status" id="trellis-status" style="display:none"></div>
-          </div>
-          <div class="checkbox-row" id="use-depth-row">
-            <input type="checkbox" id="use-depth" />
-            <label for="use-depth" style="margin:0">Use real depth estimation (single photo, needs the server's optional depth extras)</label>
-          </div>
-          <div class="checkbox-row" id="bust-mode-row" style="display:none">
-            <input type="checkbox" id="bust-mode" />
-            <label for="bust-mode" style="margin:0">This is a bust/half-body photo (don't add legs — ends where the photo ends, on a flat base)</label>
-          </div>
-          <div class="field" id="crop-base-field" style="display:none">
-            <label>Custom base — drag the line to where the model should end</label>
-            <div class="crop-preview" id="crop-preview">
-              <img id="crop-preview-img" alt="" />
-              <div class="crop-shade" id="crop-shade"></div>
-              <div class="crop-line" id="crop-line"></div>
-            </div>
-            <div class="hint">Everything below the line is left out of the model. Leave at the bottom to use the whole photo.</div>
           </div>
         </div>
 
@@ -127,6 +94,48 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <div class="settings-drawer" id="settings-drawer">
+    <div class="settings-drawer-backdrop" id="settings-drawer-backdrop"></div>
+    <div class="settings-drawer-panel">
+      <div class="settings-drawer-head">
+        <h3>Settings</h3>
+        <button class="icon-btn" id="settings-drawer-close" type="button" aria-label="Close settings">&times;</button>
+      </div>
+      <div class="settings-drawer-body">
+        <div class="field">
+          <label for="height-mm">Target height (mm)</label>
+          <input type="number" id="height-mm" value="150" min="20" max="1000" />
+        </div>
+        <div class="field">
+          <label for="method-select">Reconstruction method</label>
+          <select id="method-select">
+            <option value="capsule" selected>Capsule body (pose-fitted primitives, any number of photos)</option>
+            <option value="silhouette_relief">Silhouette relief (single photo — follows the photo's own outline directly)</option>
+            <option value="trellis">TRELLIS.2 (external, MIT-licensed — single human photo only; confirmed unreliable on animals, see below)</option>
+          </select>
+          <div class="trellis-status" id="trellis-status" style="display:none"></div>
+        </div>
+        <div class="checkbox-row" id="use-depth-row">
+          <input type="checkbox" id="use-depth" />
+          <label for="use-depth" style="margin:0">Use real depth estimation (single photo, needs the server's optional depth extras)</label>
+        </div>
+        <div class="checkbox-row" id="bust-mode-row" style="display:none">
+          <input type="checkbox" id="bust-mode" />
+          <label for="bust-mode" style="margin:0">This is a bust/half-body photo (don't add legs — ends where the photo ends, on a flat base)</label>
+        </div>
+        <div class="field" id="crop-base-field" style="display:none">
+          <label>Custom base — drag the line to where the model should end</label>
+          <div class="crop-preview" id="crop-preview">
+            <img id="crop-preview-img" alt="" />
+            <div class="crop-shade" id="crop-shade"></div>
+            <div class="crop-line" id="crop-line"></div>
+          </div>
+          <div class="hint">Everything below the line is left out of the model. Leave at the bottom to use the whole photo.</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script type="module" src="/static/app.js"></script>
