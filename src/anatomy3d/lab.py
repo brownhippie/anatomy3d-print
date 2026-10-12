@@ -195,7 +195,7 @@ class LabInputs:
 def prepare_inputs(photo_path: str) -> LabInputs:
     """Everything that depends only on the photo, computed once per run."""
     from .depth_source import estimate_relative_depth
-    from .face_features import detect_face_mesh
+    from .face_features import find_face_mesh
     from .person_segmenter import detect_person_alpha_with_source
     from .preprocess import load_image_rgb
 
@@ -212,7 +212,7 @@ def prepare_inputs(photo_path: str) -> LabInputs:
         alpha_bir = None
     depth = estimate_relative_depth(rgb)
     try:
-        face_mesh = detect_face_mesh(rgb)
+        face_mesh = find_face_mesh(rgb)
     except Exception:  # noqa: BLE001
         face_mesh = None
     mask = alpha_std > 0.5

@@ -124,3 +124,49 @@ def detect_face_mesh(rgb: np.ndarray) -> Optional[np.ndarray]:
     if not result.face_landmarks:
         return None
     return np.array([(lm.x * w, lm.y * h, lm.z * w) for lm in result.face_landmarks[0]], dtype=np.float64)
+
+
+def find_face_mesh(rgb: np.ndarray) -> Optional[np.ndarray]:
+    """detect_face_mesh, plus a second try for small faces. In a full-body
+    photo the face can be too few pixels for the landmarker to find at all
+    -- measured on a real full-body test photo: no face at full size, so
+    face shaping was silently skipped. Here the pose detector's nose
+    locates the head, that crop is enlarged to 800 px and searched again,
+    and the landmarks are mapped back to the full photo's pixels."""
+    face = detect_face_mesh(rgb)
+    if face is not None:
+        return face
+    try:
+        from .landmarks import _get_detector as _pose_detector
+
+        res = _pose_detector().detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb)))
+    except Exception:  # noqa: BLE001 - this is only a second try
+        return None
+    if not res.pose_landmarks:
+        return None
+    lms = res.pose_landmarks[0]
+    nose, left_sh, right_sh = lms[0], lms[11], lms[12]
+    if nose.presence < 0.5 or nose.visibility < 0.5:
+        return None
+    h, w = rgb.shape[:2]
+    if min(left_sh.presence, right_sh.presence) >= 0.5:
+        side = 1.2 * abs(left_sh.x - right_sh.x) * w  # shoulders are ~2.5 head widths
+    else:
+        side = 0.22 * h
+    side = int(max(side, 64))
+    x0 = int(min(max(0, nose.x * w - side / 2), max(0, w - side)))
+    y0 = int(min(max(0, nose.y * h - side / 2), max(0, h - side)))
+    crop = rgb[y0:y0 + side, x0:x0 + side]
+    zoom = 800.0 / max(crop.shape[:2])
+    if zoom <= 1.0:
+        return None  # already large enough; the first try would have found it
+    from PIL import Image
+
+    big = np.asarray(Image.fromarray(crop).resize((round(crop.shape[1] * zoom), round(crop.shape[0] * zoom)), Image.LANCZOS))
+    face = detect_face_mesh(big)
+    if face is None:
+        return None
+    face[:, 0] = face[:, 0] / zoom + x0
+    face[:, 1] = face[:, 1] / zoom + y0
+    face[:, 2] = face[:, 2] / zoom
+    return face

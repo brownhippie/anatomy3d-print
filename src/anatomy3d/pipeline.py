@@ -8,7 +8,7 @@ _NO_PROGRESS: Callable[[str, float], None] = lambda stage, frac: None
 
 import numpy as np
 
-from .face_features import detect_face_landmarks, detect_face_mesh
+from .face_features import detect_face_landmarks, find_face_mesh
 from .hair_features import detect_hair_mask
 from .landmarks import detect_pose_landmarks
 from .mesh_export import add_base_disk, export_glb, export_obj, scale_depth, to_trimesh
@@ -362,7 +362,7 @@ def run_silhouette_relief_pipeline(
     progress_cb("Shaping the face", 0.38)
     face_mesh = None
     try:
-        face_mesh = detect_face_mesh(rgb)
+        face_mesh = find_face_mesh(rgb)
     except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
         print(f"Note: face shaping skipped ({exc}).")
 
