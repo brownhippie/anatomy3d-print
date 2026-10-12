@@ -501,7 +501,24 @@ def _build_capsules(
         # so a near-zero/negative vertical gap (nose barely above neck,
         # or face landmarks misdetected) can't collapse the head height
         # to nothing.
+        #
+        # Also capped -- confirmed directly as a second, separate real
+        # bug on a different photo (a masked, capped subject): the nose
+        # landmark itself can come back far from its real position (a
+        # mask/hat confusing the pose model, not a turned head this
+        # time), giving nose.y-neck.y=120 against a head radius of 29 --
+        # a head+neck capsule more than 8x its own radius long, the same
+        # "cylinder, not a head" symptom from a different cause the floor
+        # alone doesn't guard against. head_r is reliable regardless (an
+        # ANSUR shoulder-width ratio, not a per-photo landmark), so it's
+        # computed here (duplicating the expression below, since this
+        # runs before that local) to cap against, rather than trusting an
+        # unbounded nose position. 1.9x is just above this project's own
+        # validated-good case (a 3.46 head-to-neck/head_r ratio once this
+        # cap is folded in, see the 2.1 multiplier just below).
+        head_r_cap_ref = HEAD_RADIUS_FRAC_OF_SHOULDER_WIDTH * shoulder_width
         head_up = max(joints["nose"][1] - neck[1], shoulder_width * 0.2)
+        head_up = min(head_up, head_r_cap_ref * 1.9)
         head_axis = np.array([0.0, head_up, 0.0])
         # A real head barely narrows from crown to jaw, then the neck
         # below it is a distinctly thinner cylinder -- modeling the whole
