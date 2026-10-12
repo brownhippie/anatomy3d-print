@@ -17,6 +17,7 @@ or training data licensing — everything here is either measured directly
 from the input photo or a well-known, unencumbered formula.
 """
 import itertools
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -36,6 +37,25 @@ from .safety import mad_margin_above_minimum
 # shoulders+hips are present — so 6 is the true floor, not a guess, and no
 # longer reachable as a failure path below 6.
 MIN_CAPSULES = 6
+
+
+@dataclass(frozen=True)
+class CapsuleOptions:
+    """Combination Lab switches; defaults are the current production build.
+    ring_fix: chains built as one continuous shape with smoothed radii
+    (False = the old piece-by-piece union that ringed the waist/limbs).
+    width_aware_limbs: limb depth ratio from limb thickness (False = the
+    original flat DEPTH_RATIO_LIMB_FLAT). hands: palm/thumb capsules.
+    smooth: Taubin pass after marching cubes."""
+
+    ring_fix: bool = True
+    width_aware_limbs: bool = True
+    hands: bool = True
+    smooth: bool = True
+
+
+# The single limb depth ratio used before limb depth became width-aware.
+DEPTH_RATIO_LIMB_FLAT = 0.92
 
 
 class HipsNotDetectedError(RuntimeError):
@@ -290,7 +310,7 @@ def _capsule_sdf(
     return dist - radius
 
 
-def _group_sdf(points: np.ndarray, pieces: list) -> np.ndarray:
+def _group_sdf(points: np.ndarray, pieces: list, continuous: bool = True) -> np.ndarray:
     """One segment's field. A silhouette chain's pieces run end to end
     along one straight segment; unioning them as separate capsules left a
     shallow crease at every join (each piece's rounded end cap doesn't line
@@ -301,7 +321,7 @@ def _group_sdf(points: np.ndarray, pieces: list) -> np.ndarray:
     if len(pieces) == 1:
         a, b, ra, rb, dra, drb, _ = pieces[0]
         return _capsule_sdf(points, a, b, ra, rb, dra, drb)
-    joined = all(np.allclose(pieces[i][1], pieces[i + 1][0]) for i in range(len(pieces) - 1))
+    joined = continuous and all(np.allclose(pieces[i][1], pieces[i + 1][0]) for i in range(len(pieces) - 1))
     if not joined:
         sdf = None
         for a, b, ra, rb, dra, drb, _ in pieces:
@@ -375,7 +395,7 @@ def _radius_from_distance_map(dist_map, px, py):
 
 
 def _chain_from_silhouette(
-    dist_map, image_width, image_height, a, b, ra, rb, dra, drb, n_samples, group
+    dist_map, image_width, image_height, a, b, ra, rb, dra, drb, n_samples, group, smooth_radii=True
 ):
     """Replaces one straight-taper capsule with a chain of `n_samples`
     shorter ones, each sized from the photo's own silhouette width at
@@ -416,7 +436,7 @@ def _chain_from_silhouette(
     # as a ring around the limb or waist. Smooth along the chain (ends kept)
     # so broad changes like a narrower waist survive and the jitter doesn't.
     radii = np.asarray(radii, dtype=float)
-    for _ in range(3):
+    for _ in range(3 if smooth_radii else 0):
         radii[1:-1] = 0.25 * radii[:-2] + 0.5 * radii[1:-1] + 0.25 * radii[2:]
 
     chain = []
@@ -501,7 +521,8 @@ def _hair_bumps(hair_mask, image_width, image_height, head_center, head_r, group
 
 
 def _build_capsules(
-    joints: dict, silhouette_mask=None, image_width=None, image_height=None, hair_mask=None
+    joints: dict, silhouette_mask=None, image_width=None, image_height=None, hair_mask=None,
+    options: CapsuleOptions = CapsuleOptions(),
 ) -> list:
     if "left_shoulder" not in joints or "right_shoulder" not in joints:
         raise RuntimeError("Shoulders not detected — need a front-facing upper-body view at least.")
@@ -633,6 +654,8 @@ def _build_capsules(
     _r_min, _r_max = min(_limb_radii), max(_limb_radii)
 
     def _limb_dr(r: float) -> float:
+        if not options.width_aware_limbs:
+            return DEPTH_RATIO_LIMB_FLAT
         t = (r - _r_min) / max(_r_max - _r_min, 1e-9)
         t = min(max(t, 0.0), 1.0)
         return DEPTH_RATIO_LIMB_THIN * (1.0 - t) + DEPTH_RATIO_LIMB_THICK * t
@@ -669,7 +692,7 @@ def _build_capsules(
     # requirement like legs above) when that hand's landmarks weren't
     # confidently detected, same fallback as every other optional joint
     # in this function.
-    for side in ("left", "right"):
+    for side in ("left", "right") if options.hands else ():
         hand_mid_name = f"{side}_hand_mid"
         if hand_mid_name not in joints:
             continue
@@ -699,7 +722,7 @@ def _build_capsules(
             ja, jb = seg[0], seg[1]
             chain = _chain_from_silhouette(
                 dist_map, image_width, image_height, ja, jb, ra, rb, dra, drb,
-                SILHOUETTE_SAMPLES_PER_SEGMENT, group_id,
+                SILHOUETTE_SAMPLES_PER_SEGMENT, group_id, smooth_radii=options.ring_fix,
             )
             if chain:
                 capsules.extend(chain)
@@ -930,8 +953,11 @@ def build_body_mesh(
     silhouette_mask: Optional[np.ndarray] = None,
     hair_mask: Optional[np.ndarray] = None,
     texture_rgb: Optional[np.ndarray] = None,
+    options: CapsuleOptions = CapsuleOptions(),
 ) -> BodyMesh:
-    """`depth_rgb`: the same preprocessed photo passed to pose detection.
+    """`options`: Combination Lab switches, see CapsuleOptions.
+
+    `depth_rgb`: the same preprocessed photo passed to pose detection.
     When given, sculpts the front surface using real per-pixel depth
     (anatomy3d.depth_source, optional extra) instead of the flat
     symmetric-thickness guess. Leave as None for the default, dependency-
@@ -969,6 +995,7 @@ def build_body_mesh(
         image_width=keypoints.image_width,
         image_height=keypoints.image_height,
         hair_mask=hair_mask,
+        options=options,
     )
     # Hair bumps are tagged with negative group ids (see _hair_bumps) so
     # they can be split out here and given their own blend width, the
@@ -1100,7 +1127,7 @@ def build_body_mesh(
     # single shape, not unioned piece by piece -- see _group_sdf. Different
     # segments still blend into each other with smooth-min.
     for _grp, pieces in itertools.groupby(capsules, key=lambda cap: cap[6]):
-        group_field = _group_sdf(points, list(pieces))
+        group_field = _group_sdf(points, list(pieces), continuous=options.ring_fix)
         field = group_field if field is None else _smooth_min(field, group_field, blend_k)
 
     if face_capsules:
@@ -1155,7 +1182,8 @@ def build_body_mesh(
     components = mesh.split(only_watertight=False)
     if len(components) > 1:
         mesh = max(components, key=lambda c: c.vertices.shape[0])
-    smooth_grid_terracing(mesh)
+    if options.smooth:
+        smooth_grid_terracing(mesh)
     verts, faces = mesh.vertices, mesh.faces
 
     if depth_rgb is not None:

@@ -40,6 +40,7 @@
           <button class="tab-btn active" id="tab-btn-photos" role="tab" aria-selected="true" data-tab="photos">Photos</button>
           <button class="tab-btn" id="tab-btn-viewer" role="tab" aria-selected="false" data-tab="viewer">Viewer</button>
           <button class="tab-btn" id="tab-btn-result" role="tab" aria-selected="false" data-tab="result">Result</button>
+          <button class="tab-btn" id="tab-btn-lab" role="tab" aria-selected="false" data-tab="lab">Lab</button>
         </div>
 
         <div class="tab-panel active" id="tab-photos" role="tabpanel">
@@ -65,6 +66,62 @@
           <div class="empty-result-hint" id="empty-result-hint">Nothing generated yet — switch to the Photos tab and hit Generate.</div>
         </div>
 
+        <div class="tab-panel" id="tab-lab" role="tabpanel">
+          <div class="lab-count" id="lab-count">Loading the combination list&hellip;</div>
+          <details class="lab-breakdown">
+            <summary>What gets combined</summary>
+            <div id="lab-dims"></div>
+          </details>
+
+          <div class="lab-run" id="lab-run" hidden>
+            <div class="lab-run-head">
+              <img id="lab-run-photo" alt="" />
+              <div>
+                <div class="lab-run-name" id="lab-run-name"></div>
+                <div class="lab-run-status" id="lab-run-status"></div>
+              </div>
+            </div>
+            <div class="lab-progress"><div class="lab-progress-bar" id="lab-progress-bar"></div></div>
+            <div class="lab-run-stats" id="lab-run-stats"></div>
+            <div class="lab-run-actions">
+              <button type="button" class="secondary" id="lab-pause">Pause</button>
+              <button type="button" class="secondary" id="lab-copy">Copy my results for Claude</button>
+            </div>
+            <div class="hint" id="lab-copy-hint"></div>
+          </div>
+
+          <button type="button" class="primary" id="lab-start">Start automated run on this photo</button>
+          <div class="hint" id="lab-start-hint">Pick a photo in the Photos tab first. The server works through every combination on its own; you can close the app and come back.</div>
+
+          <div class="field" id="lab-runs-field" hidden>
+            <label for="lab-run-select">Your runs</label>
+            <select id="lab-run-select"></select>
+          </div>
+
+          <div class="lab-controls" id="lab-controls" hidden>
+            <select id="lab-sort" aria-label="Sort">
+              <option value="score">Best auto-score</option>
+              <option value="rating">My rating</option>
+              <option value="newest">Newest</option>
+              <option value="number">Combination #</option>
+            </select>
+            <select id="lab-family" aria-label="Builder">
+              <option value="all">All builders</option>
+              <option value="O">Outline</option>
+              <option value="C">Capsule</option>
+            </select>
+            <select id="lab-only" aria-label="Show">
+              <option value="ok">Built</option>
+              <option value="rated">Rated by me</option>
+              <option value="failed">Failed</option>
+              <option value="all">Everything</option>
+            </select>
+          </div>
+          <div class="lab-grid" id="lab-grid"></div>
+          <button type="button" class="secondary" id="lab-more" hidden>Load more</button>
+          <div class="hint" id="lab-score-hint"></div>
+        </div>
+
         <div class="panel-actions">
           <button class="primary" id="generate-btn">Generate model</button>
           <button class="secondary" id="reset-btn">Start over</button>
@@ -81,7 +138,41 @@
         </div>
 
         <div class="viewer-toolbar">
+          <select id="finish-select" aria-label="Finish">
+            <option value="clay">Sand clay</option>
+            <option value="ivory">Ivory resin</option>
+            <option value="grey">Studio grey</option>
+            <option value="photo">Photo colour</option>
+          </select>
+          <button id="flat-toggle" type="button" aria-pressed="false" title="Show flat facets instead of smooth shading">Flat</button>
           <button id="reset-view-btn">Reset view</button>
+        </div>
+
+        <div class="lab-bar" id="lab-bar" hidden>
+          <div class="lab-bar-row">
+            <button type="button" class="lab-nav" id="lab-prev" aria-label="Previous combination">&#8249;</button>
+            <div class="lab-bar-mid">
+              <div class="lab-bar-title" id="lab-bar-title"></div>
+              <div class="lab-bar-sub" id="lab-bar-sub"></div>
+            </div>
+            <button type="button" class="lab-nav" id="lab-next" aria-label="Next combination">&#8250;</button>
+          </div>
+          <div class="lab-bar-row lab-bar-rate">
+            <div class="lab-stars" id="lab-stars" role="group" aria-label="Your rating">
+              <button type="button" data-star="1" aria-label="1 star">&#9733;</button>
+              <button type="button" data-star="2" aria-label="2 stars">&#9733;</button>
+              <button type="button" data-star="3" aria-label="3 stars">&#9733;</button>
+              <button type="button" data-star="4" aria-label="4 stars">&#9733;</button>
+              <button type="button" data-star="5" aria-label="5 stars">&#9733;</button>
+            </div>
+            <button type="button" class="lab-info-btn" id="lab-info-btn">Details</button>
+          </div>
+          <div class="lab-info" id="lab-info" hidden>
+            <ul id="lab-info-list"></ul>
+            <label for="lab-note">Note for Claude</label>
+            <textarea id="lab-note" rows="2" placeholder="e.g. face is right but arms too thick"></textarea>
+            <button type="button" class="secondary" id="lab-note-save">Save note</button>
+          </div>
         </div>
 
         <div class="stage-bottom-bar">

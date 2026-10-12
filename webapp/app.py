@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -101,6 +102,18 @@ _job_state_lock = threading.Lock()
 # process-wide sys.stdout, which two concurrent calls would corrupt for
 # each other if allowed to run at once.
 _generation_lock = threading.Lock()
+
+# Combination Lab (see lab_api.py). Imported by path so it resolves the same
+# whether the server is started as `webapp.app:app` or `app:app --app-dir webapp`.
+sys.path.insert(0, str(WEBAPP_DIR))
+from lab_api import router as lab_router, start_worker as start_lab_worker  # noqa: E402
+
+app.include_router(lab_router)
+
+
+@app.on_event("startup")
+def _start_lab_worker() -> None:
+    start_lab_worker(_generation_lock)
 
 
 def _run_pipeline_capturing(fn, *args, **kwargs) -> "list[str]":

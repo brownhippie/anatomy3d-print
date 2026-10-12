@@ -123,12 +123,16 @@ ANIMAL_CATEGORIES = (3, 8, 10, 12, 13, 17)  # bird, cat, cow, dog, horse, sheep
 # photos that its edges are visibly better there than this module's own
 # output. See _birefnet_refine for why it's used as a bounded edge
 # refinement rather than a wholesale replacement.
-BIREFNET_MODEL_URL = "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx"
-BIREFNET_MODEL_CACHE_PATH = Path.home() / ".cache" / "anatomy3d-print" / "birefnet_lite.onnx"
+# A 512x512 community ONNX export of the same BiRefNet_lite weights (the
+# official onnx-community export is fixed at 1024x1024, whose activations
+# alone measured ~7.4GB -- see _BIREFNET_REFINE_ENABLED below). Measured
+# at 512: ~0.9GB peak, 8.6s on CPU.
+BIREFNET_MODEL_URL = "https://huggingface.co/Phoenix-ActuallyFree/BiRefNet_lite_512-ONNX/resolve/main/onnx/model.onnx"
+BIREFNET_MODEL_CACHE_PATH = Path.home() / ".cache" / "anatomy3d-print" / "birefnet_lite_512.onnx"
 
 # Read directly from the model's own shipped preprocessor_config.json and
 # its ONNX graph's input/output tensor names, not guessed.
-_BIREFNET_INPUT_SIZE = 1024
+_BIREFNET_INPUT_SIZE = 512
 _BIREFNET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _BIREFNET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -1195,7 +1199,7 @@ def _birefnet_refine(rgb: np.ndarray, mask: np.ndarray, alpha: np.ndarray) -> "t
 _BIREFNET_REFINE_ENABLED = os.environ.get("ANATOMY3D_BIREFNET_REFINE", "") == "1"
 
 
-def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray, float]]":
+def _combine_channels(rgb: np.ndarray, refine: Optional[bool] = None) -> "Optional[tuple[np.ndarray, np.ndarray, float]]":
     person = _segment_full_person(rgb)
     animal = _segment_full_animal_robust(rgb)
     if person is not None:
@@ -1214,7 +1218,7 @@ def _combine_channels(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, np.ndarray
     mask, alpha = _drop_unvalidated_islands(mask, alpha)
     if not mask.any():
         return None
-    if _BIREFNET_REFINE_ENABLED:
+    if _BIREFNET_REFINE_ENABLED if refine is None else refine:
         mask, alpha = _birefnet_refine(rgb, mask, alpha)
         if not mask.any():
             return None
@@ -1289,7 +1293,7 @@ def detect_person_alpha(rgb: np.ndarray) -> Optional[np.ndarray]:
     return combined[1] if combined else None
 
 
-def detect_person_alpha_with_source(rgb: np.ndarray) -> "Optional[tuple[np.ndarray, float]]":
+def detect_person_alpha_with_source(rgb: np.ndarray, refine: Optional[bool] = None) -> "Optional[tuple[np.ndarray, float]]":
     """Same alpha as detect_person_alpha, plus animal_fraction: what
     share of the final mask's area the ANIMAL channel itself confirms
     (0.0 = no animal-channel evidence at all, higher = more likely a
@@ -1306,5 +1310,5 @@ def detect_person_alpha_with_source(rgb: np.ndarray) -> "Optional[tuple[np.ndarr
     nearly as confidently as an actual human. animal_fraction instead,
     because DeepLabV3's animal channel is a real trained per-species
     classifier and doesn't share that failure mode."""
-    combined = _combine_channels(rgb)
+    combined = _combine_channels(rgb, refine=refine)
     return (combined[1], combined[2]) if combined else None

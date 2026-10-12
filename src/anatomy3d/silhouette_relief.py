@@ -393,8 +393,25 @@ def build_silhouette_relief_mesh(
     limb_depth_scale: float = 0.9,
     bust_mode: bool = False,
     face_mesh: Optional[np.ndarray] = None,
+    profile: str = "poisson",
+    edge: str = "round",
+    depth_map: Optional[np.ndarray] = None,
+    layer_rescue: str = "auto",
+    face_strength: Optional[float] = None,
+    smooth: bool = True,
 ) -> BodyMesh:
-    """`bust_mode`: skip _detect_crop_and_extend's synthetic leg
+    """Combination Lab switches (defaults are the current production build):
+    `profile` -- cross-section shape: "tent" (9 Oct: straight ramp from the
+    edge), "row_ellipse" (11 Oct: per-row quarter-ellipse; horizontal
+    ripples), "poisson" (12 Oct: one smooth 2D field). `edge` -- "hard"
+    (mask cut + thickness floor; seam around the outline) or "round".
+    `depth_map` -- a precomputed estimate_relative_depth(rgb) for the same
+    photo, used instead of recomputing from depth_rgb. `layer_rescue` --
+    "auto" (animals only), "off", or "on" (forced, also on people).
+    `face_strength` -- landmark face relief multiplier; None means 0.45
+    with depth, 1.0 without. `smooth` -- Taubin pass after marching cubes.
+
+    `bust_mode`: skip _detect_crop_and_extend's synthetic leg
     completion -- for a photo that was always meant to show only the
     upper body (a bust/headshot-style portrait), not a standing figure
     cropped by accident. Without this, a photo cut off at the waist/
@@ -553,13 +570,34 @@ def build_silhouette_relief_mesh(
     width_frac = np.clip((dist - dist_min) / max(dist_max - dist_min, 1e-6), 0.0, 1.0)
     depth_scale_field = limb_depth_scale * (1.0 - width_frac) + depth_scale * width_frac
 
-    # Round cross-sections from one smooth 2D field. A per-row version
-    # (each row scaled to its own widest point) stacked into horizontal
-    # ripples, since neighbouring rows' peaks differ, and cut grooves where
-    # an arm's row-run merged into the torso's.
-    half_thickness_raw = _inflation_height(grid_mask) / scale * depth_scale_field
-    half_thickness = np.where(grid_mask, half_thickness_raw, 0.0)
-    min_half_thickness = 1.0 / scale  # one grid cell, used by the depth bias floor below
+    # Round cross-sections from one smooth 2D field (profile="poisson"). A
+    # per-row version (each row scaled to its own widest point) stacked
+    # into horizontal ripples, since neighbouring rows' peaks differ, and
+    # cut grooves where an arm's row-run merged into the torso's; it and
+    # the original straight ramp stay available for the Combination Lab.
+    if profile == "tent":
+        half_thickness_raw = dist * depth_scale_field
+    elif profile == "row_ellipse":
+        row_ridge = np.zeros_like(dist)
+        for y in range(dist.shape[0]):
+            row_mask = grid_mask[y]
+            if not row_mask.any():
+                continue
+            edges = np.flatnonzero(np.diff(np.concatenate(([0], row_mask.astype(np.int8), [0]))))
+            for s, e in zip(edges[0::2], edges[1::2]):
+                row_ridge[y, s:e] = dist[y, s:e].max()
+        t = np.clip(np.divide(dist, row_ridge, out=np.zeros_like(dist), where=row_ridge > 1e-6), 0.0, 1.0)
+        half_thickness_raw = row_ridge * np.sqrt(np.clip(1.0 - (1.0 - t) ** 2, 0.0, 1.0)) * depth_scale_field
+    else:
+        half_thickness_raw = _inflation_height(grid_mask) / scale * depth_scale_field
+    if edge == "hard":
+        # Original edge: a soft floor so thickness never reaches 0, with the
+        # mask cutting the volume off hard (see the field below).
+        min_half_thickness = max(1.0 / scale, 0.5)
+        half_thickness = np.where(grid_mask, np.sqrt(half_thickness_raw**2 + min_half_thickness**2), 0.0)
+    else:
+        half_thickness = np.where(grid_mask, half_thickness_raw, 0.0)
+        min_half_thickness = 1.0 / scale  # one grid cell, used by the depth bias floor below
 
     # mid/half_span generalize the symmetric lens (front = +half_thickness,
     # back = -half_thickness) to an optionally asymmetric one -- with no
@@ -567,10 +605,14 @@ def build_silhouette_relief_mesh(
     # recovering the original symmetric behavior.
     mid = np.zeros_like(half_thickness)
     half_span = half_thickness
-    if depth_rgb is not None:
-        from .depth_source import estimate_relative_depth
+    use_depth = depth_map is not None or depth_rgb is not None
+    if use_depth:
+        if depth_map is not None:
+            depth = depth_map
+        else:
+            from .depth_source import estimate_relative_depth
 
-        depth = estimate_relative_depth(depth_rgb)
+            depth = estimate_relative_depth(depth_rgb)
         depth_h, depth_w = depth.shape
         # grid (row, col) -> original full-photo pixel coords: undo the
         # pad offset and the crop+downsample scale, then add back the
@@ -603,7 +645,7 @@ def build_silhouette_relief_mesh(
         std = subj_vals.std() if subj_vals.size else 0.0
         if std > 1e-9:
             d_norm = (sampled - subj_vals.mean()) / std
-            if animal_frac > _LAYER_RESCUE_MIN_ANIMAL_FRAC:
+            if layer_rescue == "on" or (layer_rescue == "auto" and animal_frac > _LAYER_RESCUE_MIN_ANIMAL_FRAC):
                 d_norm = d_norm + _layered_detail_rescue(sampled, grid_mask, real_grid_mask, std)
             # Front-only bias, proportional to each column's own
             # thickness (tapers to ~0 at the mask edge, same as
@@ -623,7 +665,10 @@ def build_silhouette_relief_mesh(
     if face_mesh is not None:
         # Real depth already carries much of the face's shape; full-strength
         # landmark relief on top of it double-counts (deep groove at the mouth).
-        strength = _FACE_RELIEF_WITH_DEPTH if depth_rgb is not None else 1.0
+        if face_strength is not None:
+            strength = face_strength
+        else:
+            strength = _FACE_RELIEF_WITH_DEPTH if use_depth else 1.0
         face_add = np.where(grid_mask, _face_relief(face_mesh, (gh, gw), y0, x0, scale, pad) * strength, 0.0)
         front = mid + half_span + face_add
         back = mid - half_span
@@ -640,27 +685,34 @@ def build_silhouette_relief_mesh(
     # point is itself a small degenerate case, same family of problem as
     # the edge cusp above.
     z_max = true_max * 1.05
-    # Depth steps the size of the grid cells (slightly finer), so voxels
-    # are about cube-shaped and the rounded edges resolve evenly.
-    dz_target = 0.6 / scale
+    if edge == "hard":
+        # Original field: depth steps 3x finer than the floor thickness (so
+        # thin limbs close), volume cut off hard at the mask.
+        dz_target = min_half_thickness / 3.0
+        G = np.where(grid_mask, half_span.astype(np.float64) ** 2, 0.0).astype(np.float32)
+    else:
+        # Depth steps the size of the grid cells (slightly finer), so voxels
+        # are about cube-shaped and the rounded edges resolve evenly.
+        dz_target = 0.6 / scale
+        # The solid is (z - mid)^2 <= G. Inside the outline G = half_span^2,
+        # which falls linearly to ~0 at the edge; outside it continues below
+        # zero at that same rate instead of being cut off by the hard mask,
+        # so the front and back surfaces meet in a rounded edge rather than a
+        # seam-like wall around the whole outline.
+        span_sq = np.where(grid_mask, half_span.astype(np.float64) ** 2, 0.0)
+        dist_grid = distance_transform_edt(grid_mask)
+        near_edge = grid_mask & (dist_grid <= 2.0)
+        edge_slope = float(np.median(span_sq[near_edge] / dist_grid[near_edge])) if near_edge.any() else 1.0
+        G = np.where(grid_mask, span_sq, -edge_slope * distance_transform_edt(~grid_mask)).astype(np.float32)
     gz = max(4, round(2 * z_max / dz_target) + 4)
-
-    # The solid is (z - mid)^2 <= G. Inside the outline G = half_span^2,
-    # which falls linearly to ~0 at the edge; outside it continues below
-    # zero at that same rate instead of being cut off by the hard mask,
-    # so the front and back surfaces meet in a rounded edge rather than a
-    # seam-like wall around the whole outline.
-    span_sq = np.where(grid_mask, half_span.astype(np.float64) ** 2, 0.0)
-    dist_grid = distance_transform_edt(grid_mask)
-    near_edge = grid_mask & (dist_grid <= 2.0)
-    edge_slope = float(np.median(span_sq[near_edge] / dist_grid[near_edge])) if near_edge.any() else 1.0
-    G = np.where(grid_mask, span_sq, -edge_slope * distance_transform_edt(~grid_mask)).astype(np.float32)
 
     zs = np.linspace(-z_max, z_max, gz)
     dz = zs[1] - zs[0]
     field = np.empty((gz, gh, gw), dtype=np.float32)
     for i, z in enumerate(zs):
         field[i] = (z - mid) ** 2 - G
+    if edge == "hard":
+        field[:, ~grid_mask] = 1.0
 
     verts, faces, _, _ = marching_cubes(field, level=0.0, spacing=(dz, 1.0 / scale, 1.0 / scale))
 
@@ -680,7 +732,8 @@ def build_silhouette_relief_mesh(
     components = mesh.split(only_watertight=False)
     if len(components) > 1:
         mesh = max(components, key=lambda c: c.vertices.shape[0])
-    smooth_grid_terracing(mesh)
+    if smooth:
+        smooth_grid_terracing(mesh)
     verts, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
 
     vz, vrow, vcol = verts[:, 0], verts[:, 1], verts[:, 2]

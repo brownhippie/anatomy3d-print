@@ -65,6 +65,7 @@ function setActiveTab(name) {
   // nothing, a blank Viewer tab) -- piggyback on the resize listener
   // initViewer() already wires up, now that #stage actually has a size.
   if (name === "viewer") window.dispatchEvent(new Event("resize"));
+  if (name === "lab") labOnShow();
 }
 
 tabBtns.forEach((btn) => btn.addEventListener("click", () => setActiveTab(btn.dataset.tab)));
@@ -550,12 +551,49 @@ function smoothShade(geometry, creaseDeg = 50) {
   geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 }
 
-function loadModel(objUrl) {
+// Viewer finishes (display only, instant, no rebuild). "photo" uses the
+// photo colours baked into the mesh when it has them (capsule builds), and
+// falls back to clay when it doesn't (outline builds carry no colour).
+const FINISH_MATERIALS = {
+  clay: FIGURE_MATERIAL,
+  ivory: new THREE.MeshPhysicalMaterial({ color: 0xe6dccb, roughness: 0.5, metalness: 0, clearcoat: 0.35, clearcoatRoughness: 0.4 }),
+  grey: new THREE.MeshStandardMaterial({ color: 0xa9b0b9, roughness: 0.7, metalness: 0 }),
+  photo: new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.6, metalness: 0 }),
+};
+const _materialCache = {};
+const viewerLook = { finish: "clay", flat: false };
+try {
+  const saved = JSON.parse(localStorage.getItem("figuro_finish") || "null");
+  if (saved && FINISH_MATERIALS[saved.finish]) Object.assign(viewerLook, saved);
+} catch (e) { /* storage unavailable: keep defaults */ }
+
+function lookMaterial(finish, flat) {
+  const key = `${finish}:${flat}`;
+  if (!_materialCache[key]) {
+    const m = FINISH_MATERIALS[finish].clone();
+    m.flatShading = flat;
+    _materialCache[key] = m;
+  }
+  return _materialCache[key];
+}
+
+function applyLook() {
+  if (!currentModel) return;
+  currentModel.traverse((child) => {
+    if (!child.isMesh) return;
+    const colors = child.userData.photoColors;
+    const usePhoto = viewerLook.finish === "photo" && colors;
+    if (usePhoto) child.geometry.setAttribute("color", colors);
+    else if (child.geometry.attributes.color) child.geometry.deleteAttribute("color");
+    child.material = lookMaterial(usePhoto ? "photo" : (viewerLook.finish === "photo" ? "clay" : viewerLook.finish), viewerLook.flat);
+  });
+}
+
+function loadModel(objUrl, onLoaded) {
   if (currentModel) {
     scene.remove(currentModel);
     currentModel.traverse((c) => {
       if (c.geometry) c.geometry.dispose();
-      if (c.material) c.material.dispose();
     });
     currentModel = null;
   }
@@ -563,11 +601,8 @@ function loadModel(objUrl) {
   loader.load(objUrl, (obj) => {
     obj.traverse((child) => {
       if (child.isMesh) {
-        // Every model shows in the same uncoloured finish; photo colours
-        // (still in the OBJ/GLB downloads) aren't used for the preview.
-        if (child.geometry.attributes.color) child.geometry.deleteAttribute("color");
+        if (child.geometry.attributes.color) child.userData.photoColors = child.geometry.attributes.color;
         smoothShade(child.geometry);
-        child.material = FIGURE_MATERIAL;
       }
     });
 
@@ -578,10 +613,27 @@ function loadModel(objUrl) {
 
     scene.add(obj);
     currentModel = obj;
+    applyLook();
     frameCamera(obj);
     emptyState.style.display = "none";
+    if (onLoaded) onLoaded();
   });
 }
+
+const finishSelect = document.getElementById("finish-select");
+const flatToggle = document.getElementById("flat-toggle");
+finishSelect.value = viewerLook.finish;
+flatToggle.setAttribute("aria-pressed", String(viewerLook.flat));
+function saveLook() {
+  try { localStorage.setItem("figuro_finish", JSON.stringify(viewerLook)); } catch (e) { /* ignore */ }
+  applyLook();
+}
+finishSelect.addEventListener("change", () => { viewerLook.finish = finishSelect.value; saveLook(); });
+flatToggle.addEventListener("click", () => {
+  viewerLook.flat = !viewerLook.flat;
+  flatToggle.setAttribute("aria-pressed", String(viewerLook.flat));
+  saveLook();
+});
 
 document.getElementById("reset-view-btn").addEventListener("click", () => {
   if (currentModel) frameCamera(currentModel);
@@ -625,6 +677,7 @@ function showResult(data) {
     setStatus("ok", "Model generated.");
   }
   renderMessages(data.messages);
+  labBar.hidden = true;
   loadModel(data.preview_url || data.obj_url);
   currentGlbUrl = data.glb_url;
   if (methodSelect.value === "trellis") loadTrellisStatus();
@@ -771,6 +824,240 @@ resetBtn.addEventListener("click", () => {
 
 initViewer();
 renderFileList();
+
+// ---------------- Combination Lab ----------------
+//
+// One photo -> the server builds every combination on its own (see
+// webapp/lab_api.py), scores each, and this tab shows them as they land.
+// Tapping one loads it in the viewer with a rating bar; ratings and notes
+// are stored on the server so "Copy my results" (or the export link) gives
+// Claude everything in one go.
+
+const LAB_RUN_KEY = "figuro_lab_run";
+const labBar = document.getElementById("lab-bar");
+const labGrid = document.getElementById("lab-grid");
+const labMore = document.getElementById("lab-more");
+const labSort = document.getElementById("lab-sort");
+const labFamily = document.getElementById("lab-family");
+const labOnly = document.getElementById("lab-only");
+const labRunSelect = document.getElementById("lab-run-select");
+const labState = { space: null, runId: null, items: [], offset: 0, count: 0, current: -1, timer: null };
+try { labState.runId = localStorage.getItem(LAB_RUN_KEY); } catch (e) { /* storage unavailable */ }
+
+const fmt = (n) => Number(n).toLocaleString();
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function labLoadSpace() {
+  if (labState.space) return;
+  const s = await (await fetch("/api/lab/space")).json();
+  labState.space = s;
+  const perView = s.finishes.length * s.shading.length;
+  document.getElementById("lab-count").innerHTML = `
+    <div class="lab-count-big">${fmt(s.total_builds)}</div>
+    <div>build combinations — ${s.families.map((f) => `${escapeHtml(f.name)} ${fmt(f.count)}`).join(" + ")}</div>
+    <div class="lab-count-sub">× ${perView} viewer finishes (${s.finishes.length} colours × ${s.shading.length} shadings) = ${fmt(s.total_views)} ways to look at them</div>`;
+  document.getElementById("lab-dims").innerHTML = s.families.map((f) => `
+    <h4>${escapeHtml(f.name)} — ${fmt(f.count)}</h4>
+    <ul>${f.dims.map((d) => `<li><b>${escapeHtml(d.label)}</b> (${d.options.length}): ${d.options.map(escapeHtml).join(" · ")}</li>`).join("")}</ul>
+    <div class="hint">${f.dims.map((d) => d.options.length).join(" × ")} = ${fmt(f.count)}</div>`).join("")
+    + `<h4>Historical versions included</h4><ul>${s.templates.map((t) => `<li>${escapeHtml(t.name)}</li>`).join("")}</ul>`;
+  document.getElementById("lab-score-hint").textContent = `How the auto-score works: ${s.score_formula}.`;
+}
+
+async function labRefreshRuns() {
+  const data = await (await fetch("/api/lab/runs")).json();
+  const runs = data.runs;
+  document.getElementById("lab-runs-field").hidden = runs.length === 0;
+  labRunSelect.innerHTML = runs.map((r) => `<option value="${r.run_id}">${escapeHtml(r.photo_name)} — ${fmt(r.done)}/${fmt(r.total)} (${r.status})</option>`).join("");
+  if (!labState.runId || !runs.some((r) => r.run_id === labState.runId)) labState.runId = runs.length ? runs[0].run_id : null;
+  if (labState.runId) labRunSelect.value = labState.runId;
+  return data;
+}
+
+function labShowRun(run) {
+  document.getElementById("lab-run").hidden = !run;
+  document.getElementById("lab-controls").hidden = !run;
+  if (!run) return;
+  document.getElementById("lab-run-photo").src = run.photo_url;
+  document.getElementById("lab-run-name").textContent = run.photo_name;
+  const status = { running: "Running", paused: "Paused", done: "Finished", error: "Stopped by an error" }[run.status] || run.status;
+  document.getElementById("lab-run-status").textContent = run.capsule_unavailable
+    ? `${status} · capsule builder can't use this photo, outline only`
+    : status;
+  document.getElementById("lab-progress-bar").style.width = `${run.total ? (100 * run.done) / run.total : 0}%`;
+  document.getElementById("lab-run-stats").textContent =
+    `${fmt(run.done)} of ${fmt(run.total)} done · ${fmt(run.ok)} built · ${fmt(run.failed)} failed · ${fmt(run.rated)} rated`
+    + (run.eta_hours != null && run.status === "running" ? ` · about ${run.eta_hours} h left` : "");
+  const pause = document.getElementById("lab-pause");
+  pause.hidden = run.status === "done";
+  pause.textContent = run.status === "running" ? "Pause" : "Resume";
+}
+
+async function labLoadItems(reset) {
+  if (!labState.runId) { labGrid.innerHTML = ""; labShowRun(null); return; }
+  if (reset) { labState.items = []; labState.offset = 0; }
+  const q = new URLSearchParams({ sort: labSort.value, family: labFamily.value, only: labOnly.value, offset: labState.offset, limit: 40 });
+  const res = await fetch(`/api/lab/runs/${labState.runId}?${q}`);
+  if (!res.ok) { labGrid.innerHTML = ""; return; }
+  const data = await res.json();
+  labShowRun(data.run);
+  labState.count = data.count;
+  labState.items = labState.items.concat(data.items);
+  labState.offset = labState.items.length;
+  labRenderGrid();
+}
+
+function labCard(item, i) {
+  const stars = item.rating ? "★".repeat(item.rating.stars) : "";
+  const pic = item.thumb_url ? `<img loading="lazy" src="${item.thumb_url}" alt="" />` : `<div class="lab-fail">failed</div>`;
+  const label = item.template || (item.changed.length ? item.changed.slice(0, 2).join(" · ") + (item.changed.length > 2 ? ` +${item.changed.length - 2}` : "") : "current settings");
+  const metric = item.status === "ok"
+    ? `score ${item.score}${item.face_found ? ` · face ${item.face_err_pct}%` : ""}`
+    : escapeHtml((item.error || "").slice(0, 60));
+  return `<button type="button" class="lab-card${i === labState.current ? " current" : ""}" data-i="${i}">
+    ${pic}
+    <div class="lab-card-n">#${fmt(item.n)} <span>${escapeHtml(item.family.split(" ")[0])}</span>${stars ? `<span class="lab-card-stars">${stars}</span>` : ""}</div>
+    <div class="lab-card-label">${escapeHtml(label)}</div>
+    <div class="lab-card-metric">${metric}</div>
+  </button>`;
+}
+
+function labRenderGrid() {
+  labGrid.innerHTML = labState.items.length
+    ? labState.items.map(labCard).join("")
+    : `<div class="empty-result-hint">Nothing here yet — results appear as the server finishes them.</div>`;
+  labMore.hidden = labState.items.length >= labState.count;
+}
+
+labGrid.addEventListener("click", (e) => {
+  const card = e.target.closest(".lab-card");
+  if (card) labOpen(Number(card.dataset.i));
+});
+labMore.addEventListener("click", () => labLoadItems(false));
+[labSort, labFamily, labOnly].forEach((el) => el.addEventListener("change", () => labLoadItems(true)));
+labRunSelect.addEventListener("change", () => {
+  labState.runId = labRunSelect.value;
+  try { localStorage.setItem(LAB_RUN_KEY, labState.runId); } catch (e) { /* ignore */ }
+  labLoadItems(true);
+});
+
+function labPaintStars(n) {
+  document.querySelectorAll("#lab-stars button").forEach((b) => b.classList.toggle("on", Number(b.dataset.star) <= n));
+}
+
+async function labOpen(i) {
+  if (i >= labState.items.length && labState.items.length < labState.count) await labLoadItems(false);
+  const item = labState.items[i];
+  if (!item) return;
+  labState.current = i;
+  labBar.hidden = false;
+  document.getElementById("lab-bar-title").textContent = `#${fmt(item.n)} of ${fmt(labState.space ? labState.space.total_builds : 0)} · ${item.family}`;
+  document.getElementById("lab-bar-sub").textContent = item.status === "ok"
+    ? `score ${item.score} · shape ${item.shape_iou}% · spikes ${item.spike_pct}% · wall ${item.min_wall_mm}mm${item.face_found === null ? "" : item.face_found ? ` · face ${item.face_err_pct}%` : " · no face found"}`
+    : `failed: ${item.error || ""}`;
+  document.getElementById("lab-info-list").innerHTML = (item.template ? `<li><b>${escapeHtml(item.template)}</b></li>` : "")
+    + item.options.map((o) => `<li>${escapeHtml(o)}</li>`).join("");
+  document.getElementById("lab-note").value = item.rating ? item.rating.note : "";
+  labPaintStars(item.rating ? item.rating.stars : 0);
+  statsBar.style.display = "none";
+  downloadBar.innerHTML = item.status === "ok"
+    ? `<a href="/api/lab/runs/${labState.runId}/stl/${item.code}" download>Download STL</a>`
+    : "";
+  setActiveTab("viewer");
+  if (item.model_url) loadModel(item.model_url);
+}
+
+async function labRate(stars, note) {
+  const item = labState.items[labState.current];
+  if (!item) return;
+  const res = await fetch(`/api/lab/runs/${labState.runId}/rate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code: item.code, stars, note }),
+  });
+  if (res.ok) {
+    item.rating = stars > 0 || note ? { stars, note } : null;
+    labPaintStars(stars);
+  }
+}
+
+document.getElementById("lab-stars").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-star]");
+  if (!b) return;
+  const item = labState.items[labState.current];
+  const stars = Number(b.dataset.star);
+  const same = item && item.rating && item.rating.stars === stars;
+  labRate(same ? 0 : stars, document.getElementById("lab-note").value);
+});
+document.getElementById("lab-note-save").addEventListener("click", () => {
+  const item = labState.items[labState.current];
+  labRate(item && item.rating ? item.rating.stars : 0, document.getElementById("lab-note").value);
+});
+document.getElementById("lab-info-btn").addEventListener("click", () => {
+  const info = document.getElementById("lab-info");
+  info.hidden = !info.hidden;
+});
+document.getElementById("lab-prev").addEventListener("click", () => labState.current > 0 && labOpen(labState.current - 1));
+document.getElementById("lab-next").addEventListener("click", () => labOpen(labState.current + 1));
+
+document.getElementById("lab-start").addEventListener("click", async () => {
+  const hint = document.getElementById("lab-start-hint");
+  if (!selectedFiles.length) { hint.textContent = "Pick a photo in the Photos tab first."; setActiveTab("photos"); return; }
+  const form = new FormData();
+  form.append("image", selectedFiles[0]);
+  hint.textContent = "Starting…";
+  const res = await fetch("/api/lab/runs", { method: "POST", body: form });
+  if (!res.ok) { hint.textContent = "Couldn't start the run — try again."; return; }
+  labState.runId = (await res.json()).run_id;
+  try { localStorage.setItem(LAB_RUN_KEY, labState.runId); } catch (e) { /* ignore */ }
+  hint.textContent = "Running. The first results take about a minute (the photo is analysed once first).";
+  await labRefreshRuns();
+  labLoadItems(true);
+});
+
+document.getElementById("lab-pause").addEventListener("click", async (e) => {
+  const action = e.target.textContent === "Pause" ? "pause" : "resume";
+  const run = await (await fetch(`/api/lab/runs/${labState.runId}/${action}`, { method: "POST" })).json();
+  labShowRun(run);
+});
+
+document.getElementById("lab-copy").addEventListener("click", async () => {
+  const hint = document.getElementById("lab-copy-hint");
+  const exportUrl = `${location.origin}/api/lab/runs/${labState.runId}/export`;
+  const data = await (await fetch(exportUrl)).json();
+  const lines = [
+    `Figuro Lab results — run ${data.run.run_id} (${data.run.photo_name})`,
+    `${data.run.done}/${data.run.total} combinations done, ${data.run.ok} built, ${data.ratings.length} rated`,
+    `Full data: ${exportUrl}`,
+    "",
+    ...data.ratings.map((r) => `#${r.n} ${r.code} ${"★".repeat(r.stars)}${r.note ? ` — ${r.note}` : ""}`),
+  ];
+  const text = lines.join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    hint.textContent = "Copied — paste it to Claude.";
+  } catch (err) {
+    hint.textContent = `Couldn't copy automatically. Send Claude this link: ${exportUrl}`;
+  }
+});
+
+async function labOnShow() {
+  try {
+    await labLoadSpace();
+    await labRefreshRuns();
+    await labLoadItems(true);
+  } catch (e) { /* offline: the tab just stays as it was */ }
+  clearInterval(labState.timer);
+  labState.timer = setInterval(async () => {
+    if (!document.getElementById("tab-lab").classList.contains("active") || document.visibilityState !== "visible") return;
+    if (!labState.runId) return;
+    const res = await fetch(`/api/lab/runs/${labState.runId}?limit=1`);
+    if (res.ok) labShowRun((await res.json()).run);
+  }, 8000);
+}
 
 // A direct, unambiguous way to confirm a given page load is actually on
 // a given deploy -- see /api/version in webapp/app.py -- instead of
