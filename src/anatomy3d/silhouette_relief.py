@@ -385,6 +385,220 @@ def _proportioned_thickness(
     return inflation * gain * ratio
 
 
+# Arms vs body. The front outline alone can't tell an arm crossed in front of
+# the chest from the chest itself: inflating the whole outline gave the arms
+# the same depth BEHIND the body as in front -- a bulge on the back of every
+# crossed-arm build. With pose points the arms are traced as their own tubes
+# and the back is built from the torso alone. Sizes are ANSUR II male means
+# relative to the shoulder-joint distance (biacromial breadth 415.7 mm):
+# biceps circumference / 2pi = 0.137, forearm 0.119, wrist 0.067, hand
+# breadth / 2 = 0.106, chest breadth 0.697, waist breadth 0.785.
+_ARM_R = {"shoulder": 0.137, "elbow": 0.125, "wrist": 0.067, "hand": 0.090}
+_TORSO_BREADTH = (0.697, 0.785)  # chest -> waist, x shoulder distance
+_CLOTHING = 1.12  # sleeves and jacket over the bare-body measurements
+_ARM_IN_FRONT_FRAC = 0.3  # share of the forearm lying across the torso that marks it as crossed in front
+
+
+def _arm_layout(pose: Optional[dict], grid_mask: np.ndarray, y0: int, x0: int, scale: float, pad: int) -> Optional[dict]:
+    """Arm tubes and the torso band from pose points (photo pixels).
+    Returns None when there aren't two shoulders to size things from."""
+    if not pose or "left_shoulder" not in pose or "right_shoulder" not in pose:
+        return None
+    gh, gw = grid_mask.shape
+
+    def g(name):
+        x, y = pose[name][0], pose[name][1]
+        return np.array([(y - y0) * scale + pad, (x - x0) * scale + pad], dtype=np.float64)
+
+    ls, rs = g("left_shoulder"), g("right_shoulder")
+    sw = float(np.linalg.norm(ls - rs))
+    if sw < 8.0:
+        return None
+    rows, cols = np.mgrid[0:gh, 0:gw].astype(np.float64)
+
+    # torso band: shoulders down, centred between shoulders (and hips if seen)
+    sy, scx = (ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0
+    if "left_hip" in pose and "right_hip" in pose:
+        lh, rh = g("left_hip"), g("right_hip")
+        hy, hcx = (lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0
+        torso_len = max(hy - sy, sw * 0.5)
+    else:
+        hcx, torso_len = scx, _torso_profile()["torso_len_over_shoulders"] * sw
+    frac = np.clip((rows[:, 0] - sy) / torso_len, 0.0, 1.0)
+    cx_row = scx + (hcx - scx) * frac
+    hw_row = 0.5 * sw * _CLOTHING * (_TORSO_BREADTH[0] + (_TORSO_BREADTH[1] - _TORSO_BREADTH[0]) * frac)
+    band = np.abs(cols - cx_row[:, None]) <= hw_row[:, None]
+    band[rows[:, 0] < sy] = True  # head, neck and shoulder tops are all body
+
+    best = np.full((gh, gw), -np.inf)
+    r_px = np.zeros((gh, gw))
+    d_px = np.zeros((gh, gw))
+    w_on = np.zeros((gh, gw))
+    for side in ("left", "right"):
+        chain = [("shoulder", g(f"{side}_shoulder"))]
+        for joint in ("elbow", "wrist"):
+            if f"{side}_{joint}" not in pose:
+                break
+            chain.append((joint, g(f"{side}_{joint}")))
+        if len(chain) == 3:
+            tips = [g(f"{side}_{k}") for k in ("index", "pinky", "thumb") if f"{side}_{k}" in pose]
+            if tips:
+                chain.append(("hand", np.mean(tips, axis=0)))
+        if len(chain) < 2:
+            continue
+        in_front = False
+        if len(chain) >= 3:
+            e, wr = chain[1][1], chain[2][1]
+            pts = e + np.linspace(0, 1, 21)[:, None] * (wr - e)
+            ri = np.clip(np.round(pts[:, 0]).astype(int), 0, gh - 1)
+            ci = np.clip(np.round(pts[:, 1]).astype(int), 0, gw - 1)
+            in_front = float(np.mean(band[ri, ci] & (ri > sy))) >= _ARM_IN_FRONT_FRAC
+        # how much of the tube rests on the torso's front, per chain point
+        on = {"shoulder": 0.0, "elbow": 0.5 if in_front else 0.0, "wrist": 1.0 if in_front else 0.0, "hand": 1.0 if in_front else 0.0}
+        for (na, a), (nb, b) in zip(chain[:-1], chain[1:]):
+            ra, rb = _ARM_R[na] * sw * _CLOTHING, _ARM_R[nb] * sw * _CLOTHING
+            ab = b - a
+            L2 = float(ab @ ab) or 1.0
+            t = np.clip(((rows - a[0]) * ab[0] + (cols - a[1]) * ab[1]) / L2, 0.0, 1.0)
+            d = np.hypot(rows - (a[0] + t * ab[0]), cols - (a[1] + t * ab[1]))
+            r = ra + (rb - ra) * t
+            inside = r - d
+            upd = inside > best
+            best = np.where(upd, inside, best)
+            r_px = np.where(upd, r, r_px)
+            d_px = np.where(upd, d, d_px)
+            w_on = np.where(upd, on[na] + (on[nb] - on[na]) * t, w_on)
+    if not np.isfinite(best).any():
+        return None
+    arm = grid_mask & (best > -0.25 * r_px)  # a little past the tube: sleeves are looser than the arm
+    arm_only = arm & ~band
+    return {"arm": arm, "arm_only": arm_only, "r": r_px / scale, "d": d_px / scale, "w": w_on,
+            "shoulder_row": sy, "hip_row": sy + torso_len, "centre_col": cx_row}
+
+
+_TORSO_PROFILE = {}
+
+
+def _torso_profile() -> dict:
+    """Human torso cross-section shape (data/torso_profile.npz, measured
+    from the CC0 MakeHuman base mesh -- see data/README.md)."""
+    if not _TORSO_PROFILE:
+        from pathlib import Path
+
+        z = np.load(Path(__file__).with_name("data") / "torso_profile.npz")
+        _TORSO_PROFILE.update({k: z[k] for k in z.files})
+        _TORSO_PROFILE["torso_len_over_shoulders"] = float(z["torso_len_over_shoulders"])
+    return _TORSO_PROFILE
+
+
+# Template levels that are torso alone: above u=0.2 the base mesh's
+# A-posed arms are still joined to the shoulders, below u=1.1 the legs part.
+_TORSO_U = (0.2, 1.1)
+
+
+def _human_torso(torso_half: np.ndarray, body_mask: np.ndarray, layout: dict):
+    """Torso front and back surfaces with a human cross-section instead of a
+    mirror-image lens: at each height the depth through the torso's centre
+    line (from the outline and the ANSUR ratios) is kept, and the front and
+    back take the template's shape across the width -- chest standing ~70%
+    in front of the side seams with a flat upper back, a balanced waist,
+    the seat reaching behind. Between the shoulder joints and the neck, and
+    below the hips, it fades back to the plain lens."""
+    prof = _torso_profile()
+    U, S, F, B = prof["u"], prof["s"], prof["front"], prof["back"]
+    ok = (U >= _TORSO_U[0]) & (U <= _TORSO_U[1])
+    U, F, B = U[ok], F[ok], B[ok]
+    # fill the template's few unmeasured edge samples from their neighbours,
+    # then smooth along the height: its level-to-level variation (a few
+    # percent) showed as horizontal bands in the shading of the back
+    from scipy.ndimage import gaussian_filter1d
+
+    F, B = F.copy(), B.copy()
+    for A in (F, B):
+        for i in range(len(A)):
+            good = np.isfinite(A[i])
+            A[i] = np.interp(S, S[good], A[i][good])
+    F = gaussian_filter1d(F, 1.5, axis=0, mode="nearest")
+    B = gaussian_filter1d(B, 1.5, axis=0, mode="nearest")
+    front = torso_half.copy()
+    back = -torso_half
+    sy, hy = layout["shoulder_row"], layout["hip_row"]
+    gh, gw = body_mask.shape
+    # Measure each row's torso run first, then smooth centre, half-width and
+    # depth down the body: measured row by row they jitter, and the jitter
+    # showed as horizontal bands across the back.
+    rows, us, wts, lefts, rights, ccs, hws, d0s = [], [], [], [], [], [], [], []
+    for r in range(gh):
+        u = (r - sy) / max(hy - sy, 1.0)
+        wt = float(np.clip(u / _TORSO_U[0], 0.0, 1.0) * np.clip((1.25 - u) / (1.25 - _TORSO_U[1]), 0.0, 1.0))
+        if wt <= 0.0:
+            continue
+        row = body_mask[r]
+        on = np.flatnonzero(row)
+        if not len(on):
+            continue
+        c = int(round(layout["centre_col"][r]))
+        c = c if 0 <= c < gw and row[c] else int(on[np.argmin(np.abs(on - c))])
+        left, right = c, c
+        while left > 0 and row[left - 1]:
+            left -= 1
+        while right < gw - 1 and row[right + 1]:
+            right += 1
+        hw = (right - left + 1) / 2.0
+        cc = (left + right) / 2.0
+        d0 = 2.0 * float(torso_half[r, int(round(cc))])
+        if hw < 2 or d0 <= 0:
+            continue
+        rows.append(r); us.append(u); wts.append(wt); lefts.append(left); rights.append(right)
+        ccs.append(cc); hws.append(hw); d0s.append(d0)
+    if not rows:
+        return front, back
+    sig = max(3.0, 0.025 * gh)
+    ccs, hws, d0s = (gaussian_filter1d(np.array(v, dtype=np.float64), sig, mode="nearest") for v in (ccs, hws, d0s))
+    for r, u, wt, left, right, cc, hw, d0 in zip(rows, us, wts, lefts, rights, ccs, hws, d0s):
+        uu = float(np.clip(u, U[0], U[-1]))
+        f_s = np.array([np.interp(uu, U, F[:, j]) for j in range(len(S))])
+        b_s = np.array([np.interp(uu, U, B[:, j]) for j in range(len(S))])
+        cols = np.arange(left, right + 1)
+        sv = np.clip((cols - cc) / hw, -1.0, 1.0)
+        front[r, cols] = wt * d0 * np.interp(sv, S, f_s) + (1 - wt) * torso_half[r, cols]
+        back[r, cols] = wt * d0 * np.interp(sv, S, b_s) - (1 - wt) * torso_half[r, cols]
+    front = np.where(body_mask, _masked_blur(front, body_mask, 1.5), 0.0)
+    back = np.where(body_mask, _masked_blur(back, body_mask, 1.5), 0.0)
+    return front, np.minimum(back, front)
+
+
+def _with_arms(layout: dict, grid_mask: np.ndarray, torso_front: np.ndarray, torso_back: np.ndarray, arm_ratio: float, dist_out: np.ndarray):
+    """Front and back surfaces (photo px, z toward camera) of the torso plus
+    the arm tubes. Arms crossed in front rest on the torso's front surface;
+    arms at the sides stay centred. The back is the torso's own back.
+    `dist_out`: distance to the photo outline's edge (photo px)."""
+    torso = grid_mask & ~layout["arm_only"]
+    tf = np.where(torso, torso_front, 0.0)
+    r, d, w = layout["r"], layout["d"], layout["w"]
+    # Depth into the tube from its nearest edge. Where the arm is outside
+    # the body, its outer edge is the photo's own outline (a sleeve is often
+    # wider than the bare arm the tube is sized from -- using the tube's
+    # edge there left a paper-thin fin along the sleeve); over the body the
+    # tube's own edge applies too.
+    e = np.where(layout["arm_only"], np.minimum(dist_out, r), np.minimum(np.minimum(dist_out, r - d), r))
+    e = np.clip(e, 0.0, None)
+    p = arm_ratio * np.sqrt(np.clip(e * (2.0 * r - e), 0.0, None))
+    zc = w * (tf + arm_ratio * r)
+    af, ab = zc + p, zc - p
+    arm = layout["arm"]
+    front = np.where(torso, tf, -np.inf)
+    back = np.where(torso, torso_back, np.inf)
+    front = np.where(arm, np.maximum(front, af), front)
+    back = np.where(arm, np.minimum(back, ab), back)
+    front = np.where(grid_mask, front, 0.0)
+    back = np.where(grid_mask, back, 0.0)
+    # soften the step where a tube meets the body without moving the outline
+    front = _masked_blur(front, grid_mask, 1.5)
+    back = _masked_blur(back, grid_mask, 1.5)
+    return front, np.minimum(back, front)
+
+
 def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
     """Front-surface offset (photo pixels) carrying the face's own shape --
     brow, eye sockets, nose, lips, cheekbones, jaw -- from the 478 face
@@ -467,6 +681,7 @@ def build_silhouette_relief_mesh(
     layer_rescue: str = "auto",
     face_strength: Optional[float] = None,
     smooth: bool = True,
+    pose: Optional[dict] = None,
 ) -> BodyMesh:
     """Combination Lab switches (defaults are the current production build):
     `profile` -- cross-section shape: "tent" (9 Oct: straight ramp from the
@@ -643,18 +858,25 @@ def build_silhouette_relief_mesh(
     # into horizontal ripples, since neighbouring rows' peaks differ, and
     # cut grooves where an arm's row-run merged into the torso's; it and
     # the original straight ramp stay available for the Combination Lab.
+    # With pose points the arms become their own tubes and the body's
+    # thickness comes from the outline WITHOUT the arm-only parts (see
+    # _arm_layout); without them the whole outline is inflated as before.
+    # people only: on an animal the pose detector can invent a human skeleton
+    layout = _arm_layout(pose, grid_mask, y0, x0, scale, pad) if pose and animal_frac <= _CROP_MAX_ANIMAL_FRAC else None
+    body_mask = grid_mask & ~layout["arm_only"] if layout is not None else grid_mask
+    body_dist = distance_transform_edt(body_mask).astype(np.float32) / scale if layout is not None else dist
     if profile == "tent":
-        half_thickness_raw = dist * depth_scale_field
+        half_thickness_raw = body_dist * depth_scale_field
     elif profile == "row_ellipse":
         row_ridge = np.zeros_like(dist)
         for y in range(dist.shape[0]):
-            row_mask = grid_mask[y]
+            row_mask = body_mask[y]
             if not row_mask.any():
                 continue
             edges = np.flatnonzero(np.diff(np.concatenate(([0], row_mask.astype(np.int8), [0]))))
             for s, e in zip(edges[0::2], edges[1::2]):
-                row_ridge[y, s:e] = dist[y, s:e].max()
-        t = np.clip(np.divide(dist, row_ridge, out=np.zeros_like(dist), where=row_ridge > 1e-6), 0.0, 1.0)
+                row_ridge[y, s:e] = body_dist[y, s:e].max()
+        t = np.clip(np.divide(body_dist, row_ridge, out=np.zeros_like(dist), where=row_ridge > 1e-6), 0.0, 1.0)
         half_thickness_raw = row_ridge * np.sqrt(np.clip(1.0 - (1.0 - t) ** 2, 0.0, 1.0)) * depth_scale_field
     else:
         head_weight = _head_weight(face_mesh, grid_mask.shape, y0, x0, scale, pad) if face_mesh is not None else None
@@ -663,7 +885,7 @@ def build_silhouette_relief_mesh(
             # A bust ends where the photo ends: mirror the outline below
             # the cut so the shape keeps its full thickness down to the
             # base instead of pinching to an edge there.
-            upper = grid_mask[: cut_row + 1]
+            upper = body_mask[: cut_row + 1]
             mirrored = np.vstack([upper, upper[::-1]])
             mirrored_head = None
             if head_weight is not None:
@@ -675,23 +897,29 @@ def build_silhouette_relief_mesh(
             half_thickness_raw[: cut_row + 1] = thick / scale
         else:
             half_thickness_raw = (
-                _proportioned_thickness(grid_mask, _inflation_height(grid_mask), depth_scale, limb_depth_scale, head_weight)
+                _proportioned_thickness(body_mask, _inflation_height(body_mask), depth_scale, limb_depth_scale, head_weight)
                 / scale
             )
+    if layout is not None:
+        torso_front, torso_back = _human_torso(np.where(body_mask, half_thickness_raw, 0.0), body_mask, layout)
+        front0, back0 = _with_arms(layout, grid_mask, torso_front, torso_back, limb_depth_scale, dist)
+    else:
+        front0, back0 = half_thickness_raw, -half_thickness_raw
+    mid0 = np.where(grid_mask, (front0 + back0) / 2.0, 0.0)
     if edge == "hard":
         # Original edge: a soft floor so thickness never reaches 0, with the
         # mask cutting the volume off hard (see the field below).
         min_half_thickness = max(1.0 / scale, 0.5)
-        half_thickness = np.where(grid_mask, np.sqrt(half_thickness_raw**2 + min_half_thickness**2), 0.0)
+        half_thickness = np.where(grid_mask, np.sqrt(((front0 - back0) / 2.0) ** 2 + min_half_thickness**2), 0.0)
     else:
-        half_thickness = np.where(grid_mask, half_thickness_raw, 0.0)
+        half_thickness = np.where(grid_mask, (front0 - back0) / 2.0, 0.0)
         min_half_thickness = 1.0 / scale  # one grid cell, used by the depth bias floor below
+    front0, back0 = mid0 + half_thickness, mid0 - half_thickness
 
-    # mid/half_span generalize the symmetric lens (front = +half_thickness,
-    # back = -half_thickness) to an optionally asymmetric one -- with no
-    # depth_rgb, mid stays 0 and half_span stays half_thickness, exactly
-    # recovering the original symmetric behavior.
-    mid = np.zeros_like(half_thickness)
+    # mid/half_span describe each column's front and back surfaces (z
+    # toward the camera). Without arms or depth this is the symmetric lens
+    # front = +half_thickness, back = -half_thickness.
+    mid = mid0
     half_span = half_thickness
     use_depth = depth_map is not None or depth_rgb is not None
     if use_depth:
@@ -749,13 +977,13 @@ def build_silhouette_relief_mesh(
             if profile == "poisson":
                 broad = _masked_blur(d_norm, real_grid_mask, max(0.05 * max(gh, gw), 1.0))
                 d_norm = np.maximum(broad, 0.0) + (d_norm - broad)
-            front = np.maximum(half_thickness * (1.0 + d_norm * depth_strength), min_half_thickness * 0.3)
-            back = -half_thickness
+            front = np.maximum(front0 + half_thickness * d_norm * depth_strength, mid0 + min_half_thickness * 0.3)
+            back = back0
             # Synthetic extension rows keep the plain symmetric guess
             # (real_pixel False -> front==back==half_thickness mid/span)
             # -- no real depth to bias them with.
             apply_bias = grid_mask & real_pixel
-            mid = np.where(apply_bias, (front + back) / 2.0, 0.0)
+            mid = np.where(apply_bias, (front + back) / 2.0, mid0)
             half_span = np.where(apply_bias, (front - back) / 2.0, half_thickness)
 
     if face_mesh is not None:

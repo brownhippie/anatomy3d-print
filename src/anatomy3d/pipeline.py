@@ -366,6 +366,14 @@ def run_silhouette_relief_pipeline(
     except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
         print(f"Note: face shaping skipped ({exc}).")
 
+    pose = {}
+    try:
+        from .landmarks import detect_pose_points
+
+        pose = detect_pose_points(rgb)
+    except Exception as exc:  # noqa: BLE001 - without it the arms are just part of the outline, as before
+        print(f"Note: arm separation skipped ({exc}).")
+
     progress_cb("Building relief mesh", 0.45)
     body = build_silhouette_relief_mesh(
         alpha,
@@ -376,6 +384,7 @@ def run_silhouette_relief_pipeline(
         bust_mode=bust_mode,
         face_mesh=face_mesh,
         face_strength=face_strength,
+        pose=pose,
     )
 
     progress_cb("Finishing mesh", 0.78)

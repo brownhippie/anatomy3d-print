@@ -227,3 +227,22 @@ def detect_pose_landmarks(image_path: str, min_visibility: float = 0.5, min_pres
         )
 
     return DetectedKeypoints(image_width=width, image_height=height, joints=joints)
+
+
+def detect_pose_points(rgb) -> dict:
+    """Confident pose joints as {name: (x_px, y_px)} on `rgb` at full size,
+    without detect_pose_landmarks' whole-body requirements -- a waist-up
+    photo's shoulders, elbows and wrists are still worth having (the outline
+    builder uses them to tell the arms from the body). Empty if none."""
+    import numpy as np
+
+    res = _get_detector().detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb)))
+    if not res.pose_landmarks:
+        return {}
+    h, w = rgb.shape[:2]
+    out = {}
+    for name, idx in MEDIAPIPE_JOINT_INDEX.items():
+        lm = res.pose_landmarks[0][idx]
+        if lm.visibility >= 0.5 and lm.presence >= 0.5 and 0.0 <= lm.y <= 1.0:
+            out[name] = (float(lm.x * w), float(lm.y * h))
+    return out

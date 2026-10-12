@@ -232,27 +232,12 @@ def prepare_inputs(photo_path: str) -> LabInputs:
     except Exception as exc:  # noqa: BLE001 - PoseUnusableError and friends
         capsule, unavailable = None, str(exc)
     try:
-        pose = _photo_pose(rgb)
+        from .landmarks import detect_pose_points
+
+        pose = detect_pose_points(rgb)
     except Exception:  # noqa: BLE001
         pose = {}
     return LabInputs(rgb, alpha_std, alpha_bir, float(animal_frac), depth, face_mesh, mask, capsule, unavailable, bust, pose)
-
-
-def _photo_pose(rgb: np.ndarray) -> dict:
-    import mediapipe as mp
-
-    from .landmarks import MEDIAPIPE_JOINT_INDEX, _get_detector
-
-    res = _get_detector().detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb)))
-    if not res.pose_landmarks:
-        return {}
-    h, w = rgb.shape[:2]
-    out = {}
-    for name, idx in MEDIAPIPE_JOINT_INDEX.items():
-        lm = res.pose_landmarks[0][idx]
-        if lm.visibility >= 0.5 and lm.presence >= 0.5 and 0.0 <= lm.y <= 1.0:
-            out[name] = (float(lm.x * w), float(lm.y * h))
-    return out
 
 
 def _capsule_inputs(photo_path: str, rgb_full: np.ndarray) -> dict:
@@ -337,6 +322,7 @@ def build(code: str, inputs: LabInputs):
             edge=o["edge"],
             layer_rescue=o["rescue"],
             smooth=o["smooth"] == "on",
+            pose=inputs.pose,
         )
     return add_base_disk(body, HEIGHT_MM)
 
@@ -528,13 +514,17 @@ PARAMS = [
     ("face_hw", "Face height : width", "detected", "forehead–chin ÷ cheek–cheek", "100 − % off"),
     ("face_id", "Face embedding match", "detected", "SFace (Apache-2.0) cosine, model's face render vs the photo's face", "100 × cosine"),
     ("d_head", "Head depth", "common", "front-to-back ÷ side-to-side at the eyes; ANSUR II 1.29", "100 − % off"),
-    ("d_chest", "Chest depth", "common", "front-to-back ÷ side-to-side at the chest; ANSUR II 0.89", "100 − % off"),
-    ("d_waist", "Waist depth", "common", "front-to-back ÷ side-to-side at the waist; ANSUR II 0.72", "100 − % off"),
+    ("d_chest", "Chest depth", "common", "front-to-back through the chest's centre line ÷ shoulder-joint distance; ANSUR II 0.61", "100 − % off"),
+    ("d_waist", "Waist depth", "common", "front-to-back through the waist's centre line ÷ shoulder-joint distance; ANSUR II 0.57", "100 − % off"),
     ("sealed", "Sealed", "common", "mesh is watertight", "100 or 0"),
     ("wall", "Thinnest wall", "common", "2nd-percentile wall thickness; printable at 0.8 mm", "100 × wall ÷ 0.8, max 100"),
     ("smooth_ok", "No spikes", "common", "share of folds sharper than 60°", "100 − 20 × %"),
 ]
-_ANSUR_DEPTH = {"d_head": 1.2914, "d_chest": 0.8907, "d_waist": 0.7212}
+# Head: head length / head breadth. Chest and waist: depth through the
+# centre line / biacromial (shoulder-joint) breadth -- measured against
+# the shoulders because arms hanging against the body join the torso's
+# cross-section and would inflate a width-based ratio's denominator.
+_ANSUR_DEPTH = {"d_head": 1.2914, "d_chest": 0.611, "d_waist": 0.572}
 _FACE_IDX = {"eye": (33, 263), "cheek": (234, 454), "brow_chin": (10, 152), "nose": (168, 2), "mouth": (61, 291), "jaw": (172, 397)}
 
 
@@ -585,6 +575,17 @@ def _run_width(row: np.ndarray, col: float) -> int:
     while r < len(row) - 1 and row[r + 1]:
         r += 1
     return r - l + 1
+
+
+def _centre_depth(mesh: trimesh.Trimesh, y: float, x_mid: float, half_band: float) -> Optional[float]:
+    """Front-to-back extent of the cross-section at height y, within
+    half_band of the body's centre line."""
+    sec = mesh.section(plane_origin=[0.0, y, 0.0], plane_normal=[0.0, 1.0, 0.0])
+    if sec is None:
+        return None
+    pts = np.vstack(sec.discrete)
+    near = np.abs(pts[:, 0] - x_mid) <= half_band
+    return float(np.ptp(pts[near, 2])) if near.sum() >= 2 else None
 
 
 def _depth_ratio(mesh: trimesh.Trimesh, y: float, x_mid: float) -> Optional[float]:
@@ -698,10 +699,21 @@ def _parameters(m: dict, inputs: "LabInputs", preview: trimesh.Trimesh, floor: f
         above = preview.vertices[preview.vertices[:, 1] > floor]
         mx_c, px_c = (above[:, 0].min() + above[:, 0].max()) / 2, (mx0 + mx1) / 2
         scale = (top - floor) / (my1 - my0)
+        pose = inputs.pose or {}
+        sw_mm = None
+        if "left_shoulder" in pose and "right_shoulder" in pose:
+            sw_mm = float(np.hypot(*(np.array(pose["left_shoulder"]) - np.array(pose["right_shoulder"])))) * scale
         for part, key in (("head", "d_head"), ("chest", "d_chest"), ("waist", "d_waist")):
             if part in lv:
                 row, col = lv[part]
-                ratio = _depth_ratio(preview, top - (row - my0) * scale, mx_c + (col - px_c) * scale)
+                y, x = top - (row - my0) * scale, mx_c + (col - px_c) * scale
+                if part == "head":
+                    ratio = _depth_ratio(preview, y, x)
+                elif sw_mm:
+                    ratio = _centre_depth(preview, y, x, 0.04 * sw_mm)
+                    ratio = None if ratio is None else ratio / sw_mm
+                else:
+                    ratio = None
                 if ratio is not None:
                     t = _ANSUR_DEPTH[key]
                     out[key] = [round(ratio, 2), t, _held_ratio(ratio, t)]
