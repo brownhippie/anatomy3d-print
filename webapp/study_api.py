@@ -251,7 +251,8 @@ def work_one(sid: str, generation_lock: threading.Lock) -> None:
         st = _read(d / "state.json", None)
     if not st or st.get("status") != "running":
         return
-    if st["cand"] is None and study.rebase_if_code_changed(st):
+    if study.rebase_if_code_changed(st):
+        shutil.rmtree(_renders(sid) / "cand", ignore_errors=True)
         with _lock:
             _write(d / "state.json", st)
         return
@@ -410,7 +411,7 @@ def get_study(sid: str, log: int = 60):
     t = _renders(sid)
     floor = _min_score(st)
     neighbours = st.get("kind") == "neighbours"
-    shown = [x for x in lines if neighbours or x.get("kept") == "baseline" or str(x.get("kept", "")).startswith("rebuilt")
+    shown = [x for x in lines if neighbours or x.get("kept") in ("baseline", "undone") or str(x.get("kept", "")).startswith("rebuilt")
              or floor is None or x.get("objective", -1e9) >= floor]
     kept_shown = [k for k in st["kept"] if floor is None or k["objective"] >= floor]
     return {
@@ -481,11 +482,24 @@ def threshold(sid: str, value: Optional[float] = None):
 @router.post("/{sid}/{action}")
 def control(sid: str, action: str):
     d = _dir(sid)
-    if action not in ("pause", "resume", "apply", "finish"):
+    if action not in ("pause", "resume", "apply", "finish", "undo-last-kept"):
         raise HTTPException(404, "Unknown action.")
     with _lock:
         st = _read(d / "state.json", {})
-        if action == "apply":
+        if action == "undo-last-kept":
+            # take back the last kept move (e.g. one judged on scores from two
+            # code versions): its number back, its best rebuilt before more moves
+            if st.get("kind") != "tune" or not st.get("kept"):
+                raise HTTPException(409, "No kept move to undo.")
+            last = st["kept"].pop()
+            st["x"][last["key"]] = last["from"]
+            st["cand"] = None
+            st["rebase"] = [r for r in st.get("rebase", []) if r != "best"] + ["best"]
+            shutil.rmtree(_renders(sid) / "cand", ignore_errors=True)
+            with open(d / "log.jsonl", "a") as f:
+                f.write(json.dumps({"i": st.get("evals"), "at": time.time(), "change": [last["key"], last["to"], last["from"], 0],
+                                    "kept": "undone", "objective": "–", "complete": True}) + "\n")
+        elif action == "apply":
             floor = _min_score(st)
             if st.get("best_obj") is None or (floor is not None and st["best_obj"] < floor):
                 raise HTTPException(409, f"The best result ({st.get('best_obj')}) is below the minimum score ({floor}).")

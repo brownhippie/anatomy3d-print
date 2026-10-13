@@ -558,9 +558,21 @@ def code_version() -> str:
 def rebase_if_code_changed(st: dict) -> bool:
     """New code since the study's scores: build its start and its best
     again before any more moves (else a move would be judged against a
-    score the old code made). True if it queued that."""
-    if st.get("code") == code_version() or st.get("best_obj") is None or st.get("cand") is not None:
+    score the old code made), dropping any move part-built by the old code.
+    True if it queued that."""
+    if st.get("code") == code_version():
         return False
+    c = st.get("cand")
+    if c is not None:
+        # a move part-built by the old code: its photos so far can't be put
+        # beside the new code's (one photo scored by a new rule would swing
+        # the mean) -- dropped, and tried again once the start is rebuilt
+        if c.get("change") is not None and st.get("kind") != "neighbours":
+            st.setdefault("queue", []).insert(0, [c["change"][0], c["change"][3]])
+        st["cand"] = None
+    if st.get("best_obj") is None:
+        st["code"] = code_version()  # nothing scored yet: the first build starts again
+        return True
     if st.get("kind") == "neighbours":
         # a neighbours run compares moves against one start: begun again from scratch by the autopilot
         st["status"], st["stale"] = "done", True
