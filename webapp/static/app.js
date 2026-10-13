@@ -1094,7 +1094,7 @@ async function labOpen(i) {
   labBar.hidden = false;
   document.getElementById("lab-bar-title").textContent = `#${fmt(item.n)} of ${fmt(labState.space ? labState.space.total_builds : 0)} · ${item.family}`;
   document.getElementById("lab-bar-sub").textContent = item.status === "ok"
-    ? `score ${item.score} · shape ${item.shape_iou}% · spikes ${item.spike_pct}% · wall ${item.min_wall_mm}mm${item.face_found === null ? "" : item.face_found ? ` · face ${item.face_err_pct}%` : " · no face found"}`
+    ? `score ${item.score} · shape ${item.shape_iou}% · spikes ${item.spike_pct}% ·${item.photo_detail == null ? "" : ` photo detail ${item.photo_detail} ·`} wall ${item.min_wall_mm}mm${item.face_found === null ? "" : item.face_found ? ` · face ${item.face_err_pct}%` : " · no face found"}`
     : `failed: ${item.error || ""}`;
   document.getElementById("lab-params").innerHTML = labParamsHtml(item);
   document.getElementById("lab-info-list").innerHTML = (item.template ? `<li><b>${escapeHtml(item.template)}</b></li>` : "")

@@ -528,9 +528,15 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
                 m["face_err_pct"] = round(_procrustes_nme(got[:468, :2], inputs.face_mesh[:468, :2]), 1)
                 m.update(_face_part_errors(got[:468, :2], inputs.face_mesh[:468, :2]))
 
+    try:
+        m["photo_detail"] = _photo_detail(preview, floor, inputs)
+    except Exception:  # noqa: BLE001 - scored on the rest then
+        m["photo_detail"] = None
     s = m["shape_iou"] - 4.0 * m["spike_pct"] - (25.0 if not m["watertight"] else 0.0) - (20.0 if m["min_wall_mm"] < 0.8 else 0.0)
     if m.get("face_err_pct") is not None:
         s += max(0.0, 30.0 - m["face_err_pct"])
+    if m["photo_detail"] is not None:
+        s += PHOTO_DETAIL_W * m["photo_detail"]
     m["score"] = round(s, 1)
     try:
         params = _parameters(m, inputs, preview, floor, sil, got, head)
@@ -539,6 +545,55 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
     except Exception as exc:  # noqa: BLE001 - a measuring problem shouldn't lose the build
         m["params_error"] = f"{type(exc).__name__}: {exc}"[:200]
     return m, preview, thumb
+
+
+PHOTO_DETAIL_W = 1.0
+
+
+def _photo_detail(preview: trimesh.Trimesh, floor: float, inputs: LabInputs) -> Optional[float]:
+    """How much of the whole photo the model carries inside its outline --
+    the jacket's edge, lapels, tie, buttons, hair, face, hands: the model's
+    fine relief (its surface off a copy smoothed over 0.4 % of the figure's
+    height) where the photo shows detail (colour edges, spread over 1 %, so
+    a few pixels' misalignment doesn't matter), plus twice how much more
+    relief it has there than where the photo is plain. Hundredths of a mm.
+    A smooth body that drops the clothes scores low however clean its
+    outline; bumps everywhere add as much on plain photo as on detail (and
+    count as spikes)."""
+    from scipy.ndimage import binary_erosion, gaussian_filter, zoom
+
+    from .study import front_in_photo
+
+    mask = inputs.photo_mask
+    ys, xs = np.nonzero(mask)
+    box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    z, _, _ = front_in_photo(preview, floor, inputs, box)
+    zy, zx = z.shape
+    if zy < 40 or not np.isfinite(z).any():
+        return None
+    f = (zy / (box[3] - box[1]), zx / (box[2] - box[0]))
+
+    def to_z(a):
+        return zoom(a[box[1]:box[3], box[0]:box[2]].astype(np.float32), f, order=1)[:zy, :zx]
+
+    rgb = np.stack([to_z(inputs.rgb[..., c]) / 255.0 for c in range(3)], -1)
+    mm = to_z(mask) > 0.5
+    h_, w_ = min(rgb.shape[0], zy), min(rgb.shape[1], zx)
+    rgb, mm, z = rgb[:h_, :w_], mm[:h_, :w_], z[:h_, :w_]
+    fill = np.where(np.isfinite(z), z, float(np.nanmin(np.where(np.isfinite(z), z, np.nan))))
+    # inside the outline only: the outline itself is shape_iou's
+    inside = binary_erosion(mm & np.isfinite(z), iterations=max(2, int(0.015 * h_)))
+    if inside.sum() < 500:
+        return None
+    sg = max(0.8, 0.004 * h_)
+    edges = np.max([np.hypot(gaussian_filter(rgb[..., c], sg, order=(0, 1)), gaussian_filter(rgb[..., c], sg, order=(1, 0)))
+                    for c in range(3)], axis=0)
+    w = gaussian_filter(edges, 0.01 * h_)
+    w = (w / (w[inside].max() + 1e-9))[inside]
+    relief = np.abs(fill - gaussian_filter(fill, sg))[inside]
+    at_detail = float((relief * w).sum() / w.sum())
+    at_plain = float((relief * (1 - w)).sum() / (1 - w).sum())
+    return round(100.0 * (at_detail + 2.0 * (at_detail - at_plain)), 1)
 
 
 def _aligned_iou(sil: np.ndarray, mask: np.ndarray) -> float:
@@ -793,5 +848,6 @@ def _parameters(m: dict, inputs: "LabInputs", preview: trimesh.Trimesh, floor: f
 
 SCORE_FORMULA = (
     "score = shape match % − 4 × spikes % − 25 if not sealed − 20 if thinnest wall < 0.8 mm "
-    "+ (30 − face error %) when a face is found"
+    "+ (30 − face error %) when a face is found + photo detail (how much of the whole photo -- clothes, "
+    "hair, face, hands -- the model's surface carries inside its outline)"
 )
