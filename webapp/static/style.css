@@ -138,6 +138,11 @@ main {
   .stage { display: none; }
   main.viewer-active .panel { flex: 0 0 auto; }
   main.viewer-active .stage { display: block; flex: 1 1 auto; min-height: 60vh; }
+  /* The Viewer tab is the model alone: Generate / Start over (their own
+     tabs' buttons) and the tagline took a third of a phone's screen above
+     it. */
+  main.viewer-active .panel-actions { display: none; }
+  body:has(main.viewer-active) header.topbar .tagline { display: none; }
 }
 
 @media (min-width: 861px) {
@@ -476,7 +481,12 @@ button.secondary:hover { border-color: var(--accent); }
   overflow: hidden;
 }
 
-#viewer-canvas { position: absolute; inset: 0; display: block; }
+/* width/height too, not just inset: a canvas doesn't stretch to its insets
+   the way a div does -- it keeps its own pixel size, which on a phone
+   (renderer pixel ratio 2) is twice the stage each way: only its top-left
+   quarter showed, the model pushed to the stage's corner. A laptop at
+   pixel ratio 1 never showed it. */
+#viewer-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 
 .empty-state {
   position: absolute;
@@ -580,8 +590,12 @@ button.secondary:hover { border-color: var(--accent); }
   /* Full-width and centered on a narrow phone, both bars, stacked by
      the flex column above (stats on top, downloads below) rather than
      a guessed pixel gap. */
-  .stage-bottom-bar { left: 10px; right: 10px; align-items: center; }
+  .stage-bottom-bar { left: 10px; right: 10px; bottom: 10px; align-items: center; gap: 6px; }
   .stats-bar, .download-bar { justify-content: center; flex-wrap: wrap; }
+  /* one row of downloads, not two, so less of the screen sits under them */
+  .stats-bar { gap: 10px; padding: 6px 10px; font-size: 11px; }
+  .download-bar { gap: 6px; }
+  .stage-bottom-bar .download-bar a { font-size: 12px; padding: 8px 10px; }
 }
 .download-bar a {
   background: var(--accent);

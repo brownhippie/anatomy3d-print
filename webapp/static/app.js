@@ -409,14 +409,41 @@ function initViewer() {
   grid.position.y = 0.01;
   scene.add(grid);
 
+  // The model is framed in the band the overlays leave free: on a phone the
+  // toolbar spans the stage's top and the stats/download bars its bottom,
+  // and a model framed on the whole stage sat half under the downloads. The
+  // camera's frame is that band (setViewOffset renders the stage round it).
+  // Overlays in a corner (a laptop's) don't count.
+  function _overlayEdge(els, w, rect, fromTop) {
+    let edge = 0;
+    for (const el of els) {
+      if (!el || !el.offsetParent) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 0.5 * w || r.height === 0) continue;
+      edge = Math.max(edge, fromTop ? r.bottom - rect.top : rect.bottom - r.top);
+    }
+    return Math.max(0, Math.min(edge, 0.4 * rect.height));
+  }
+
   function resize() {
     const w = stage.clientWidth;
     const h = stage.clientHeight;
-    camera.aspect = w / h;
+    if (!w || !h) return;
+    const rect = stage.getBoundingClientRect();
+    const top = _overlayEdge([stage.querySelector(".viewer-toolbar")], w, rect, true);
+    const bottom = _overlayEdge(stage.querySelectorAll(".stage-bottom-bar > *"), w, rect, false);
+    const band = Math.max(h - top - bottom, 0.5 * h);
+    camera.aspect = w / band;
+    camera.setViewOffset(w, band, 0, -top, w, h);
     camera.updateProjectionMatrix();
     renderer.setSize(w, h, false);
   }
   window.addEventListener("resize", resize);
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => resize());
+    ro.observe(stage);
+    stage.querySelectorAll(".viewer-toolbar, .stage-bottom-bar").forEach((el) => ro.observe(el));
+  }
   resize();
 
   function animate() {
