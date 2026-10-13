@@ -45,6 +45,8 @@ THUMB = (720, 480)
 HELD_W = 0.3
 BUMP_W = 3.0
 FLOW_W = 0.1
+SEAM_W = 0.1  # cracks where hair meets what's beside it, grooves between the legs under a skirt (%)
+SYM_W = 0.1  # left/right balance off the photo's (% points)
 STAND_W = 10.0  # the figure's centre outside its base: it would tip over
 OVERHANG_W = 0.05  # % of the surface facing steeply down
 EAR_W = 0.2  # the ears' reach beside the head off the photo's, % of the face's width
@@ -60,7 +62,8 @@ OBJECTIVE = (f"study score = Lab score + {HELD_W} × held mean − {BUMP_W} × b
              f"+ {LAYER_W} × overlaps kept (% of the photo's sure over/under boundaries the model has the right way round) "
              f"− {FIT_W} × the posed body's joint miss (% of shoulder width) "
              f"− {EAR_W} × the ears' reach off the photo's (% of face width) − {NAPE_W} × the nape's bumps (%) "
-             f"− {STAND_W} if it wouldn't stand on its base − {OVERHANG_W} × overhang (%)")
+             f"− {STAND_W} if it wouldn't stand on its base − {OVERHANG_W} × overhang (%) "
+             f"− {SEAM_W} × (cracks at hair's seams + grooves under a skirt, %) − {SYM_W} × left/right balance off the photo's")
 
 
 # ---------------------------------------------------------------- critics
@@ -183,6 +186,7 @@ def front_in_photo(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInput
 # which lies over which, for the overlaps check -- only pairs whose order a
 # front photo leaves in no doubt (hair beside a face can be in front of the
 # cheek or behind the head; a hand is skin lying over clothes: left out)
+_ALL_WORN = ("shirt", "tshirt", "sweater", "jacket", "suit", "coat", "dress", "hoodie", "kimono", "skirt", "trousers", "jeans", "shorts")
 _OUTER = {
     "hat": ("hair", "face", "forehead"), "glasses": ("face", "forehead"), "mask": ("face",),
     "jacket": ("shirt", "tshirt", "sweater", "tie", "dress", "trousers", "jeans", "skirt", "shorts"),
@@ -193,7 +197,13 @@ _OUTER = {
     "belt": ("trousers", "jeans", "skirt", "dress", "shorts", "kimono"),
     "collar": ("neck",),
     "hair": ("forehead",), "earring": ("hair", "neck", "face"),
+    "hand": _ALL_WORN, "watch": ("wrist",), "bracelet": ("wrist",),
+    "necklace": ("neck", "shirt", "tshirt", "dress", "sweater", "kimono"),
+    "badge": _ALL_WORN, "lanyard": _ALL_WORN, "backpack": _ALL_WORN, "strap": _ALL_WORN, "buttons": _ALL_WORN, "pocket": _ALL_WORN,
+    "zip": _ALL_WORN, "shoes": ("socks",), "trousers": ("shoes", "socks"), "jeans": ("shoes", "socks"), "skirt": ("socks",),
 }
+for _sleeved in ("shirt", "tshirt", "jacket", "suit", "coat", "sweater", "hoodie", "kimono"):
+    _OUTER[_sleeved] = tuple(_OUTER.get(_sleeved, ())) + ("wrist",)
 LAYER_MIN_MM = 0.1
 
 
@@ -204,7 +214,7 @@ def _codes(inputs: "lab.LabInputs", H: int, W: int):
     from .clothes import GARMENTS, NAMES
     from .head_parts import FACE_SKIN, GLASSES, HAIR, HAT, MASK
 
-    names = ["", "hat", "hair", "face", "glasses", "mask", "neck", "collar", "forehead", "earring"] + list(GARMENTS)
+    names = ["", "hat", "hair", "face", "glasses", "mask", "neck", "collar", "forehead", "earring", "hand", "wrist"] + list(GARMENTS)
     code = np.zeros((H, W), np.uint8)
     parts = inputs.parts or {}
     cl = parts.get("clothes")
@@ -218,7 +228,23 @@ def _codes(inputs: "lab.LabInputs", H: int, W: int):
             band = (np.arange(H)[:, None] > chin) & (np.arange(H)[:, None] < chin + 0.6 * face_h)
             skin = cl["labels"] == NAMES.index("skin") + 1
             code[band & skin] = names.index("neck")
-            code[band & (code >= names.index("earring") + 1)] = names.index("collar")
+            code[band & (code >= names.index("wrist") + 1)] = names.index("collar")
+        # hands and wrists (skin by the photo's own hand points): a hand lies
+        # over the clothes under it; a sleeve's cuff over the wrist
+        pose = inputs.pose or {}
+        if "left_shoulder" in pose and "right_shoulder" in pose:
+            sw = float(np.linalg.norm(np.subtract(pose["left_shoulder"], pose["right_shoulder"])))
+            yy_, xx_ = np.mgrid[0:H, 0:W]
+            skin = cl["labels"] == NAMES.index("skin") + 1
+            for sd in ("left", "right"):
+                if f"{sd}_wrist" in pose:
+                    wx, wy = pose[f"{sd}_wrist"]
+                    tips = [pose[f"{sd}_{k}"] for k in ("index", "pinky") if f"{sd}_{k}" in pose]
+                    if tips:
+                        hx, hy = np.mean(tips, axis=0)
+                        code[skin & ((xx_ - hx) ** 2 + (yy_ - hy) ** 2 < (0.12 * sw) ** 2)] = names.index("hand")
+                    near_w = skin & ((xx_ - wx) ** 2 + (yy_ - wy) ** 2 < (0.07 * sw) ** 2) & (code != names.index("hand"))
+                    code[near_w] = names.index("wrist")
     if parts.get("labels") is not None:
         hl = parts["labels"]
         for lab_, nm in ((HAT, "hat"), (HAIR, "hair"), (FACE_SKIN, "face"), (GLASSES, "glasses"), (MASK, "mask")):
@@ -341,6 +367,89 @@ def nape_bumps(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") 
     return {"nape_bumps": round(100.0 * float((off > BUMP_MM).mean()), 2)}
 
 
+SEAM_MM = 3.0  # a depth jump this big across a seam reads as a crack
+
+
+def seams_and_skirt(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
+    """hair_seams: where hair meets the face, ears, neck or clothes -- whose
+    order a front photo can't settle -- % of those boundary points with a
+    depth jump over SEAM_MM (a crack or a cliff). skirt_gap: under a dress
+    or skirt, between the knees' columns, % of it sunk SEAM_MM behind the
+    skirt's own median at that height (a groove between the legs)."""
+    from scipy.ndimage import binary_dilation, zoom
+
+    from .clothes import NAMES
+
+    H, W = inputs.photo_mask.shape
+    code, names = _codes(inputs, H, W)
+    ys, xs = np.nonzero(inputs.photo_mask)
+    box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    z, have, k = front_in_photo(preview, floor, inputs, box)
+    o = code[box[1]:box[3], box[0]:box[2]]
+    o = zoom(o, (z.shape[0] / o.shape[0], z.shape[1] / o.shape[1]), order=0)[: z.shape[0], : z.shape[1]]
+    h_, w_ = min(o.shape[0], z.shape[0]), min(o.shape[1], z.shape[1])
+    o, z = o[:h_, :w_], z[:h_, :w_]
+    out = {}
+    hair = o == names.index("hair")
+    others = np.isin(o, [names.index(n) for n in ("face", "neck", "collar", "earring")] + [i for i, n in enumerate(names) if n in _ALL_WORN])
+    edge_h = hair & binary_dilation(others, iterations=2)
+    edge_o = others & binary_dilation(hair, iterations=2)
+    if edge_h.sum() > 20 and edge_o.sum() > 20:
+        from scipy.ndimage import maximum_filter, minimum_filter
+
+        zf = np.where(np.isfinite(z), z, np.nan)
+        hi = maximum_filter(np.nan_to_num(zf, nan=-1e9), size=5)
+        lo = minimum_filter(np.nan_to_num(zf, nan=1e9), size=5)
+        jump = (hi - lo)[edge_h & np.isfinite(zf)]
+        if len(jump):
+            out["hair_seams"] = round(100.0 * float((jump > SEAM_MM).mean()), 1)
+    cl = (inputs.parts or {}).get("clothes")
+    pose = inputs.pose or {}
+    if cl and "left_knee" in (inputs.reference or {}).get("joints_px", {}):
+        jp = inputs.reference["joints_px"]
+        skirt = np.isin(o, [names.index(n) for n in ("skirt", "dress") if n in names])
+        x_lo, x_hi = sorted([(jp["left_knee"][0] - box[0]) / k, (jp["right_knee"][0] - box[0]) / k])
+        y_hip = (min(jp["left_hip"][1], jp["right_hip"][1]) - box[1]) / k
+        cols = np.arange(w_)
+        zone = skirt & (cols[None, :] > x_lo) & (cols[None, :] < x_hi) & (np.arange(h_)[:, None] > y_hip) & np.isfinite(z)
+        if zone.sum() > 30:
+            sunk = 0
+            for r in np.flatnonzero(zone.any(axis=1)):
+                row = z[r][skirt[r] & np.isfinite(z[r])]
+                if len(row) > 3:
+                    sunk += int((z[r][zone[r]] < np.median(row) - SEAM_MM).sum())
+            out["skirt_gap"] = round(100.0 * sunk / zone.sum(), 1)
+    _ = (NAMES, pose)
+    return out
+
+
+def symmetry(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
+    """Left and right: the model's front outline against its mirror image
+    (IoU), next to the photo's own against its mirror; the gap between the
+    two, % points (0 = as balanced, or as lopsided, as the photo)."""
+    from scipy.ndimage import zoom
+
+    ys, xs = np.nonzero(inputs.photo_mask)
+    box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    z, have, k = front_in_photo(preview, floor, inputs, box)
+    m = inputs.photo_mask[box[1]:box[3], box[0]:box[2]]
+    m = zoom(m.astype(np.uint8), (have.shape[0] / m.shape[0], have.shape[1] / m.shape[1]), order=0)[: have.shape[0], : have.shape[1]] > 0
+
+    def mirror_iou(a):
+        cols = np.flatnonzero(a.any(axis=0))
+        if not len(cols):
+            return None
+        c = int(round((cols.min() + cols.max()) / 2))
+        half = min(c, a.shape[1] - 1 - c)
+        left, right = a[:, c - half:c], a[:, c + 1:c + 1 + half][:, ::-1]
+        return 100.0 * float((left & right).sum()) / max(float((left | right).sum()), 1.0)
+
+    a, b = mirror_iou(have), mirror_iou(m)
+    if a is None or b is None:
+        return {}
+    return {"symmetry_diff": round(abs(a - b), 1)}
+
+
 def printability(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
     """Stands: the figure's centre (by surface area) over its base disk's
     inner 80%. Overhang: % of the figure's surface facing steeply down
@@ -368,7 +477,8 @@ def objective(m: dict) -> float:
                  + LAYER_W * m.get("layering", 0.0)
                  - FIT_W * 100.0 * (m.get("fit_kp") or 0.0)
                  - EAR_W * m.get("ear_err", 0.0) - NAPE_W * m.get("nape_bumps", 0.0)
-                 - STAND_W * (1.0 - m.get("stands", 1.0)) - OVERHANG_W * m.get("overhang_pct", 0.0))
+                 - STAND_W * (1.0 - m.get("stands", 1.0)) - OVERHANG_W * m.get("overhang_pct", 0.0)
+                 - SEAM_W * (m.get("hair_seams", 0.0) + m.get("skirt_gap", 0.0)) - SYM_W * m.get("symmetry_diff", 0.0))
 
 
 def evaluate(inputs: "lab.LabInputs", values: dict):
@@ -385,7 +495,7 @@ def evaluate(inputs: "lab.LabInputs", values: dict):
     if inputs.reference is not None:
         m["fit_kp"] = inputs.reference["report"].get("kp_median")  # the posed body's miss of the photo's joints
     m.update(bumps(preview, _floor(preview)))
-    for critic in (hair_flow, layering, ears_fit, nape_bumps, printability):
+    for critic in (hair_flow, layering, ears_fit, nape_bumps, printability, seams_and_skirt, symmetry):
         try:
             m.update(critic(preview, _floor(preview), inputs))
         except Exception:  # noqa: BLE001 - a photo it can't apply to just doesn't score it
@@ -537,7 +647,7 @@ def finish_candidate(st: dict) -> dict:
             "metrics": {pid: {k: r.get(k) for k in ("score", "held_mean", "bumps", "shape_iou", "face_err_pct", "spike_pct", "hair_flow",
                                                     "face_err_eyes", "face_err_brows", "face_err_nose", "face_err_mouth", "face_err_jaw",
                                                     "mouth_open_diff", "eyes_open_diff", "layering", "fit_kp", "ear_err", "nape_bumps", "stands",
-                                                    "overhang_pct", "error")}
+                                                    "overhang_pct", "hair_seams", "skirt_gap", "symmetry_diff", "error")}
                         for pid, r in c["results"].items()}}
     if c.get("role"):
         # the same values built again with new code
@@ -598,6 +708,7 @@ METRIC_HOME = {
     "layering": ["clothes", "headwear", "neck"], "ear_err": ["ears"], "nape_bumps": ["neck", "hair"],
     "bumps": ["hair", "clothes"], "shape_iou": ["clothes"], "fit_kp": ["bones"], "held_mean": ["clothes", "bones"],
     "spike_pct": ["clothes", "hair"], "min_wall_mm": ["clothes"], "overhang_pct": ["clothes"], "stands": ["bones"],
+    "hair_seams": ["hair"], "skirt_gap": ["clothes"], "symmetry_diff": ["bones", "clothes"],
 }
 CROSS_Z = 2.0  # a move shifting a score by this many of its usual shifts counts
 

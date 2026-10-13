@@ -858,6 +858,7 @@ _HAIR_CURL_DEPTH = 0.0025  # ... and stands this proud
 _HAIR_COIL = 0.006  # tight coils: this across ...
 _HAIR_COIL_DEPTH = 0.0015  # ... this proud
 _HAIRLINE_EDGE = 0.004  # the pattern ends over this at the hairline
+_PARTING_DEPTH = 0.0015  # a parting's groove
 # Each part of the face, read from the photo (face_parts.py) and shaped by
 # _face_parts_relief, metres on the person:
 _EYE_INSET = 0.0015  # an open eye's ball sits this far behind its lids, rounding up to them
@@ -1781,6 +1782,20 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
 
     out_f = pattern(c2, s2, False, 0)
     out_b = pattern(np.full(shape, -1.0), np.zeros(shape), True, 1)
+    part = reading.get("parting")
+    if part is not None and len(part) >= 2:
+        # the parting: a groove along it
+        pr = (np.asarray(part)[:, 1] - y0) * scale + pad - r0
+        pc = (np.asarray(part)[:, 0] - x0) * scale + pad - c0
+        rr_, cc_ = np.mgrid[0:shape[0], 0:shape[1]]
+        groove = np.zeros(shape)
+        wid = max(0.004 * per_cell, 0.8)
+        for a, b_ in zip(np.column_stack([pr, pc])[:-1], np.column_stack([pr, pc])[1:]):
+            ab = b_ - a
+            t = np.clip(((rr_ - a[0]) * ab[0] + (cc_ - a[1]) * ab[1]) / max(ab @ ab, 1e-9), 0, 1)
+            d2 = (rr_ - a[0] - t * ab[0]) ** 2 + (cc_ - a[1] - t * ab[1]) ** 2
+            groove = np.maximum(groove, np.exp(-d2 / (2 * wid ** 2)))
+        out_f = out_f - _PARTING_DEPTH * px_per_m * groove
     # where it applies: in front, the hair the photo shows, ending at the
     # hairline; behind, the back of the head down to the nape (the photo's
     # face covers those cells -- it says nothing about the back)

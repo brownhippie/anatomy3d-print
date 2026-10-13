@@ -17,6 +17,8 @@ forehead.
   of locks and shading -- near nothing on sleek hair, most on coils.
 - Hairline: across the forehead, the first row of hair going up from the
   brows.
+- Parting: on top of the head, the line the strands fall away from to
+  either side.
 """
 from typing import Optional
 
@@ -37,6 +39,7 @@ _SLEEK = 0.25
 _COMBED = 0.5
 _WAVY_SWING = 24.0
 _COILY = 0.85
+_PART_MIN = 1.0  # how clearly the strands fall away either side of a parting (-1..2)
 
 
 def _structure(gray: np.ndarray, hair: np.ndarray, s1: float, s2: float):
@@ -178,6 +181,51 @@ def _hairline(labels: np.ndarray, f: np.ndarray, hair_label: int, hat_label: int
             "height": round(float((brow_y - (np.median(mid) if len(mid) else np.nanmedian(rows_out))) / ruler), 2)}
 
 
+def _parting(theta: np.ndarray, coh: np.ndarray, hair: np.ndarray, f: np.ndarray, box, size: float):
+    """A parting: on top of the head, the line the strands fall away from to
+    either side (left of it they run down to the left, right of it down to
+    the right). Photo px points, or None."""
+    from scipy.ndimage import gaussian_filter1d
+
+    bx0, by0 = box[0], box[1]
+    brow = float((f[105, 1] + f[334, 1]) / 2) - by0
+    xl, xr = float(f[234, 0]) - bx0, float(f[454, 0]) - bx0
+    tx = np.cos(theta) * np.sign(np.sin(theta) + 1e-9)  # the strand's sideways run, taken pointing down
+    w = coh * hair
+    win = max(int(0.06 * size), 3)
+    pts = []
+    rows = np.flatnonzero(hair[:, int(max(xl, 0)):int(min(xr, hair.shape[1]))].any(axis=1))
+    rows = rows[rows < brow - 0.15 * size]
+    for r in rows[::2]:
+        a = gaussian_filter1d(tx[r] * w[r], 2.0)
+        n = gaussian_filter1d(w[r], 2.0) + 1e-6
+        best, bc = 0.0, None
+        for c in range(int(max(xl + win, win)), int(min(xr - win, hair.shape[1] - win))):
+            if not hair[r, c]:
+                continue
+            left = a[c - win:c].sum() / n[c - win:c].sum()
+            right = a[c:c + win].sum() / n[c:c + win].sum()
+            sc = right - left  # left side running left (negative), right side running right
+            if sc > best:
+                best, bc = sc, c
+        if bc is not None and best > _PART_MIN:
+            pts.append((bc + bx0, r + by0))
+    if len(pts) < max(4, 0.3 * len(rows[::2])):
+        return None
+    pts = np.array(pts, np.float32)
+    # one steady line, a fair way down the head, most of the points on it --
+    # else no parting (a wrong groove would be an artifact)
+    fit = np.polyfit(pts[:, 1], pts[:, 0], 1)
+    res = np.polyval(fit, pts[:, 1]) - pts[:, 0]
+    keep = np.abs(res) < 0.04 * size
+    if keep.sum() < max(6, 0.6 * len(pts)):
+        return None
+    pts = pts[keep]
+    if np.ptp(pts[:, 1]) < 0.2 * size or float(np.std(res[keep])) > 0.02 * size:
+        return None
+    return pts
+
+
 def read_hair(rgb: np.ndarray, labels: np.ndarray, box, face_mesh: np.ndarray, hair_label: int, hat_label: int) -> Optional[dict]:
     """See the module's docstring. `labels`, `box`: head_parts' map. None
     when too little hair shows (a cap, a shaved head)."""
@@ -201,6 +249,10 @@ def read_hair(rgb: np.ndarray, labels: np.ndarray, box, face_mesh: np.ndarray, h
         kind = "wavy" if swing >= _WAVY_SWING else "straight"
     else:
         kind = "coily" if fine >= _COILY else "curly"
-    return {"box": (bx0, by0, bx1, by1), "theta": theta, "coherence": coh, "size_px": size,
+    try:
+        part = _parting(theta, coh, hair, f, (bx0, by0), size)
+    except Exception:  # noqa: BLE001 - no parting then
+        part = None
+    return {"box": (bx0, by0, bx1, by1), "theta": theta, "coherence": coh, "size_px": size, "parting": part,
             "kind": kind, "coherence_mean": round(c, 3), "swing_deg": round(swing, 1),
             "wave_px": wave_px if kind == "wavy" else None, "fineness": round(fine, 3), "hairline": hairline}

@@ -42,6 +42,9 @@ _HEAD_PROMPTS = {
     "face": [49406, 320, 1710, 49407],
     "hair": [49406, 2225, 49407],
     "hat": [49406, 320, 3938, 541, 3801, 49407],  # "a cap or hat"
+    "headwrap": [49406, 320, 1603, 13365, 49407],  # "a headscarf" (hijab, turban, wrap)
+    "headband": [49406, 320, 28556, 49407],  # "a headband"
+    "hood": [49406, 320, 3222, 49407],  # "a hood"
     "mask": [49406, 320, 1710, 8306, 9462, 518, 4932, 537, 8231, 49407],  # "a face mask covering the mouth and nose"
     "clothes": [49406, 7080, 49407],
     "background": [49406, 518, 5994, 49407],
@@ -153,7 +156,7 @@ def detect_head_parts(rgb: np.ndarray, face_mesh: Optional[np.ndarray]) -> Optio
     face_box = float(np.ptp(fx)) * float(np.ptp(fy))
 
     labels = part.copy()
-    found = {"hat": False, "mask": False, "glasses": False, "sunglasses": False}
+    found = {"hat": False, "mask": False, "glasses": False, "sunglasses": False, "headwrap": False, "headband": False, "hood": False}
     try:
         # named on a tighter crop round the head: a cap is too small to name
         # in the big one
@@ -170,7 +173,12 @@ def detect_head_parts(rgb: np.ndarray, face_mesh: Optional[np.ndarray]) -> Optio
         # a cap or hat: where it wins over face, hair and the rest, together
         # with the hair/accessory patches the segmenter split it into that
         # touch it above the eyes
-        hat = (win == names.index("hat")) & person & (yy < eye_y - 0.1 * ruler)  # never below the eyes
+        # a cap or hat -- or a head wrap, headband or hood, built the same way
+        # (a shell over the hair and skull)
+        hatlike = {k: (win == names.index(k)) & person for k in ("hat", "headwrap", "headband", "hood")}
+        for k in ("headwrap", "headband", "hood"):
+            found[k] = bool(hatlike[k].sum() >= _HAT_AREA * face_box)
+        hat = (hatlike["hat"] | hatlike["headwrap"] | hatlike["headband"] | hatlike["hood"]) & (yy < eye_y - 0.1 * ruler)  # never below the eyes
         if hat.sum() >= _HAT_AREA * face_box:
             near = ((part == HAIR) | (part == ACCESSORY)) & (yy < eye_y - 0.2 * ruler)
             lab, _ = ndimage.label(near | hat)

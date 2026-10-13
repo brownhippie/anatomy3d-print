@@ -58,6 +58,7 @@ KNOBS = [
     Knob(_SR, "_HAIR_COIL", 0.003, 0.012, "hair pattern", "a tight coil is this across (m)"),
     Knob(_SR, "_HAIR_COIL_DEPTH", 0.0005, 0.003, "hair pattern", "a coil stands this proud (m)"),
     Knob(_SR, "_HAIRLINE_EDGE", 0.002, 0.01, "hair pattern", "the pattern ends over this at the hairline (m)"),
+    Knob(_SR, "_PARTING_DEPTH", 0.0, 0.004, "hair pattern", "a parting's groove (m)"),
     # what's worn on the head
     Knob(_SR, "_HAT_PEAK", 0.2, 0.45, "headwear", "a cap's peak reaches this far forward (x face width)"),
     Knob(_SR, "_MASK_SPAN", 0.02, 0.06, "headwear", "a face mask spans hollows narrower than this (m)"),

@@ -33,6 +33,16 @@ GARMENTS = {
     "gloves": [49406, 12363, 49407],  # "gloves"
     "strap": [49406, 320, 3365, 13946, 49407],  # "a bag strap"
     "watch": [49406, 320, 19243, 1239, 49407],  # "a wristwatch"
+    "necklace": [49406, 320, 7385, 49407],  # "a necklace"
+    "buttons": [49406, 16188, 49407],  # "buttons"
+    "pocket": [49406, 320, 8504, 49407],  # "a pocket"
+    "badge": [49406, 320, 11301, 541, 6974, 49407],  # "a badge or medal"
+    "lanyard": [49406, 320, 46808, 49407],  # "a lanyard"
+    "zip": [49406, 320, 33670, 49407],  # "a zipper"
+    "socks": [49406, 8774, 49407],  # "socks"
+    "boots": [49406, 7319, 49407],  # "boots"
+    "backpack": [49406, 320, 14894, 13946, 49407],  # "a backpack strap"
+    "bracelet": [49406, 320, 8969, 49407],  # "a bracelet"
 }
 OTHERS = {
     "skin": [49406, 3575, 49407],
@@ -43,8 +53,13 @@ NAMES = list(GARMENTS) + list(OTHERS)  # label i+1 = NAMES[i]; 0 = not the perso
 # how far out each lies (skin 0): what's outer stands over what's inner where they meet
 LAYER = {"skin": 0, "shirt": 1, "tshirt": 1, "dress": 1, "kimono": 1, "trousers": 1, "jeans": 1, "shorts": 1, "skirt": 1.5,
          "sweater": 2, "hoodie": 2.5, "tie": 2.2, "jacket": 3, "suit": 3, "coat": 4, "belt": 3.2, "scarf": 5,
-         "strap": 5.5, "watch": 2, "gloves": 1, "shoes": 1, "hair": 6}
-_MIN_SHARE = {"tie": 0.003, "belt": 0.003, "watch": 0.0005, "strap": 0.003, "gloves": 0.002, "shoes": 0.003}
+         "strap": 5.5, "watch": 2, "gloves": 1, "shoes": 1, "hair": 6, "necklace": 2.5, "lanyard": 4.5, "backpack": 5.5,
+         "socks": 0.5, "boots": 1.2, "bracelet": 2}
+# small things that sit on whatever garment is round them: half a layer over it
+ON_TOP = ("buttons", "pocket", "badge", "zip")
+_MIN_SHARE = {"tie": 0.003, "belt": 0.003, "watch": 0.0005, "strap": 0.003, "gloves": 0.002, "shoes": 0.003, "necklace": 0.001,
+              "buttons": 0.0005, "pocket": 0.002, "badge": 0.001, "lanyard": 0.002, "zip": 0.001, "socks": 0.002, "boots": 0.003,
+              "backpack": 0.003, "bracelet": 0.0005}
 _MIN_SHARE_DEFAULT = 0.02
 
 
@@ -96,7 +111,13 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
         else:
             labels[labels == i + 1] = 0  # too little to trust
     _ = Image  # (PIL is CLIPSeg's resizer)
-    return {"labels": labels, "found": found}
+    out = {"labels": labels, "found": found}
+    if face_mesh is not None:
+        try:
+            out["neckline"] = neckline(out, face_mesh)
+        except Exception:  # noqa: BLE001 - unnamed then
+            out["neckline"] = None
+    return out
 
 
 def _segment(rgb: np.ndarray) -> np.ndarray:
@@ -119,9 +140,45 @@ def _segment(rgb: np.ndarray) -> np.ndarray:
 
 
 def layer_map(reading: dict) -> np.ndarray:
-    """Each pixel's layer (LAYER), NaN where nothing was named."""
+    """Each pixel's layer (LAYER; the ON_TOP things half a layer over the
+    garment round them), NaN where nothing was named."""
+    from scipy.ndimage import distance_transform_edt
+
     lut = np.full(len(NAMES) + 1, np.nan, np.float32)
     for i, k in enumerate(NAMES):
         if k in LAYER:
             lut[i + 1] = LAYER[k]
-    return lut[reading["labels"]]
+    L = lut[reading["labels"]]
+    top = np.isin(reading["labels"], [NAMES.index(k) + 1 for k in ON_TOP])
+    if top.any():
+        known = np.isfinite(L) & (reading["labels"] > 0)
+        if known.any():
+            iy, ix = distance_transform_edt(~known, return_distances=False, return_indices=True)
+            L = np.where(top, L[iy, ix] + 0.5, L)
+    return L
+
+
+def neckline(reading: dict, face_mesh: np.ndarray) -> Optional[str]:
+    """V, crew or collared: the shape of the skin showing below the chin."""
+    labels = reading["labels"]
+    fm = np.asarray(face_mesh)[:, :2]
+    chin, face_h = float(fm[152, 1]), float(np.ptp(fm[:468, 1]))
+    cx = float((fm[234, 0] + fm[454, 0]) / 2)
+    skin = labels == NAMES.index("skin") + 1
+    widths = []
+    for k in np.linspace(0.15, 1.2, 12):
+        r = int(chin + k * face_h)
+        if r >= labels.shape[0]:
+            break
+        cols = np.flatnonzero(skin[r, max(int(cx - face_h), 0):int(cx + face_h)])
+        widths.append(len(cols))
+    widths = np.array(widths, float)
+    if len(widths) < 6 or widths[:2].max() == 0:
+        return None
+    collar = any(k in reading["found"] for k in ("shirt", "tie")) and widths[2:].max() < 0.2 * face_h
+    if collar:
+        return "collared"
+    deep = widths[3:8]
+    if len(deep) and (deep > 0.1 * face_h).sum() >= 3 and np.all(np.diff(deep[deep > 0]) <= 0.05 * face_h):
+        return "V"
+    return "crew"
