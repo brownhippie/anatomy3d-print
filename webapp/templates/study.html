@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Figuro Study</title>
+  <style>
+    :root {
+      --bg: #0f1115; --panel: #161922; --panel-2: #1d212c; --border: #2a2f3d;
+      --text: #e7e9ee; --text-dim: #9aa1b2; --accent: #6ea8ff; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+      --radius: 10px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 18px 16px 60px; display: flex; flex-direction: column; gap: 18px; }
+    header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    header h1 { font-size: 20px; margin: 0; }
+    header a { color: var(--accent); text-decoration: none; font-size: 13px; }
+    .lede { color: var(--text-dim); margin: 0; max-width: 68ch; }
+    section { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); margin: 0; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    button, select, input[type=number] { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+    button { cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .dim { color: var(--text-dim); }
+    .big { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .stat { display: flex; flex-direction: column; gap: 2px; min-width: 110px; }
+    .stat span:first-child { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); }
+    .up { color: var(--ok); } .down { color: var(--err); }
+    .bar { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+    .bar > div { height: 100%; background: var(--accent); width: 0; }
+    .photos { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    .photo { display: flex; flex-direction: column; gap: 6px; }
+    .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .pair figure { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+    .pair img { width: 100%; max-width: 100%; border-radius: 6px; background: #14181f; aspect-ratio: 3 / 2; object-fit: contain; }
+    figcaption { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+    .scroll { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    td.what { white-space: normal; min-width: 220px; color: var(--text-dim); }
+    th { font-weight: 500; color: var(--text-dim); font-size: 12px; }
+    label.chk { display: inline-flex; gap: 6px; align-items: center; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+    .plist { display: flex; flex-direction: column; gap: 6px; }
+    .plist .row { justify-content: space-between; }
+    .hint { font-size: 12.5px; color: var(--text-dim); }
+    .pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--border); color: var(--text-dim); }
+    .pill.running { color: var(--ok); border-color: var(--ok); }
+    .pill.done { color: var(--accent); border-color: var(--accent); }
+    [hidden] { display: none !important; }
+    @media (max-width: 520px) { .pair { grid-template-columns: 1fr; } }
+    @media (min-width: 900px) { .photos { grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Study</h1>
+    <a href="/">&larr; back to Figuro</a>
+  </header>
+  <p class="lede">The server teaches the builder on its own: it builds your study photos, scores every model automatically,
+    moves one setting at a time and keeps what scores better. Nothing it finds is used until you press Apply.</p>
+
+  <section id="inuse">
+    <h2>In use now</h2>
+    <div id="tuned"></div>
+    <div class="row"><button id="clear-tuned" hidden>Back to the code's own values</button></div>
+  </section>
+
+  <section id="study" hidden>
+    <div class="row" style="justify-content: space-between">
+      <h2>Study</h2>
+      <select id="study-select" aria-label="Study"></select>
+    </div>
+    <div class="row" id="stats"></div>
+    <div class="bar"><div id="bar"></div></div>
+    <div class="hint" id="now"></div>
+    <div class="row">
+      <button id="pause">Pause</button>
+      <button class="primary" id="apply">Apply the best values</button>
+      <button id="copy">Copy summary for Claude</button>
+    </div>
+    <div class="hint" id="action-hint"></div>
+    <h2>Before → best, per photo</h2>
+    <div class="photos" id="photos"></div>
+    <h2>Kept moves</h2>
+    <div class="scroll"><table id="kept"></table></div>
+    <h2>Values changed</h2>
+    <div class="scroll"><table id="values"></table></div>
+    <details>
+      <summary class="dim">Every move tried (latest first)</summary>
+      <div class="scroll"><table id="log"></table></div>
+    </details>
+    <div class="hint" id="formula"></div>
+  </section>
+
+  <section>
+    <h2>Start a study</h2>
+    <div class="hint">Up to 8 photos of people (a full face and shoulders). Each one costs about 20–45 s per move on the server, and moves alternate with any Lab run.</div>
+    <input type="file" id="files" accept="image/*" multiple />
+    <div class="plist" id="plist"></div>
+    <div class="row" id="areas"></div>
+    <div class="row">
+      <label class="dim" for="max">Moves at most</label>
+      <input type="number" id="max" value="300" min="10" max="2000" step="10" style="width: 100px" />
+      <button class="primary" id="start" disabled>Start study</button>
+    </div>
+    <div class="hint" id="start-hint"></div>
+  </section>
+
+  <section>
+    <h2>Server storage</h2>
+    <div class="hint" id="free"></div>
+    <div class="scroll"><table id="storage"></table></div>
+  </section>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let current = null, timer = null, areas = [];
+const fmt = (v) => (typeof v === "number" ? (Math.abs(v) < 1 && v !== 0 ? v.toFixed(4).replace(/0+$/, "") : String(+v.toFixed(3))) : String(v));
+const short = (key) => key.split(".").pop().replace(/^_/, "").toLowerCase().replace(/_/g, " ");
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) throw new Error((await res.text()).slice(0, 200));
+  return res.json();
+}
+
+async function loadList() {
+  const data = await api("/api/study");
+  areas = data.areas;
+  const tv = Object.entries(data.tuned.values || {});
+  $("tuned").innerHTML = tv.length
+    ? `<div class="hint">From ${esc(data.tuned.source || "a study")}${data.tuned.at ? ", " + new Date(data.tuned.at * 1000).toLocaleString() : ""}.</div>` +
+      `<div class="scroll"><table><tr><th>Setting</th><th>Code's value</th><th>In use</th></tr>` +
+      tv.map(([k, e]) => `<tr><td>${esc(short(k))}</td><td>${fmt(e.code_default)}</td><td>${fmt(e.value)}</td></tr>`).join("") + "</table></div>"
+    : `<div class="hint">The code's own values (nothing applied from a study).</div>`;
+  if (data.tuned.stale && data.tuned.stale.length) $("tuned").innerHTML += `<div class="hint">Dropped (the code changed since): ${data.tuned.stale.map(short).join(", ")}</div>`;
+  $("clear-tuned").hidden = !tv.length;
+  const sel = $("study-select");
+  sel.innerHTML = data.studies.map((s) => `<option value="${s.sid}">${new Date(s.created * 1000).toLocaleString()} · ${s.photos.length} photos · ${s.status}</option>`).join("");
+  $("study").hidden = !data.studies.length;
+  if (data.studies.length) {
+    if (!current || !data.studies.find((s) => s.sid === current)) current = data.studies[0].sid;
+    sel.value = current;
+    await loadStudy();
+  }
+  if (!$("areas").childElementCount) {
+    $("areas").innerHTML = areas.map((a) => `<label class="chk"><input type="checkbox" value="${a}" checked /> ${a}</label>`).join("");
+  }
+}
+
+async function loadStudy() {
+  const s = await api(`/api/study/${current}`);
+  const gain = s.best_obj != null && s.base_obj != null ? s.best_obj - s.base_obj : null;
+  $("stats").innerHTML = [
+    ["Status", `<span class="pill ${s.status}">${s.status}</span>`],
+    ["Score at start", s.base_obj ?? "…"],
+    ["Best", s.best_obj ?? "…"],
+    ["Gain", gain == null ? "…" : `<span class="${gain > 0 ? "up" : ""}">${gain >= 0 ? "+" : ""}${gain.toFixed(2)}</span>`],
+    ["Moves", `${s.evals} / ${s.max_evals}`],
+    ["Kept", s.kept],
+  ].map(([k, v]) => `<div class="stat"><span>${k}</span><span class="big">${v}</span></div>`).join("");
+  $("bar").style.width = `${Math.min(100, (100 * s.evals) / s.max_evals)}%`;
+  $("now").textContent = s.building
+    ? (s.building.change ? `Trying ${short(s.building.change[0])}: ${fmt(s.building.change[1])} → ${fmt(s.building.change[2])} (${s.building.done}/${s.photos.length} photos built)` : `Building the starting point (${s.building.done}/${s.photos.length} photos)`)
+      + ` · round ${s.round}, step ${fmt(s.step)} of each range`
+    : s.status === "done" ? "Finished." : "";
+  $("pause").textContent = s.status === "running" ? "Pause" : "Resume";
+  $("pause").disabled = s.status === "done";
+  $("apply").disabled = !s.kept;
+  $("action-hint").textContent = s.applied ? `Applied ${new Date(s.applied * 1000).toLocaleString()}.` : "";
+  $("photos").innerHTML = s.photos.map((p) => {
+    const r = s.renders[p.id] || {};
+    const b = s.base_per_photo[p.id], n = s.best_per_photo[p.id];
+    return `<div class="photo"><div class="row" style="justify-content: space-between"><span>${esc(p.name)}</span><span class="dim">${p.body}</span></div>
+      <div class="pair">
+        <figure>${r.base ? `<img src="${r.base}?t=${s.evals}" alt="start" loading="lazy" />` : `<img alt="" />`}<figcaption>start · ${b ?? "…"}</figcaption></figure>
+        <figure>${r.best ? `<img src="${r.best}?t=${s.evals}" alt="best" loading="lazy" />` : `<img alt="" />`}<figcaption>best · ${n ?? "…"}</figcaption></figure>
+      </div></div>`;
+  }).join("");
+  $("kept").innerHTML = s.kept_moves.length
+    ? "<tr><th>#</th><th>Setting</th><th>From</th><th>To</th><th>Gain</th></tr>" +
+      s.kept_moves.map((k) => `<tr><td>${k.i}</td><td>${esc(short(k.key))}</td><td>${fmt(k.from)}</td><td>${fmt(k.to)}</td><td class="up">+${k.gain}</td></tr>`).join("")
+    : `<tr><td class="dim">None yet.</td></tr>`;
+  const changed = s.values.filter((v) => v.best !== v.base);
+  $("values").innerHTML = changed.length
+    ? "<tr><th>Setting</th><th>Area</th><th>Start</th><th>Best</th><th>Range</th><th>What it shapes</th></tr>" +
+      changed.map((v) => `<tr><td>${esc(short(v.key))}</td><td>${v.area}</td><td>${fmt(v.base)}</td><td>${fmt(v.best)}</td><td>${fmt(v.lo)}–${fmt(v.hi)}</td><td class="what">${esc(v.what)}</td></tr>`).join("")
+    : `<tr><td class="dim">None yet.</td></tr>`;
+  $("log").innerHTML = "<tr><th>#</th><th>Move</th><th>Score</th><th>Kept</th></tr>" +
+    s.log.slice().reverse().map((l) => `<tr><td>${l.i}</td><td>${l.change ? `${esc(short(l.change[0]))} ${fmt(l.change[1])} → ${fmt(l.change[2])}` : "start"}</td><td>${l.objective}${l.complete ? "" : " (dropped early)"}</td><td>${l.kept === true ? `<span class="up">+${l.gain}</span>` : l.kept === "baseline" ? "start" : "–"}</td></tr>`).join("");
+  $("formula").textContent = s.objective_formula;
+  clearTimeout(timer);
+  if (s.status === "running") timer = setTimeout(loadStudy, 15000);
+}
+
+$("study-select").onchange = (e) => { current = e.target.value; loadStudy(); };
+$("pause").onclick = async () => {
+  const s = await api(`/api/study/${current}`);
+  await api(`/api/study/${current}/${s.status === "running" ? "pause" : "resume"}`, { method: "POST" });
+  loadList();
+};
+$("apply").onclick = async () => {
+  $("apply").disabled = true;
+  await api(`/api/study/${current}/apply`, { method: "POST" });
+  $("action-hint").textContent = "Applied: every build from now on uses these values.";
+  loadList();
+};
+$("clear-tuned").onclick = async () => { await api("/api/study/tuned/clear", { method: "POST" }); loadList(); };
+$("copy").onclick = async () => {
+  const s = await api(`/api/study/${current}?log=0`);
+  const text = JSON.stringify({ sid: s.sid, status: s.status, evals: s.evals, base: s.base_obj, best: s.best_obj, base_per_photo: s.base_per_photo, best_per_photo: s.best_per_photo, kept: s.kept_moves, photos: s.photos.map((p) => p.name) });
+  try { await navigator.clipboard.writeText(`${location.origin}/api/study/${s.sid}\n${text}`); $("action-hint").textContent = "Copied."; }
+  catch { $("action-hint").textContent = `${location.origin}/api/study/${s.sid}`; }
+};
+
+$("files").onchange = () => {
+  const files = [...$("files").files].slice(0, 8);
+  $("plist").innerHTML = files.map((f, i) => `<div class="row"><span>${esc(f.name)}</span><select data-i="${i}" aria-label="Body"><option value="male">male</option><option value="female">female</option></select></div>`).join("");
+  $("start").disabled = !files.length;
+};
+$("start").onclick = async () => {
+  const files = [...$("files").files].slice(0, 8);
+  const form = new FormData();
+  files.forEach((f) => form.append("photos", f));
+  form.append("bodies", [...$("plist").querySelectorAll("select")].map((s) => s.value).join(","));
+  form.append("areas", [...$("areas").querySelectorAll("input:checked")].map((c) => c.value).join(","));
+  form.append("max_evals", $("max").value);
+  $("start").disabled = true;
+  $("start-hint").textContent = "Uploading…";
+  try {
+    const s = await api("/api/study", { method: "POST", body: form });
+    current = s.sid;
+    $("start-hint").textContent = "Started. The first step prepares each photo; scores appear as moves finish.";
+    loadList();
+  } catch (e) { $("start-hint").textContent = `Couldn't start: ${e.message}`; $("start").disabled = false; }
+};
+
+async function loadStorage() {
+  const s = await api("/api/lab/storage");
+  $("free").textContent = `${s.free_mb} MB free on the volume. Removing a run's 3D previews keeps its scores, thumbnails and your ratings (Download STL still rebuilds any of them).`;
+  $("storage").innerHTML = "<tr><th>Lab run</th><th>Status</th><th>3D previews</th><th>Thumbnails</th><th>Rated</th><th></th></tr>" +
+    s.runs.map((r) => `<tr><td>${new Date(r.created * 1000).toLocaleString()} · ${esc(r.photo_name || "")}</td><td>${r.status}</td><td>${r.models_mb} MB</td><td>${r.thumbs_mb} MB</td><td>${r.rated}</td>
+      <td>${r.models_mb > 0 && r.status !== "running" ? `<button data-run="${r.run_id}">Remove 3D previews</button>` : ""}</td></tr>`).join("");
+  $("storage").querySelectorAll("button[data-run]").forEach((b) => b.onclick = async () => {
+    b.disabled = true; b.textContent = "Removing…";
+    try { await api(`/api/lab/runs/${b.dataset.run}/drop-models`, { method: "POST" }); } catch (e) { b.textContent = e.message; return; }
+    loadStorage();
+  });
+}
+
+loadList().catch((e) => { $("tuned").textContent = e.message; });
+loadStorage().catch(() => {});
+</script>
+</body>
+</html>

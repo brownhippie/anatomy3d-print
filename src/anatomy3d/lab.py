@@ -191,11 +191,16 @@ class LabInputs:
     bust_hint: bool
     pose: Optional[dict] = None  # joint -> (x_px, y_px) on the full-size photo
     reference: Optional[dict] = None  # body_reference.fit_body_reference result, when it matched
+    parts: Optional[dict] = None  # head_parts.detect_head_parts, what the reference was fitted with
+    body: str = "male"
 
 
-def prepare_inputs(photo_path: str, body: str = "male") -> LabInputs:
+def prepare_inputs(photo_path: str, body: str = "male", capsule_builder: bool = True, matting: bool = True) -> LabInputs:
     """Everything that depends only on the photo, computed once per run.
-    `body`: which reference body is posed to the photo ("male"/"female")."""
+    `body`: which reference body is posed to the photo ("male"/"female").
+    Without `capsule_builder` / `matting` the capsule family's inputs and the
+    fine-edge cutout are skipped (a study builds only the production
+    combination)."""
     from .depth_source import estimate_relative_depth
     from .face_features import find_face_mesh
     from .person_segmenter import detect_person_alpha_with_source
@@ -206,12 +211,13 @@ def prepare_inputs(photo_path: str, body: str = "male") -> LabInputs:
     if detected is None:
         raise RuntimeError("No person or animal found in this photo.")
     alpha_std, animal_frac = detected
+    alpha_bir = None
     try:
-        refined = detect_person_alpha_with_source(rgb, refine=True)
-        alpha_bir = refined[0] if refined else None
+        if matting:
+            refined = detect_person_alpha_with_source(rgb, refine=True)
+            alpha_bir = refined[0] if refined else None
     except Exception as exc:  # noqa: BLE001 - one optional switch shouldn't sink the run
         print(f"Note: fine-edge matting unavailable ({exc}).")
-        alpha_bir = None
     depth = estimate_relative_depth(rgb)
     try:
         face_mesh = find_face_mesh(rgb)
@@ -224,6 +230,8 @@ def prepare_inputs(photo_path: str, body: str = "male") -> LabInputs:
 
     capsule, unavailable, bust = None, None, False
     try:
+        if not capsule_builder:
+            raise RuntimeError("not prepared")
         capsule = _capsule_inputs(photo_path, rgb)
         from .procedural_body import CapsuleOptions, HipsNotDetectedError, build_body_mesh
 
@@ -241,12 +249,11 @@ def prepare_inputs(photo_path: str, body: str = "male") -> LabInputs:
         pose = {}
     if face_mesh is not None and "left_shoulder" in pose and "right_shoulder" in pose:
         animal_frac = 0.0  # a human face and shoulders: a person (see pipeline.py)
-    reference = None
+    reference, parts = None, None
     if pose and animal_frac <= 0.15:
         try:
             from .body_reference import fit_body_reference
 
-            parts = None
             try:
                 from .head_parts import detect_head_parts
 
@@ -258,7 +265,7 @@ def prepare_inputs(photo_path: str, body: str = "male") -> LabInputs:
         except Exception:  # noqa: BLE001 - builds fall back to outline-based shapes
             reference = None
     return LabInputs(rgb, alpha_std, alpha_bir, float(animal_frac), depth, face_mesh, mask, capsule, unavailable, bust, pose,
-                     reference)
+                     reference, parts, body)
 
 
 def _capsule_inputs(photo_path: str, rgb_full: np.ndarray) -> dict:
@@ -437,7 +444,7 @@ def _procrustes_nme(src: np.ndarray, dst: np.ndarray) -> float:
     return 100.0 * float(np.linalg.norm(aligned - b, axis=1).mean() / np.linalg.norm(dst[33] - dst[263]))
 
 
-def score(code: str, body, inputs: LabInputs) -> "tuple[dict, trimesh.Trimesh, Image.Image]":
+def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (480, 320)) -> "tuple[dict, trimesh.Trimesh, Image.Image]":
     """Metrics, a light preview mesh (keeps vertex colours when small enough)
     and a thumbnail for one built combination."""
     from .face_features import detect_face_mesh
@@ -462,7 +469,7 @@ def score(code: str, body, inputs: LabInputs) -> "tuple[dict, trimesh.Trimesh, I
 
     sil, zf, px = _front_heightmap(preview, floor)
     m["shape_iou"] = round(_aligned_iou(sil, inputs.photo_mask), 1)
-    thumb = _three_views(preview, floor, sil, zf, px)
+    thumb = _three_views(preview, floor, sil, zf, px, size=thumb_size)
 
     m["face_found"] = None
     got, head = None, None

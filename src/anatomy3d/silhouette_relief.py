@@ -366,7 +366,7 @@ def _proportioned_thickness(
     part: limbs where the outline is narrowest, torso where it's widest,
     head over the face."""
     dist = distance_transform_edt(grid_mask).astype(np.float32)
-    skel = medial_axis(grid_mask) & (inflation > 1e-6)
+    skel = medial_axis(grid_mask, rng=0) & (inflation > 1e-6)  # seeded: it breaks ties at random, and the same photo should give the same model
     if not skel.any():
         return inflation * torso_ratio
     gain_on_axis = np.zeros_like(dist)

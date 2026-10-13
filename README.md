@@ -438,6 +438,18 @@ external JS dependency to go down.
 and mesh stats; `/fit` is still there as a direct-download endpoint for
 scripting/curl use, same as before.
 
+`/study` lets the server teach the builder on its own. A study holds a
+few photos and some areas of the builder's numbers (`anatomy3d/knobs.py`:
+hair, headwear, neck, ears, clothes, face). It builds each photo with the
+production settings, scores every model automatically (`anatomy3d/study.py`:
+the Lab's outline, face and depth checks plus a bump check for fins and
+ridges on the sides and back), moves one number at a time and keeps the
+moves that raise the mean score. It shares the Lab's worker, two turns to a
+Lab run's one, and takes the same lock as Generate. Nothing it finds is used
+until you press Apply; that writes `tuned.json` on the volume, which every
+build then uses. A tuned value is dropped as soon as the code's own default
+for it changes.
+
 The included `Dockerfile` and `railway.toml` deploy as-is on Railway —
 no license-gated files to host or inject, since the default pipeline
 doesn't need any.

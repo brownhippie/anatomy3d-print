@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -32,6 +33,8 @@ from starlette.concurrency import run_in_threadpool
 from trimesh.exchange.obj import export_obj
 
 from anatomy3d import lab
+
+import study_api
 
 
 def _lab_root() -> Path:
@@ -50,6 +53,9 @@ LAB_ROOT = _lab_root()
 # Stop storing preview models (metrics and thumbnails still kept) once the
 # lab's own folder passes this, so a long run can't fill the volume.
 LAB_MAX_BYTES = int(float(os.environ.get("ANATOMY3D_LAB_MAX_GB", "9")) * 1e9)
+# Below this much free space on the volume a run keeps only its metrics (no
+# thumbnails or models), so a full volume never stops it or anything else.
+LAB_MIN_FREE = 150e6
 RUN_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 CODE_RE = re.compile(r"^[A-Z]-[0-9]{1,16}$")
 
@@ -94,6 +100,13 @@ def _results(d: Path) -> "dict[str, dict]":
                 r = json.loads(line)
                 out[r["code"]] = r
     return out
+
+
+def _disk_free() -> float:
+    try:
+        return shutil.disk_usage(LAB_ROOT).free
+    except OSError:
+        return 0.0
 
 
 def _folder_bytes() -> int:
@@ -156,10 +169,12 @@ def _work_one(run_id: str) -> bool:
                 body = lab.build(code, inputs)
                 metrics, preview, thumb = lab.score(code, body, inputs)
             row.update(status="ok", **metrics)
-            (d / "t").mkdir(exist_ok=True)
-            thumb.save(d / "t" / f"{code}.png", optimize=True)
-            added = (d / "t" / f"{code}.png").stat().st_size
-            if _folder_bytes() < LAB_MAX_BYTES:
+            added = 0
+            if _disk_free() > LAB_MIN_FREE:
+                (d / "t").mkdir(exist_ok=True)
+                thumb.save(d / "t" / f"{code}.png", optimize=True)
+                added = (d / "t" / f"{code}.png").stat().st_size
+            if _folder_bytes() < LAB_MAX_BYTES and _disk_free() > LAB_MIN_FREE:
                 (d / "m").mkdir(exist_ok=True)
                 data = gzip.compress(export_obj(preview, include_normals=False, include_texture=False, digits=3).encode(), 6)
                 (d / "m" / f"{code}.obj.gz").write_bytes(data)
@@ -178,17 +193,25 @@ def _work_one(run_id: str) -> bool:
 
 
 def _worker_loop() -> None:
+    turn = 0
     while True:
         run_id = None
         try:
+            turn += 1
+            sid = study_api.active()
             run_id = _active_run()
+            if sid and (run_id is None or turn % 3):  # a running study gets two turns to a run's one
+                run_id = None
+                study_api.work_one(sid, _generation_lock)
+                time.sleep(0.3)
+                continue
             if run_id is None:
                 time.sleep(3)
                 continue
             _work_one(run_id)
             time.sleep(0.3)  # let a person's own Generate take the lock between combinations
         except Exception as exc:  # noqa: BLE001 - keep the worker alive whatever happens
-            print(f"Lab worker error on {run_id}: {exc}")
+            print(f"Lab worker error on {run_id or 'a study'}: {exc}")
             if run_id:
                 with _state_lock:
                     d = LAB_ROOT / run_id
@@ -360,6 +383,8 @@ def rate(run_id: str, rating: Rating):
 
 @router.post("/runs/{run_id}/{action}")
 def control_run(run_id: str, action: str):
+    if action == "drop-models":
+        return drop_models(run_id)
     if action not in ("pause", "resume"):
         raise HTTPException(404, "Unknown action.")
     d = _run_dir(run_id)
@@ -439,3 +464,43 @@ async def stl(run_id: str, code: str):
     if not path.exists():
         await run_in_threadpool(make)
     return FileResponse(path, media_type="model/stl", filename=f"figure-{code}.stl")
+
+
+# ---------------------------------------------------------------- storage
+
+
+def _bytes(p: Path) -> int:
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.is_dir() else 0
+
+
+@router.get("/storage")
+def storage():
+    """What each run keeps on the volume: 3D previews (m/), thumbnails (t/)."""
+    runs = []
+    for d in sorted(LAB_ROOT.iterdir(), key=lambda p: p.stat().st_mtime):
+        meta = _read_json(d / "meta.json", None) if d.is_dir() else None
+        if meta:
+            runs.append({"run_id": d.name, "photo_name": meta.get("photo_name"), "status": meta.get("status"),
+                         "created": meta.get("created"), "models_mb": round(_bytes(d / "m") / 1e6, 1),
+                         "thumbs_mb": round(_bytes(d / "t") / 1e6, 1), "rated": len(_read_json(d / "ratings.json", {}))})
+    return {"runs": runs, "free_mb": round(_disk_free() / 1e6), "cap_gb": round(LAB_MAX_BYTES / 1e9, 1)}
+
+
+def drop_models(run_id: str):
+    """Removes a run's stored 3D previews (its scores, thumbnails and your
+    ratings stay; Download STL still rebuilds any combination)."""
+    d = _run_dir(run_id)
+    meta = _read_json(d / "meta.json", {})
+    if meta.get("status") == "running":
+        raise HTTPException(409, "Pause the run first.")
+    freed = _bytes(d / "m")
+    shutil.rmtree(d / "m", ignore_errors=True)
+    with _state_lock:
+        rows = list(_results(d).values())
+        for r in rows:
+            r["model"] = False
+        tmp = d / "results.tmp"
+        tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        tmp.replace(d / "results.jsonl")
+    _lab_bytes["total"] = None
+    return {"freed_mb": round(freed / 1e6, 1), "free_mb": round(_disk_free() / 1e6)}

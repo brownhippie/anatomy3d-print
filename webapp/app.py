@@ -107,12 +107,17 @@ _generation_lock = threading.Lock()
 # whether the server is started as `webapp.app:app` or `app:app --app-dir webapp`.
 sys.path.insert(0, str(WEBAPP_DIR))
 from lab_api import router as lab_router, start_worker as start_lab_worker  # noqa: E402
+import study_api  # noqa: E402
 
 app.include_router(lab_router)
+app.include_router(study_api.router)
 
 
 @app.on_event("startup")
 def _start_lab_worker() -> None:
+    # approved study values (tuned.json) in place before any build
+    study_api.load_tuned_at_startup()
+    study_api.set_generation_lock(_generation_lock)
     start_lab_worker(_generation_lock)
 
 
@@ -210,6 +215,11 @@ def index():
     html = html.replace('href="/static/style.css"', f'href="/static/style.css?v={_COMMIT}"')
     html = html.replace('src="/static/app.js"', f'src="/static/app.js?v={_COMMIT}"')
     return html
+
+
+@app.get("/study", response_class=HTMLResponse)
+def study_page():
+    return (WEBAPP_DIR / "templates" / "study.html").read_text()
 
 
 @app.get("/health")
