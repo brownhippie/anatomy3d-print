@@ -343,12 +343,10 @@ function initViewer() {
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.target.set(0, 60, 0);
-  // One-finger drag orbits the model; that's the drag gesture someone on
-  // a phone actually uses, and it was going the unintuitive way -- flip
-  // it (rotateSpeed, not panSpeed: the earlier panSpeed=-1 fix inverted
-  // a gesture -- two-finger drag/right-click pan -- that one-finger
-  // orbiting never actually used).
-  controls.rotateSpeed = -1;
+  // One-finger drag orbits the model. Reversed once (rotateSpeed -1) and
+  // reported backwards both ways on a phone after that: back to
+  // OrbitControls' own direction, left-right and up-down.
+  controls.rotateSpeed = 1;
   // Two-finger pinch keeps OrbitControls' default DOLLY_PAN touch gesture
   // -- finger-distance change zooms, the two fingers' average movement
   // pans -- directly requested as "pinch for movement" alongside
