@@ -62,6 +62,9 @@ _EAR_STANDS = (0.08, 0.6)  # how far out of the head's line an ear can stand
 _EAR_LENGTH = (0.75, 1.3)  # how long an ear can be
 _EAR_TURN = (-0.35, 0.8)  # radians an ear may swing in toward / out from the head
 _EAR_SCALE = (0.8, 1.5)
+_EAR_UNDER_HAIR = 0.6  # an ear's place beside the face this much hair (or hat): under it
+# head_parts.py's labels (not imported: it pulls in the segmenters)
+_HP_HAIR, _HP_SKIN, _HP_FACE, _HP_HAT = 1, 2, 3, 6
 _EAR_BEND = 0.015  # the swing reaches all of it this far (metres) out from the ear's root
 _MAX_FOREARM_LIFT = (0.10, 0.18)  # metres folded forearms/hands stand off the torso's front: median, most
 _REST_MAX = 0.10  # fit: a folded forearm's surface stays within this of the torso's front
@@ -176,15 +179,20 @@ def _photo_targets(pose: dict, face_mesh: Optional[np.ndarray]):
     return names, np.asarray(xy, dtype=np.float64), np.asarray(w)
 
 
-def measure_ears(photo_mask: np.ndarray, face_mesh: Optional[np.ndarray], px_per_m: float):
+def measure_ears(photo_mask: np.ndarray, face_mesh: Optional[np.ndarray], px_per_m: float, parts: Optional[dict] = None):
     """Each ear as the photo's outline shows it: where it starts (the outline
     turning out of the hair or temple, or the brow line when it doesn't
     show), where the lobe ends (the outline stepping in to the jaw), and how
     far it stands out of the head's own line at its widest. Keyed by the
-    subject's side ("L" is on the photo's right); a side whose ear the
-    outline doesn't show (hair over it, the head turned) is left out. With
-    one ear seen, the other gets its size; with none, the body model's own
-    ear stays. Returns (ears, report)."""
+    subject's side ("L" is on the photo's right).
+
+    With the head's parts (head_parts.py): an ear whose place beside the face
+    is mostly hair or a hat is under it ({"hidden": True}: not built); a
+    bump in the outline counts only if it's skin (a curl of hair or an
+    earring isn't an ear); and an ear that shows but can't be measured runs,
+    as most people's do, from the brow line to the nose base. With one ear
+    measured, the other gets its size. Without parts, sides not measured are
+    left out (the body model's own ear). Returns (ears, report)."""
     if face_mesh is None:
         return {}, {"source": "none"}
     f = np.asarray(face_mesh, dtype=np.float64)[:, :2]
@@ -195,11 +203,25 @@ def measure_ears(photo_mask: np.ndarray, face_mesh: Optional[np.ndarray], px_per
         return {}, {"source": "none"}
     k = max(2, int(round(0.05 * ruler)))
     xc = int(round((f[_FACE_EDGE["R"], 0] + f[_FACE_EDGE["L"], 0]) / 2.0))  # the head's middle
-    seen = {}
+    labels = parts.get("labels") if parts else None
+    seen, hidden, place = {}, set(), {}
     for side, out in (("R", -1), ("L", 1)):
         brow = float(f[_BROW[side], 1])
         base = float(f[2, 1]) + (brow - brow_mid)  # nose base, tilted with the brows
         x0 = float(f[_FACE_EDGE[side], 0])
+        place[side] = (brow, base)
+        if labels is not None:
+            # what lies beside the face, brow line to nose base, out to the outline
+            y_lo, y_hi = int(max(brow, 0)), int(min(base, H - 1))
+            xs = np.arange(int(x0), int(x0 + out * 0.6 * ruler), out)
+            xs = xs[(xs >= 0) & (xs < W)]
+            if y_hi > y_lo and len(xs):
+                zone = labels[y_lo:y_hi + 1][:, xs][photo_mask[y_lo:y_hi + 1][:, xs]]
+                if len(zone) >= (0.1 * ruler) ** 2:
+                    hair = np.isin(zone, (_HP_HAIR, _HP_HAT)).mean()
+                    if hair >= _EAR_UNDER_HAIR:
+                        hidden.add(side)
+                        continue
         rows = np.arange(max(int(brow - 0.6 * ruler), k), min(int(base + 0.8 * ruler), H - k))
         if len(rows) < 4 * k or not 0 <= xc < W:
             continue
@@ -239,16 +261,37 @@ def measure_ears(photo_mask: np.ndarray, face_mesh: Optional[np.ndarray], px_per
         # hair there isn't the ear)
         o0 = t + int(round(0.15 * (b - t)))
         o = o0 + int(np.argmax(e[o0:b + 1]))
+        if labels is not None:
+            # the bump itself has to be skin
+            bump = []
+            for i in range(t, b + 1):
+                y = int(rows[i])
+                lo_x, hi_x = sorted((x0 + out * (line[i - t] + 1), x0 + out * e[i]))
+                xs = np.arange(int(np.ceil(lo_x)), int(hi_x) + 1)
+                xs = xs[(xs >= 0) & (xs < W)]
+                bump.append(labels[y, xs])
+            bump = np.concatenate(bump) if bump else np.zeros(0, dtype=np.uint8)
+            if len(bump) and np.isin(bump, (_HP_FACE, _HP_SKIN)).mean() < 0.5:
+                continue
         seen[side] = {"top": float(rows[t]), "bottom": float(rows[b]), "outer": [x0 + out * float(e[o]), float(rows[o])],
                       "stands_px": float(stands.max()), "top_from": "outline" if t != ix(brow) else "brow line"}
-    ears = dict(seen)
+    ears = {sd: dict(m, source="measured") for sd, m in seen.items()}
     if len(seen) == 1:
-        # one ear seen: the other is its size, level with its own brow
+        # one ear measured: the other is its size, level with its own brow
         (a, m), = seen.items()
         other = "L" if a == "R" else "R"
-        dy = float(f[_BROW[other], 1] - f[_BROW[a], 1])
-        ears[other] = {"top": m["top"] + dy, "bottom": m["bottom"] + dy, "outer": None}
-    report = {"source": {2: "both", 1: "left" if "L" in seen else "right", 0: "none"}[len(seen)]}
+        if other not in hidden:
+            dy = float(f[_BROW[other], 1] - f[_BROW[a], 1])
+            ears[other] = {"top": m["top"] + dy, "bottom": m["bottom"] + dy, "outer": None, "source": "the other ear"}
+    elif not seen and labels is not None:
+        # not measured but showing: brow line to nose base
+        for sd in "LR":
+            if sd not in hidden:
+                ears[sd] = {"top": place[sd][0], "bottom": place[sd][1], "outer": None, "source": "face"}
+    for sd in hidden:
+        ears[sd] = {"hidden": True, "source": "under hair"}
+    report = {"source": {2: "both", 1: "left" if "L" in seen else "right", 0: "none"}[len(seen)],
+              "sides": {sd: ears[sd]["source"] for sd in sorted(ears)}}
     if seen:
         length = float(np.mean([m["bottom"] - m["top"] for m in seen.values()]))
         report.update({"length_cm": round(100 * length / px_per_m, 1),
@@ -276,7 +319,7 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
         t = ears.get(side)
         w = ear_w[:, i]
         core = w > 0.95  # the ear itself; below that, skin around its base
-        if not t or core.sum() < 10:
+        if not t or t.get("hidden") or core.sum() < 10:
             continue
         u = 1.0 if side == "L" else -1.0  # outward, in the head's frame
         loc = V @ A
@@ -344,11 +387,12 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
 
 
 def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], photo_mask: np.ndarray,
-                       gender: str = "male") -> Optional[dict]:
+                       gender: str = "male", parts: Optional[dict] = None) -> Optional[dict]:
     """The body posed onto the photo, in photo pixels: x right, y down, depth
     toward the back, with a report of how well it matches the photo
     ("matched" False: don't use it). None when there is not enough to pose
-    it."""
+    it. `parts`: head_parts.detect_head_parts of the same photo (hair, skin,
+    hat, mask, glasses round the head), carried on for the builder."""
     if not pose or "left_shoulder" not in pose or "right_shoulder" not in pose:
         return None
     body = _body(gender)
@@ -689,6 +733,8 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
     # the head's own axes in the photo's frame (x right, y down, depth back),
     # for turning the ears; the ears as the photo shows them
     head_axes = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]) @ Rw[body["head_bone"]]
-    ears, report["ears"] = measure_ears(photo_mask, face_mesh, s)
+    ears, report["ears"] = measure_ears(photo_mask, face_mesh, s, parts=parts)
+    if parts is not None:
+        report["head_has"] = [k for k, v in parts.get("found", {}).items() if v]
     return {"matched": report["matched"], "report": report, "vertices": px, "joints_px": joints_px, "core_depth": core_depth, "faces": body["faces"], "part_w": body["part_w"],
-            "part_names": np.array(body["part_names"]), "px_per_m": s, "ear_w": body["ear_w"], "head_axes": head_axes, "ears": ears}
+            "part_names": np.array(body["part_names"]), "px_per_m": s, "ear_w": body["ear_w"], "head_axes": head_axes, "ears": ears, "parts": parts}

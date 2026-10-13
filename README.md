@@ -258,6 +258,12 @@ MediaPipe, from Google's model bucket, not something you need to register
 for or accept a license for — unlike SMPL-X, downloading them is just
 normal setup, not a legal step.
 
+For what is worn on and around a person's head (a cap or hat, a face mask,
+glasses, hair), `head_parts.py` also fetches CLIPSeg
+(`CIDAS/clipseg-rd64-refined`, Apache-2.0) as the int8 ONNX export
+`Xenova/clipseg-rd64-refined` (139MB, same cache), run on the CPU with
+onnxruntime like the other ONNX models — no service is called.
+
 MediaPipe's native library also needs a few system packages even for
 CPU-only use — `libgl1`, `libglib2.0-0`, `libgles2`, `libegl1` (already in
 the Dockerfile; install them yourself if running outside a container,

@@ -246,7 +246,14 @@ def prepare_inputs(photo_path: str, body: str = "male") -> LabInputs:
         try:
             from .body_reference import fit_body_reference
 
-            fitted = fit_body_reference(pose, face_mesh, mask, gender=body)
+            parts = None
+            try:
+                from .head_parts import detect_head_parts
+
+                parts = detect_head_parts(rgb, face_mesh)
+            except Exception:  # noqa: BLE001 - without it hair and accessories go unnamed
+                parts = None
+            fitted = fit_body_reference(pose, face_mesh, mask, gender=body, parts=parts)
             reference = fitted if fitted is not None and fitted["matched"] else None
         except Exception:  # noqa: BLE001 - builds fall back to outline-based shapes
             reference = None

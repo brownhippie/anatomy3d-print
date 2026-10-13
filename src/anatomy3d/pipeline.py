@@ -392,7 +392,14 @@ def run_silhouette_relief_pipeline(
         try:
             from .body_reference import fit_body_reference
 
-            fitted = fit_body_reference(pose, face_mesh, alpha > 0.5, gender=body)
+            parts = None
+            try:
+                from .head_parts import detect_head_parts
+
+                parts = detect_head_parts(rgb, face_mesh)
+            except Exception as exc:  # noqa: BLE001 - without it hair and accessories go unnamed, as before
+                print(f"Note: head parts skipped ({exc}).")
+            fitted = fit_body_reference(pose, face_mesh, alpha > 0.5, gender=body, parts=parts)
             if fitted is not None:
                 print(f"Reference body ({body}): {'used' if fitted['matched'] else 'not used, no match'} -- {fitted['report']}")
                 reference = fitted if fitted["matched"] else None

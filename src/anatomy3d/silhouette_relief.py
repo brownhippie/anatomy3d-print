@@ -803,6 +803,21 @@ _REF_HAIR = 0.012  # most the head grows front to back (hair), metres
 _KNEE_REACH = 0.9
 _REF_BARE_PARTS = ("hand.L", "hand.R")
 _REF_RELIEF_MAX = 0.015  # photo-depth detail on top of the reference, metres
+_HAIR_SHELL_MAX = 0.05  # thickest hair (or hat) lying round the skull, metres (more: a mass of its own)
+_HAIR_FEATHER = 0.006  # where hair over the skin ends: feathered over this, metres
+_HAIR_SMOOTH = 0.004  # hair and hat surfaces smoothed across their edges by this, metres
+_HAIR_THIN = 0.012  # hair thinner than this is the head's own outline (the skull grows to it), metres
+_HAIR_FACE_MEET = 0.012  # hair this near the face comes down to the cheek's level, metres
+_HAIR_NECK_BEHIND = 0.008  # hair beside the neck lies this far behind its front, metres
+_HAIR_NAPE_EDGE = 0.004  # the hairline at the nape: hair ends over this, metres
+_HAIR_FRINGE = 0.012  # a fringe over the forehead, at most, metres
+_HAIR_LAYER = 0.008  # long hair lying over the shoulders or chest, metres
+_HAIR_HANG = 0.012  # long hair hanging beside the neck: at least this half-thick, metres
+_HAT_PEAK = 0.3  # a cap's peak reaches this far forward, x the face's width
+_MASK_SPAN = 0.04  # a face mask spans hollows narrower than a ball this size, metres
+_GLASSES_SPAN = 0.02  # glasses' lenses: the same over the eye sockets
+_GLASSES_FRAME = 0.002  # their frame stands this proud, metres
+_REF_RELIEF_FACING = (0.35, 0.7)  # ... fading in as the surface turns from side-on to facing the camera
 _REF_BACK_SMOOTH = 0.02  # clothing over the back: smoothing radius, metres
 # A shirt or jacket over a man's chest spans the hollow between the
 # pectorals and the crease under them: the torso's front is lifted onto a
@@ -1007,6 +1022,17 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
         ear_w = np.zeros((len(V), 0)) if ear_w is None else np.asarray(ear_w, dtype=np.float64)
         on_ear = ear_w.max(axis=1) > 0.05 if ear_w.shape[1] else np.zeros(len(V), dtype=bool)
         ear_grew = np.zeros(ear_w.shape[1])
+        # the skull doesn't grow into hair or a hat: those get their own
+        # volume (_hair_volume); its rim under them doesn't measure the outline
+        under_hair = np.zeros(len(V), dtype=bool)
+        parts = reference.get("parts")
+        if parts is not None and parts.get("labels") is not None:
+            from .head_parts import HAIR as _HAIR, HAT as _HAT
+
+            lab = parts["labels"]
+            ry = np.clip(np.rint(V[:, 1]).astype(int), 0, lab.shape[0] - 1)
+            rx = np.clip(np.rint(V[:, 0]).astype(int), 0, lab.shape[1] - 1)
+            under_hair = (head > 0.5) & np.isin(lab[ry, rx], (_HAIR, _HAT))
         lap = _mesh_laplacian(F, len(V))
         # distance to the photo's outline (photo px, + inside), measured at the
         # photo's own resolution and smoothed: the grid's pixel steps, read
@@ -1023,11 +1049,13 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
             r = np.clip(np.rint(gy).astype(int), 0, shape[0] - 1)
             c = np.clip(np.rint(gx).astype(int), 0, shape[1] - 1)
             inb = (gy >= 0) & (gy < shape[0]) & (gx >= 0) & (gx < shape[1])
-            on_rim = inb & rim[r, c] & (np.abs(_vertex_normals(V, F)[:, 2]) < 0.35) & ~bare & ~on_ear
             if signed_px is not None:
                 gap = map_coordinates(signed_px, [V[:, 1], V[:, 0]], order=1, mode="nearest")
             else:
                 gap = np.where(grid_mask[r, c], d_in[r, c], -d_out[r, c]) / scale
+            # (through thin hair it still grows: a short cut is the head's own outline)
+            thick_hair = under_hair & (gap > _HAIR_THIN * float(reference["px_per_m"]))
+            on_rim = inb & rim[r, c] & (np.abs(_vertex_normals(V, F)[:, 2]) < 0.35) & ~bare & ~on_ear & ~thick_hair
             known = np.flatnonzero(on_rim | bare)
             want = np.where(bare[known], 0.0, np.clip(total[known] + gap[known], lo, hi))
             total = _harmonic_fill(lap, known, want)
@@ -1097,7 +1125,8 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
     if EW is not None and reference.get("head_axes") is not None and part_w is not None:
         EW = np.asarray(EW, dtype=np.float64)
         seen = reference.get("ears") or {}
-        build3d = [side in seen or (not seen and ear_grew[i] <= _REF_EAR_HAIR * float(reference["px_per_m"]))
+        build3d = [(side in seen and not seen[side].get("hidden"))
+                   or (not seen and ear_grew[i] <= _REF_EAR_HAIR * float(reference["px_per_m"]))
                    for i, side in enumerate("LR")]
     if any(build3d):
         lap_e = _mesh_laplacian(F, len(V))
@@ -1234,6 +1263,318 @@ def _join_solids(V: np.ndarray, F: np.ndarray, parts: list):
         out = max(pieces, key=lambda c: c.num_tri())
     mesh = out.to_mesh()
     return np.asarray(mesh.vert_properties[:, :3], dtype=np.float64), np.asarray(mesh.tri_verts, dtype=np.int64)
+
+
+def _offset_surface(F, B, solid, radius_px, scale):
+    """The 3D offset of a front/back solid by `radius_px` (photo px): every
+    point of it grown into a ball of that radius (grey dilation of the front,
+    erosion of the back, with a ball). Returns front, back and the cells it
+    covers."""
+    from scipy.ndimage import distance_transform_edt, grey_dilation
+
+    n = max(int(np.ceil(radius_px * scale)), 1)
+    yy, xx = np.mgrid[-n:n + 1, -n:n + 1]
+    d = np.hypot(yy, xx) / scale
+    ball = d <= radius_px
+    cap = np.where(ball, np.sqrt(np.maximum(radius_px ** 2 - d ** 2, 0.0)), 0.0)
+    low = -1e9
+    Fo = grey_dilation(np.where(solid, F, low), footprint=ball, structure=cap)
+    Bo = -grey_dilation(np.where(solid, -B, low), footprint=ball, structure=cap)
+    covers = distance_transform_edt(~solid) / scale <= radius_px
+    return Fo, Bo, covers & (Fo > low / 2) & (Bo < -low / 2)
+
+
+def _offset_variable(F, B, solid, radius_px, scale):
+    """The 3D offset of a front/back solid where each cell's own radius
+    (photo px) is radius_px there: every point of the solid within that
+    radius of the cell, as a ball. Returns front, back (-inf/+inf where
+    nothing reaches)."""
+    gh, gw = F.shape
+    n = max(int(np.ceil(float(np.nanmax(radius_px)) * scale)), 1)
+    Fo = np.full((gh, gw), -np.inf)
+    Bo = np.full((gh, gw), np.inf)
+    Fs = np.where(solid, F, -np.inf)
+    Bs = np.where(solid, B, np.inf)
+    R2 = radius_px ** 2
+    for dy in range(-n, n + 1):
+        for dx in range(-n, n + 1):
+            d2 = (dy * dy + dx * dx) / (scale * scale)
+            if d2 > n * n / (scale * scale):
+                continue
+            # the solid's cell at (y + dy, x + dx), seen from (y, x)
+            ys0, ys1 = max(0, -dy), min(gh, gh - dy)
+            xs0, xs1 = max(0, -dx), min(gw, gw - dx)
+            src = (slice(ys0 + dy, ys1 + dy), slice(xs0 + dx, xs1 + dx))
+            dst = (slice(ys0, ys1), slice(xs0, xs1))
+            h = np.sqrt(np.maximum(R2[dst] - d2, 0.0))
+            ok = R2[dst] >= d2
+            np.maximum(Fo[dst], np.where(ok, Fs[src] + h, -np.inf), out=Fo[dst])
+            np.minimum(Bo[dst], np.where(ok, Bs[src] - h, np.inf), out=Bo[dst])
+    return Fo, Bo
+
+
+def _hair_and_hat(front, back, grid_mask, photo_cells, parts_g, cov, face_mesh, y0, x0, scale, pad, px_per_m):
+    """Hair (and a cap or hat) as their own volume round the skull, in the
+    build grid (depth in photo px, z toward the camera).
+
+    How thick the hair lies is how far it reaches past the skull at the
+    sides in the photo. The skull -- the reference body's head -- is grown by
+    that much in 3D (every point of it into a ball), so the hair follows the
+    skull's own curve over the top, down the sides and round the back. Hair
+    that reaches further than that (a bun, big hair, long hair beside the
+    neck) is a rounded mass of its own, as deep as it is wide, joined to it.
+    Seen over the skull from the front (the crown, a fringe) the hair lies
+    on it, a fringe never thicker than _HAIR_FRINGE, its edges feathered into
+    the skin; nothing goes on the face below the brows. Below the chin long
+    hair lies over the shoulders and falls straight down the back from the
+    back of the head. A cap whose lower edge comes down to the brows gets a
+    peak. Returns front, back and the cells to build."""
+    from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt, gaussian_filter1d, label as cc_label
+
+    from .head_parts import ACCESSORY, HAIR, HAT
+
+    gh, gw = grid_mask.shape
+    fm = np.asarray(face_mesh, dtype=np.float64)[:, :2]
+    to_r = lambda y: (y - y0) * scale + pad  # noqa: E731
+    to_c = lambda x: (x - x0) * scale + pad  # noqa: E731
+    chin_r = int(round(to_r(fm[152, 1])))
+    eye_r = to_r((fm[33, 1] + fm[263, 1]) / 2.0)
+    brow_r = to_r((fm[105, 1] + fm[334, 1]) / 2.0)
+    base_r = to_r(fm[2, 1])
+    ruler = max(base_r - brow_r, 2.0)  # brow line to nose base, cells
+    c_face = int(round(to_c((fm[234, 0] + fm[454, 0]) / 2.0)))
+    face_w = abs(float(fm[454, 0] - fm[234, 0]))  # photo px
+    rows = np.arange(gh)[:, None]
+    hairish = np.isin(parts_g, (HAIR, HAT)) & photo_cells
+    # a flower or clip in the hair is part of its volume
+    hairish |= (parts_g == ACCESSORY) & photo_cells & binary_dilation(hairish, iterations=2) & (rows < eye_r)
+    # nothing on the face below the brows (a stray label on the nose)
+    from PIL import Image as _Image, ImageDraw as _Draw
+
+    oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176,
+            149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+    face_img = _Image.new("1", (gw, gh), 0)
+    _Draw.Draw(face_img).polygon([(float(to_c(fm[i, 0])), float(to_r(fm[i, 1]))) for i in oval], fill=1)
+    hairish &= ~(np.asarray(face_img, dtype=bool) & (rows > brow_r))
+    if hairish.sum() < 20 or not 0 <= c_face < gw or not 0 < chin_r < gh:
+        return front, back, grid_mask
+    hat = (parts_g == HAT) & hairish
+    # the outline's own edge round the hair, where the parts map called it
+    # background (its pixels are coarser): hair too, not a fin of outline
+    hairish |= photo_cells & (parts_g == 0) & binary_dilation(hairish, iterations=3) & (rows <= chin_r)
+    # the skull: the reference's head above the chin, the piece round the eyes
+    lab, _ = cc_label(cov & (rows <= chin_r))
+    er = int(np.clip(round(eye_r), 0, gh - 1))
+    keep = lab[er, max(c_face - 2, 0):c_face + 3]
+    keep = keep[keep > 0]
+    if not len(keep):
+        return front, back, grid_mask
+    skull = lab == np.bincount(keep).argmax()
+    # the hair (and hat) touching the head; long hair hanging beside the neck
+    lab2, _ = cc_label(skull | (hairish & ~(cov & (rows > chin_r))))
+    keep2 = np.unique(lab2[skull])
+    region = np.isin(lab2, keep2[keep2 > 0])
+    hair_here = region & hairish & ~skull
+    if hair_here.sum() < 10 and not (hairish & skull).any():
+        return front, back, grid_mask
+    # how thick it lies, area by area: how far the hair's outline reaches
+    # past the skull there (4-5 cm on top of an updo, a few mm on a short
+    # cut), spread smoothly inward from the outline and over the skull; up to
+    # _HAIR_SHELL_MAX. (Hair is that thick all over the area -- thinning it to
+    # nothing toward the outline in the photo's plane made a wall on top.)
+    d_skull = distance_transform_edt(~skull) / scale  # photo px
+    tmax = _HAIR_SHELL_MAX * px_per_m
+    edge = hair_here & ~binary_erosion(region)
+    if edge.sum() < 5:
+        return front, back, grid_mask
+    iy, ix = distance_transform_edt(~edge, return_distances=False, return_indices=True)
+    tloc = np.minimum(d_skull, tmax)[iy, ix]
+    tloc = _masked_blur(tloc, np.ones_like(region), max(0.12 * face_w * scale, 1.0))
+    # ... and comes down to nothing right at the outline (a hair edge with
+    # any thickness left there closed in a cut: a seam over the crown)
+    d_edge = distance_transform_edt(region) / scale
+    tloc = np.where(hair_here, np.minimum(tloc, d_skull + 3.0 * d_edge), tloc)
+    tloc = np.clip(tloc, 0.15 * _HAIR_FRINGE * px_per_m, tmax)
+    # the skull grown by it in 3D, each point by its own thickness
+    ys, xs = np.nonzero(region | skull)
+    m = int(np.ceil(tmax * scale)) + 3
+    r0, r1, c0, c1 = max(ys.min() - m, 0), min(ys.max() + m + 1, gh), max(xs.min() - m, 0), min(xs.max() + m + 1, gw)
+    crop = (slice(r0, r1), slice(c0, c1))
+    fo, bo = _offset_variable(front[crop], back[crop], skull[crop], tloc[crop], scale)
+    Fo = np.full((gh, gw), -np.inf)
+    Bo = np.full((gh, gw), np.inf)
+    Fo[crop], Bo[crop] = fo, bo
+    shell = np.isfinite(Fo) & np.isfinite(Bo) & (Fo > Bo)
+    # a front photo can't say whether hair piled high sits forward or back;
+    # it goes up and back: never more than a fringe in front of the forehead
+    br = int(np.clip(round(brow_r - 0.3 * ruler), 0, gh - 1))
+    fcols = np.arange(max(c_face - 3, 0), min(c_face + 4, gw))
+    if skull[br, fcols].any():
+        brow_front = float(front[br, fcols][skull[br, fcols]].max())
+        Fo = np.minimum(Fo, brow_front + _HAIR_FRINGE * px_per_m)
+    F, B = front.copy(), back.copy()
+    # how much it's hair rather than the head's own outline: none for a
+    # short cut, all of it from twice that, smoothly in between (a hard
+    # cut-off, mixed with which rows the outline happened to reach, stamped
+    # bars above every ear)
+    thick = np.clip((tloc - _HAIR_THIN * px_per_m) / (_HAIR_THIN * px_per_m), 0.0, 1.0)
+    on_hair = hair_here & shell & np.isfinite(Fo) & np.isfinite(Bo)
+    blend = on_hair & grid_mask & (thick > 0)
+    F = np.where(blend, F + thick * (np.where(blend, Fo, F) - F), F)
+    B = np.where(blend, B + thick * (np.where(blend, Bo, B) - B), B)
+    new_cells = on_hair & ~grid_mask & (thick >= 0.5)
+    F[new_cells], B[new_cells] = Fo[new_cells], Bo[new_cells]
+    built = blend | new_cells
+    # further than that (long hair, a big bun): a rounded mass of its own,
+    # centred where the shell is
+    more = hair_here & ~shell
+    if more.any():
+        blob = more | (binary_dilation(more, iterations=2) & (shell | skull))
+        blob[:1], blob[-1:], blob[:, :1], blob[:, -1:] = False, False, False, False
+        hb = _inflation_height(blob) / scale
+        known = shell & np.isfinite(Fo) & np.isfinite(Bo)
+        if known.any():
+            iy, ix = distance_transform_edt(~known, return_distances=False, return_indices=True)
+            mid = np.where(known, (np.where(known, Fo, 0.0) + np.where(known, Bo, 0.0)) / 2.0, 0.0)
+            mm = _masked_blur(mid[iy, ix], blob, max(0.05 * face_w * scale, 1.0))
+            F[more], B[more] = mm[more] + hb[more], mm[more] - hb[more]
+            built |= more
+    # hair beside the face lies behind the cheek next to it, meeting it
+    # (standing proud of the face's own falling edge it left a crack)
+    from .head_parts import BODY_SKIN, FACE_SKIN
+
+    skin = skull & np.isin(parts_g, (FACE_SKIN, BODY_SKIN))
+    if skin.any():
+        dist_s, (sy, sx) = distance_transform_edt(~skin, return_indices=True)
+        reach_ = max(_HAIR_FACE_MEET * px_per_m * scale, 1.0)
+        near_s = built & (dist_s <= reach_)
+        cap_f = front[sy, sx]
+        k_ = np.clip(1.0 - dist_s / reach_, 0.0, 1.0)
+        F = np.where(near_s, F + k_ * (np.minimum(F, cap_f) - F), F)
+    # hair hanging beside the neck falls behind it: the neck shows as a neck
+    neck = np.isin(parts_g, (BODY_SKIN,)) & (rows > chin_r) & grid_mask
+    if neck.any():
+        dist_n, (ny, nx) = distance_transform_edt(~neck, return_indices=True)
+        reach_n = max(_HAIR_FACE_MEET * px_per_m * scale, 1.0)
+        near_n = (built | (hairish & (rows > chin_r))) & (dist_n <= reach_n) & ~neck
+        cap_n = front[ny, nx] - _HAIR_NECK_BEHIND * px_per_m
+        F = np.where(near_n, np.minimum(F, cap_n), F)
+    # round the back of the head, down to the nape (hair at the back reaches
+    # about the ear lobes even when the sides are short)
+    nape = max(base_r, max((r for r in np.flatnonzero(hair_here.any(axis=1)) if r <= chin_r), default=0))
+    w = np.clip((nape - rows) / max(_HAIR_NAPE_EDGE * px_per_m * scale, 1.0) + 0.5, 0.0, 1.0)  # a hairline, not a fade
+    on = skull & shell & np.isfinite(Bo)
+    w = w * np.clip((tloc - _HAIR_THIN * px_per_m) / (_HAIR_THIN * px_per_m) + 1.0, 0.0, 1.0)
+    B = np.where(on, np.minimum(B, B + w * (np.where(on, Bo, B) - B)), B)
+    # seen over the skull from the front: on it, a fringe thin, edges feathered
+    over = hairish & skull
+    lay = np.where(over & shell, np.maximum(Fo - F, 0.0), 0.0)
+    near_brow = np.clip((rows - (brow_r - 0.6 * ruler)) / max(0.3 * ruler, 1.0), 0.0, 1.0)
+    lay = np.minimum(lay, (1.0 - near_brow) * lay + near_brow * _HAIR_FRINGE * px_per_m)
+    # (feathered only where it meets skin: where it meets the hair beside
+    # the skull it carries straight on -- feathering there left a seam)
+    feather = np.clip(distance_transform_edt(over | hair_here) / max(_HAIR_FEATHER * px_per_m * scale, 1.0), 0.0, 1.0)
+    F = F + lay * feather * thick
+    # long hair over the shoulders and chest: a layer on them
+    on_body = hairish & cov & (rows > chin_r)
+    F[on_body] = F[on_body] + _HAIR_LAYER * px_per_m * np.clip(distance_transform_edt(on_body)[on_body] / 2.0, 0.0, 1.0)
+    # falling down the back from the back of the head, where it hangs on
+    # both sides of the neck
+    below = hairish & (rows > chin_r)
+    if below.any():
+        occ = np.where(skull | built, B, np.inf).min(axis=0)
+        for r in np.flatnonzero(below.any(axis=1)):
+            hc = np.flatnonzero(below[r])
+            if hc.min() < c_face < hc.max():
+                cols = np.arange(hc.min(), hc.max() + 1)
+                cols = cols[(grid_mask[r, cols] | built[r, cols]) & np.isfinite(occ[cols])]
+                B[r, cols] = np.minimum(B[r, cols], occ[cols])
+    # a cap's peak: along the hat's lower edge across the face, if it comes
+    # down near the brows; one smooth curve, thin as a peak is
+    if hat.any():
+        half_w = 0.45 * face_w * scale
+        fc = np.arange(int(round(c_face - half_w)), int(round(c_face + half_w)) + 1)
+        fc = fc[(fc >= 0) & (fc < gw)]
+        bot = np.array([float(np.flatnonzero(hat[:, cc]).max()) if hat[:, cc].any() else np.nan for cc in fc])
+        good = np.isfinite(bot)
+        if good.mean() > 0.6 and brow_r - 0.8 * ruler <= np.median(bot[good]) <= eye_r:
+            # one smooth arc across the brow (the label's edge is ragged)
+            coef = np.polyfit(fc[good] - c_face, bot[good], 2)
+            bot = np.polyval(coef, fc - c_face)
+            band = max(0.1 * ruler, 1.5)
+            peak = _HAT_PEAK * face_w
+            base = np.array([F[min(int(round(rb_)) + 1, gh - 1), cc] for cc, rb_ in zip(fc, bot)])
+            base = gaussian_filter1d(base, max(0.15 * half_w, 1.0))  # the brow's bumps aren't the peak's
+            for cc, rb_, b0 in zip(fc, bot, base):
+                k = np.sqrt(max(1.0 - ((cc - c_face) / half_w) ** 2, 0.0))
+                r1_ = int(round(rb_))
+                rr = np.arange(max(int(round(rb_ - band)), 0), min(r1_, gh - 1) + 1)
+                F[rr, cc] = np.maximum(F[rr, cc], b0 + peak * k)
+    # smooth across every boundary it changed (label edges are pixel-ragged:
+    # left as they are they were cracks along the hairline, the cap's edge)
+    cells = grid_mask | built
+    changed = cells & ((np.abs(F - front) > 0.5) | (np.abs(B - back) > 0.5) | built)
+    if changed.any():
+        # (not at the outline's own edge: smoothing there stepped the edge
+        # row by row -- ridges down the sides)
+        zone = binary_dilation(changed, iterations=3) & cells & (distance_transform_edt(cells) > 3)
+        sig = max(_HAIR_SMOOTH * px_per_m * scale, 1.0)
+        F = np.where(zone, _masked_blur(F, cells, sig), F)
+        B = np.where(zone, _masked_blur(B, cells, sig), B)
+        # and wider where the hair meets the face's side (a cliff there read
+        # as a crack between the hair and the cheek)
+        seam = binary_dilation(built, iterations=2) & binary_dilation(skull & ~built, iterations=2) & cells & (distance_transform_edt(cells) > 3)
+        if seam.any():
+            w2 = np.clip(gaussian_filter(seam.astype(np.float32), 2.0) * 2.0, 0.0, 1.0)
+            F = F + w2 * (_masked_blur(F, cells, 2.5 * sig) - F)
+    B = np.minimum(B, F - 1.0 / scale)
+    return F, B, cells
+
+
+def _wear_on_face(front: np.ndarray, grid_mask: np.ndarray, parts_g: np.ndarray, scale: float, px_per_m: float) -> np.ndarray:
+    """What's worn on the face, on the front surface (photo px, toward the
+    camera): a face mask is cloth stretched from the nose over the mouth to
+    the chin (a ball of _MASK_SPAN rolled over the face: no lips or hollows
+    under it); glasses are a smooth lens over the eye sockets (a ball of
+    _GLASSES_SPAN) with a raised frame round them."""
+    from scipy.ndimage import binary_dilation, binary_erosion, grey_closing
+
+    from .head_parts import GLASSES, MASK
+
+    out = front.copy()
+    for label, span, rim in ((MASK, _MASK_SPAN, 0.0), (GLASSES, _GLASSES_SPAN, _GLASSES_FRAME)):
+        on = (parts_g == label) & grid_mask
+        if on.sum() < 6:
+            continue
+        n = max(int(round(span * px_per_m * scale)), 1)
+        ys, xs = np.nonzero(on)
+        r0, r1 = max(ys.min() - 2 * n, 0), min(ys.max() + 2 * n + 1, front.shape[0])
+        c0, c1 = max(xs.min() - 2 * n, 0), min(xs.max() + 2 * n + 1, front.shape[1])
+        crop = (slice(r0, r1), slice(c0, c1))
+        yy, xx = np.mgrid[-n:n + 1, -n:n + 1]
+        d = np.hypot(yy, xx) / scale
+        R = span * px_per_m
+        ball = d <= R
+        cap = np.where(ball, np.sqrt(np.maximum(R * R - d * d, 0.0)) - R, 0.0)
+        f = np.where(grid_mask[crop], out[crop], float(out[crop][grid_mask[crop]].min()) - 4 * R)
+        closed = grey_closing(f, footprint=ball, structure=cap)
+        cloth = _masked_blur(np.maximum(closed, f), grid_mask[crop], 1.0)
+        w = np.clip(gaussian_filter(on[crop].astype(np.float32), 1.0) * 1.5, 0.0, 1.0)
+        new = out[crop] + w * (np.maximum(cloth, out[crop]) - out[crop])
+        if rim > 0:
+            band = on[crop] & ~binary_erosion(on[crop], iterations=1)
+            band |= binary_dilation(band, iterations=1) & on[crop]
+            new = new + gaussian_filter(band.astype(np.float32), 0.7) * rim * px_per_m
+        out[crop] = np.where(grid_mask[crop], new, out[crop])
+    return out
+
+
+def _parts_on_grid(labels: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
+    """head_parts labels (photo px) at each build-grid cell (nearest)."""
+    gh, gw = grid_shape
+    r = np.clip(np.rint(y0 + (np.arange(gh) - pad) / scale).astype(int), 0, labels.shape[0] - 1)
+    c = np.clip(np.rint(x0 + (np.arange(gw) - pad) / scale).astype(int), 0, labels.shape[1] - 1)
+    return labels[r[:, None], c[None, :]]
 
 
 def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
@@ -1568,6 +1909,9 @@ def build_silhouette_relief_mesh(
         front0, back0 = half_thickness_raw, -half_thickness_raw
     ref = (_reference_surfaces(reference, grid_mask, y0, x0, scale, pad, face_mesh, photo_mask=mask)
            if reference is not None else None)
+    parts = reference.get("parts") if reference is not None else None
+    parts_g = (_parts_on_grid(parts["labels"], grid_mask.shape, y0, x0, scale, pad)
+               if parts is not None and parts.get("labels") is not None else None)
     photo_cells = grid_mask
     if ref is not None:
         rf, rb, cov, ears3d = ref
@@ -1655,6 +1999,10 @@ def build_silhouette_relief_mesh(
         r_half = seam * _masked_blur(r_half, grid_mask, 1.0) + (1.0 - seam) * r_half
         front0 = np.where(grid_mask, r_mid + r_half, 0.0)
         back0 = np.where(grid_mask, r_mid - r_half, 0.0)
+        if parts_g is not None and face_mesh is not None:
+            front0, back0, grid_mask = _hair_and_hat(front0, back0, grid_mask, photo_cells, parts_g, inside | (cov & grid_mask),
+                                                     face_mesh, y0, x0, scale, pad, float(reference["px_per_m"]))
+            front0, back0 = np.where(grid_mask, front0, 0.0), np.where(grid_mask, back0, 0.0)
     mid0 = np.where(grid_mask, (front0 + back0) / 2.0, 0.0)
     if edge == "hard":
         # Original edge: a soft floor so thickness never reaches 0, with the
@@ -1735,6 +2083,14 @@ def build_silhouette_relief_mesh(
                 # belly, the head's forward reach): the photo adds detail only
                 cap = _REF_RELIEF_MAX * float(reference["px_per_m"])
                 relief = np.clip(relief, -cap, cap)
+                # ... on surfaces facing the camera: the depth estimate jumps
+                # at every edge it sees (the jaw over the neck, the head
+                # against the background), and pressed onto a surface facing
+                # sideways that made a ridge down the jaw in front of the ear
+                # and ripples over the crown
+                sy_, sx_ = np.gradient(front0)
+                facing = 1.0 / np.sqrt(1.0 + (np.hypot(sy_, sx_) * scale) ** 2)
+                relief = relief * np.clip((facing - _REF_RELIEF_FACING[0]) / (_REF_RELIEF_FACING[1] - _REF_RELIEF_FACING[0]), 0.0, 1.0)
             front = np.maximum(front0 + relief, mid0 + min_half_thickness * 0.3)
             back = back0
             # Synthetic extension rows keep the plain symmetric guess
@@ -1752,8 +2108,17 @@ def build_silhouette_relief_mesh(
         else:
             strength = _FACE_RELIEF_WITH_DEPTH if use_depth else 1.0
         face_add = np.where(grid_mask, _face_relief(face_mesh, (gh, gw), y0, x0, scale, pad) * strength, 0.0)
+        if parts_g is not None:
+            # only the face the photo shows: nothing sculpted under a mask,
+            # behind sunglasses or under a fringe or a cap's peak (the face
+            # landmarks are guessed there, the photo doesn't show them)
+            from .head_parts import BODY_SKIN, FACE_SKIN
+
+            face_add = face_add * gaussian_filter(np.isin(parts_g, (FACE_SKIN, BODY_SKIN)).astype(np.float32), 1.5)
         front = mid + half_span + face_add
         back = mid - half_span
+        if parts_g is not None and ref is not None:
+            front = _wear_on_face(front, grid_mask, parts_g, scale, float(reference["px_per_m"]))
         mid = (front + back) / 2.0
         # Eye sockets push the front back; never let that thin the head
         # below the floor used elsewhere.
