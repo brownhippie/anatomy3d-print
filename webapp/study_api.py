@@ -88,6 +88,28 @@ def _renders(sid: str) -> Path:
     return CACHE_ROOT / sid / "t"
 
 
+def _repair(sid: str, st: dict, generation_lock: threading.Lock) -> bool:
+    """Renders lost with the container's temp space (a redeploy while the
+    volume was full) are built again, one per step. True if it built one."""
+    t = _renders(sid)
+    for which, values in (("base", {**st["x"], **st["base"]}), ("best", st["x"])):
+        for p in st["photos"]:
+            if (t / which / f"{p['id']}.png").exists():
+                continue
+            d = STUDY_ROOT / sid
+            try:
+                with generation_lock:
+                    inputs = study.prepare(str(d / "p" / p["file"]), p["body"], CACHE_ROOT / sid / f"{p['id']}.pkl")
+                    _, thumb = study.evaluate(inputs, values)
+                (t / which).mkdir(parents=True, exist_ok=True)
+                thumb.save(t / which / f"{p['id']}.png", optimize=True)
+            except Exception as exc:  # noqa: BLE001 - leave it missing; the study goes on
+                print(f"Study {sid}: couldn't render {which} {p['id']}: {exc}")
+                return False
+            return True
+    return False
+
+
 def load_tuned_at_startup() -> None:
     _tuned_status.update(knobs.load_tuned())
 
@@ -110,6 +132,8 @@ def work_one(sid: str, generation_lock: threading.Lock) -> None:
     with _lock:
         st = _read(d / "state.json", None)
     if not st or st.get("status") != "running":
+        return
+    if st["cand"] is None and st["best_obj"] is not None and _repair(sid, st, generation_lock):
         return
     if st["cand"] is None:
         st["cand"] = study.next_candidate(st)
