@@ -794,6 +794,8 @@ _REF_CLOTH_RANGE = (-0.025, 0.05)  # most a part shrinks (slimmer than the refer
 _REF_CLOTH_DEPTH = 1.0
 _REF_DEPTH_MARGIN = 1.10
 _REF_HEAD_MARGIN = 1.05
+_REF_SIDE_SMOOTH = 30  # extra smoothing passes on surfaces facing sideways
+_REF_EDGE_SLACK = 0.015  # the body's own edge may pass the photo outline by this much, metres
 _REF_HAND_SHRINK = 0.3  # hands shrunk to this share about the wrist
 _REF_HAIR = 0.012  # most the head grows front to back (hair), metres
 # How much body to build (see _person_extent): a photo reaching this share
@@ -852,6 +854,16 @@ def _mesh_laplacian(F, n):
     return sparse.diags(np.asarray(adj.sum(axis=1)).ravel()) - adj
 
 
+def _mesh_smooth(lap, x, iterations):
+    """Average each vertex's value with its neighbours', `iterations` times."""
+    deg = np.asarray(lap.diagonal()).ravel()
+    adj = sparse.diags(deg) - lap
+    inv = 1.0 / np.maximum(deg, 1.0)
+    for _ in range(iterations):
+        x = 0.5 * x + 0.5 * inv * (adj @ x)
+    return x
+
+
 def _harmonic_fill(lap, known, values):
     """Values at `known` vertices spread smoothly over the rest of the mesh."""
     n = lap.shape[0]
@@ -884,7 +896,7 @@ def _person_extent(mask: np.ndarray, hip_y: Optional[float], knee_y: Optional[fl
 
 
 def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int, scale: float, pad: int,
-                        face_mesh: Optional[np.ndarray]):
+                        face_mesh: Optional[np.ndarray], photo_mask: Optional[np.ndarray] = None):
     """Front and back (photo px, z toward camera) of the posed reference body
     on the build grid, grown to the outline, and the cells it covers."""
     from scipy.ndimage import binary_closing, binary_dilation, binary_erosion
@@ -915,6 +927,12 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
         head = part_w[:, names.index("head")] if "head" in names else np.zeros(len(V))
         depth_share = 1.0 - (1.0 - _REF_CLOTH_DEPTH) * (1.0 - head)
         lap = _mesh_laplacian(F, len(V))
+        # distance to the photo's outline (photo px, + inside), measured at the
+        # photo's own resolution and smoothed: the grid's pixel steps, read
+        # straight into each vertex's growth, made ridges along every side
+        signed_px = None
+        if photo_mask is not None:
+            signed_px = gaussian_filter((distance_transform_edt(photo_mask) - distance_transform_edt(~photo_mask)).astype(np.float32), 1.5)
         total = np.zeros(len(V))
         for _ in range(3):
             gx, gy = grid_xy(V)
@@ -925,10 +943,16 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
             c = np.clip(np.rint(gx).astype(int), 0, shape[1] - 1)
             inb = (gy >= 0) & (gy < shape[0]) & (gx >= 0) & (gx < shape[1])
             on_rim = inb & rim[r, c] & (np.abs(_vertex_normals(V, F)[:, 2]) < 0.35) & ~bare
-            gap = np.where(grid_mask[r, c], d_in[r, c], -d_out[r, c]) / scale
+            if signed_px is not None:
+                gap = map_coordinates(signed_px, [V[:, 1], V[:, 0]], order=1, mode="nearest")
+            else:
+                gap = np.where(grid_mask[r, c], d_in[r, c], -d_out[r, c]) / scale
             known = np.flatnonzero(on_rim | bare)
             want = np.where(bare[known], 0.0, np.clip(total[known] + gap[known], lo, hi))
             total = _harmonic_fill(lap, known, want)
+            # smooth it over the surface: what's left of the outline's pixel
+            # steps in the measured gaps showed as ridges along every side
+            total = _mesh_smooth(lap, total, 12)
             step = nrm0 * total[:, None]
             # depth: never shrinks; on the head it grows by hair at most (the
             # outline's ears and hair say nothing about the skull's length)
@@ -1330,7 +1354,7 @@ def build_silhouette_relief_mesh(
         front0, back0 = _with_arms(layout, grid_mask, torso_front, torso_back, max(limb_depth_scale, 0.95), dist)
     else:
         front0, back0 = half_thickness_raw, -half_thickness_raw
-    ref = (_reference_surfaces(reference, grid_mask, y0, x0, scale, pad, face_mesh)
+    ref = (_reference_surfaces(reference, grid_mask, y0, x0, scale, pad, face_mesh, photo_mask=mask)
            if reference is not None else None)
     photo_cells = grid_mask
     if ref is not None:
@@ -1343,8 +1367,17 @@ def build_silhouette_relief_mesh(
         # the body) keep the outline-based thickness.
         from scipy.ndimage import binary_dilation, binary_opening
 
-        ring = cov & (distance_transform_edt(~grid_mask) <= 2.0)
+        # (how far past the outline: its pixel edge is ragged row by row at
+        # hair and ears, and cutting the smooth body wherever it poked out
+        # 2 cells left a little wall on every row -- grooves down the sides)
+        slack = max(2.0, _REF_EDGE_SLACK * float(reference["px_per_m"]) * scale)
+        ring = cov & (distance_transform_edt(~grid_mask) <= slack)
         wide_gap = binary_opening(grid_mask & ~cov, iterations=2)
+        # below the ankles the outline takes in the floor shadow around the
+        # feet: there the body's own feet decide (no slabs of shadow)
+        Jx = reference["joints_px"]
+        ankle_row = (max(Jx["left_ankle"][1], Jx["right_ankle"][1]) - y0) * scale + pad
+        wide_gap[np.arange(gh) > ankle_row] = False
         grid_mask = ring | wide_gap
         grid_mask[:pad], grid_mask[-pad:], grid_mask[:, :pad], grid_mask[:, -pad:] = False, False, False, False
         inside = grid_mask & cov
@@ -1536,18 +1569,34 @@ def build_silhouette_relief_mesh(
         dist_grid = distance_transform_edt(grid_mask)
         near_edge = grid_mask & (dist_grid <= 2.0)
         edge_slope = float(np.median(span_sq[near_edge] / dist_grid[near_edge])) if near_edge.any() else 1.0
-        G = np.where(grid_mask, span_sq, -edge_slope * distance_transform_edt(~grid_mask)).astype(np.float32)
-        if ref is not None:
-            # The outline steps from pixel to pixel; with a body's round edge
-            # behind it the steps showed as grooves down the sides. Smooth the
-            # field near the edge, only where the reference body is (thin
-            # outline-only parts such as fingers keep theirs).
-            zone = np.where(grid_mask, np.clip(1.0 - dist_grid / 4.0, 0.0, 1.0), 0.0) * gaussian_filter(ref[2].astype(np.float32), 2.0)
-            G = (zone * gaussian_filter(G, 1.0) + (1.0 - zone) * G).astype(np.float32)
+        # Outside, continue the inside field along its own local slope. With
+        # one global slope there, where the surface crossed zero between the
+        # last cell inside and the first outside depended on where the true
+        # edge fell inside that cell -- different on every row, which showed
+        # as grooves down every side. Clamped so the edge stays within a cell
+        # of the outline.
+        d_out, (iy, ix) = distance_transform_edt(~grid_mask, return_indices=True)
+        oy, ox = np.mgrid[0:gh, 0:gw]
+        uy, ux = iy - oy, ix - ox
+        un = np.maximum(np.hypot(uy, ux), 1e-6)
+        jy = np.clip(np.rint(iy + uy / un).astype(int), 0, gh - 1)
+        jx = np.clip(np.rint(ix + ux / un).astype(int), 0, gw - 1)
+        g1, g2 = span_sq[iy, ix], span_sq[jy, jx]
+        slope = np.where(grid_mask[jy, jx] & (g2 > g1), g2 - g1, edge_slope)
+        g_out = np.minimum(g1 - slope * d_out, -(d_out - 1.0) * edge_slope)
+        G = np.where(grid_mask, span_sq, g_out).astype(np.float32)
     gz = max(4, round(2 * z_max / dz_target) + 4)
 
     zs = np.linspace(-z_max, z_max, gz)
     dz = zs[1] - zs[0]
+    if edge != "hard":
+        # Carry each edge cell's mid-depth outward. It was 0 outside the
+        # outline, and the edge is placed by interpolating the field between
+        # the last cell inside and the first outside: with a jump in mid
+        # between them every row's edge landed somewhere different, which
+        # showed as grooves down every side.
+        near_in = distance_transform_edt(~grid_mask, return_distances=False, return_indices=True)
+        mid = np.where(grid_mask, mid, mid[near_in[0], near_in[1]])
     field = np.empty((gz, gh, gw), dtype=np.float32)
     for i, z in enumerate(zs):
         field[i] = (z - mid) ** 2 - G
@@ -1574,6 +1623,16 @@ def build_silhouette_relief_mesh(
         mesh = max(components, key=lambda c: c.vertices.shape[0])
     if smooth:
         smooth_grid_terracing(mesh)
+        if ref is not None:
+            # The round sides (the band where front meets back) still step by
+            # a fraction of a grid cell from row to row -- below a print layer,
+            # but grazing light shows it as grooves. Smooth those harder,
+            # fading out toward surfaces facing front or back (face, relief).
+            # (Vertices are (depth, row, col) here.)
+            side = np.clip((0.75 - np.abs(mesh.vertex_normals[:, 0])) / 0.35, 0.0, 1.0)
+            extra = mesh.copy()
+            trimesh.smoothing.filter_taubin(extra, lamb=0.5, nu=0.53, iterations=_REF_SIDE_SMOOTH)
+            mesh.vertices = mesh.vertices + side[:, None] * (extra.vertices - mesh.vertices)
     verts, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
 
     vz, vrow, vcol = verts[:, 0], verts[:, 1], verts[:, 2]

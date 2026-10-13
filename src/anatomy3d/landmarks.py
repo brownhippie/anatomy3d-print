@@ -64,6 +64,8 @@ MEDIAPIPE_JOINT_INDEX = {
     "right_ankle": 28,
 }
 
+_HEAD_POINT_INDEX = {"left_eye": 2, "right_eye": 5, "left_ear": 7, "right_ear": 8}
+
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
@@ -241,7 +243,9 @@ def detect_pose_points(rgb) -> dict:
         return {}
     h, w = rgb.shape[:2]
     out = {}
-    for name, idx in MEDIAPIPE_JOINT_INDEX.items():
+    # plus the eyes and ears: which way the head is turned, when the face is
+    # in profile and the face landmarker finds nothing
+    for name, idx in {**MEDIAPIPE_JOINT_INDEX, **_HEAD_POINT_INDEX}.items():
         lm = res.pose_landmarks[0][idx]
         if lm.visibility >= 0.5 and lm.presence >= 0.5 and 0.0 <= lm.y <= 1.0:
             out[name] = (float(lm.x * w), float(lm.y * h))

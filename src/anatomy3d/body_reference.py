@@ -31,7 +31,7 @@ _TRUNK = ["root", "spine05", "spine04", "spine03", "spine02", "spine01", "neck01
 _ARM = ["clavicle", "shoulder01", "upperarm01", "upperarm02", "lowerarm01", "lowerarm02", "wrist"]
 _LEG = ["upperleg01", "lowerleg01"]
 # rotation prior per bone (larger = stiffer)
-_PRIOR = {"root": 2.0, "spine": 6.0, "neck": 3.0, "head": 2.0, "clavicle": 6.0, "shoulder01": 6.0,
+_PRIOR = {"root": 2.0, "spine": 6.0, "neck": 1.0, "head": 0.5, "clavicle": 6.0, "shoulder01": 6.0,
           "upperarm01": 0.05, "upperarm02": 0.5, "lowerarm01": 0.05, "lowerarm02": 0.5, "wrist": 0.5,
           "upperleg01": 0.2, "lowerleg01": 0.2}
 # build (weight, muscle, height, proportions) moves at most this far from
@@ -153,10 +153,14 @@ def _photo_targets(pose: dict, face_mesh: Optional[np.ndarray]):
             names.append(n)
             xy.append(p)
             w.append(wt)
-    elif "nose" in pose:
-        names.append("nose")
-        xy.append(pose["nose"])
-        w.append(1.0)
+    else:
+        # no face landmarks (a profile, a small face): the pose detector's
+        # own nose, eyes and ears say where the head points
+        for n, wt in (("nose", 1.0), ("left_eye", 0.6), ("right_eye", 0.6), ("left_ear", 0.6), ("right_ear", 0.6)):
+            if n in pose:
+                names.append(n)
+                xy.append(pose[n])
+                w.append(wt)
     return names, np.asarray(xy, dtype=np.float64), np.asarray(w)
 
 
@@ -183,7 +187,9 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
     bones = list(_TRUNK) + [f"{b}.{s}" for s in "LR" for b in _ARM] + ([f"{b}.{s}" for s in "LR" for b in _LEG] if legs else [])
     bone_ids = np.array([labels.index(b) for b in bones])
     prior = np.array([next(v for k, v in _PRIOR.items() if b.startswith(k)) for b in bones])
-    pitch = np.array([i for i, b in enumerate(bones) if b in _TRUNK])
+    # the spine stays upright and facing the camera; the neck and head turn
+    # and tilt as the face points say (heads turn all the time)
+    pitch = np.array([i for i, b in enumerate(bones) if b == "root" or b.startswith("spine")])
     leg_i = np.array([i for i, b in enumerate(bones) if b.startswith(("upperleg", "lowerleg"))], dtype=int)
 
     # vertices the fit looks at: keypoint supports, hands, a spread of the rest
