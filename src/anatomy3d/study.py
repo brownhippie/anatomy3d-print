@@ -45,6 +45,8 @@ THUMB = (720, 480)
 HELD_W = 0.3
 BUMP_W = 3.0
 FLOW_W = 0.1
+STAND_W = 10.0  # the figure's centre outside its base: it would tip over
+OVERHANG_W = 0.05  # % of the surface facing steeply down
 EAR_W = 0.2  # the ears' reach beside the head off the photo's, % of the face's width
 NAPE_W = 1.0  # the back of the neck's bumps, %
 FIT_W = 0.5  # the posed body's joints (and bone lengths) on the photo's: its miss, % of the shoulders' width
@@ -57,7 +59,8 @@ OBJECTIVE = (f"study score = Lab score + {HELD_W} × held mean − {BUMP_W} × b
              f"− {OPEN_W} × (how much more or less open the mouth and eyes are than in the photo) "
              f"+ {LAYER_W} × overlaps kept (% of the photo's sure over/under boundaries the model has the right way round) "
              f"− {FIT_W} × the posed body's joint miss (% of shoulder width) "
-             f"− {EAR_W} × the ears' reach off the photo's (% of face width) − {NAPE_W} × the nape's bumps (%)")
+             f"− {EAR_W} × the ears' reach off the photo's (% of face width) − {NAPE_W} × the nape's bumps (%) "
+             f"− {STAND_W} if it wouldn't stand on its base − {OVERHANG_W} × overhang (%)")
 
 
 # ---------------------------------------------------------------- critics
@@ -338,13 +341,34 @@ def nape_bumps(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") 
     return {"nape_bumps": round(100.0 * float((off > BUMP_MM).mean()), 2)}
 
 
+def printability(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
+    """Stands: the figure's centre (by surface area) over its base disk's
+    inner 80%. Overhang: % of the figure's surface facing steeply down
+    (a printer has to hold it up)."""
+    v = preview.vertices
+    cen, area, fn = preview.triangles_center, preview.area_faces, preview.face_normals
+    body = cen[:, 1] > floor + 2.0
+    base = v[v[:, 1] < floor - 0.5]
+    out = {}
+    if len(base) > 10 and body.any():
+        bc = base[:, [0, 2]].mean(0)
+        rad = float(np.percentile(np.linalg.norm(base[:, [0, 2]] - bc, axis=1), 98))
+        com = (cen[body][:, [0, 2]] * area[body, None]).sum(0) / area[body].sum()
+        out["stands"] = 1.0 if np.linalg.norm(com - bc) <= 0.8 * rad else 0.0
+    if body.any():
+        down = body & (fn[:, 1] < -0.6)
+        out["overhang_pct"] = round(100.0 * float(area[down].sum() / area[body].sum()), 2)
+    return out
+
+
 def objective(m: dict) -> float:
     return float(m.get("score", -100.0) + HELD_W * m.get("held_mean", 0.0) - BUMP_W * m.get("bumps", 0.0)
                  + FLOW_W * m.get("hair_flow", 0.0)
                  - OPEN_W * (m.get("mouth_open_diff", 0.0) + m.get("eyes_open_diff", 0.0))
                  + LAYER_W * m.get("layering", 0.0)
                  - FIT_W * 100.0 * (m.get("fit_kp") or 0.0)
-                 - EAR_W * m.get("ear_err", 0.0) - NAPE_W * m.get("nape_bumps", 0.0))
+                 - EAR_W * m.get("ear_err", 0.0) - NAPE_W * m.get("nape_bumps", 0.0)
+                 - STAND_W * (1.0 - m.get("stands", 1.0)) - OVERHANG_W * m.get("overhang_pct", 0.0))
 
 
 def evaluate(inputs: "lab.LabInputs", values: dict):
@@ -361,7 +385,7 @@ def evaluate(inputs: "lab.LabInputs", values: dict):
     if inputs.reference is not None:
         m["fit_kp"] = inputs.reference["report"].get("kp_median")  # the posed body's miss of the photo's joints
     m.update(bumps(preview, _floor(preview)))
-    for critic in (hair_flow, layering, ears_fit, nape_bumps):
+    for critic in (hair_flow, layering, ears_fit, nape_bumps, printability):
         try:
             m.update(critic(preview, _floor(preview), inputs))
         except Exception:  # noqa: BLE001 - a photo it can't apply to just doesn't score it
@@ -425,15 +449,24 @@ def rebase_if_code_changed(st: dict) -> bool:
     score the old code made). True if it queued that."""
     if st.get("code") == code_version() or st.get("best_obj") is None or st.get("cand") is not None:
         return False
+    if st.get("kind") == "neighbours":
+        # a neighbours run compares moves against one start: begun again from scratch by the autopilot
+        st["status"], st["stale"] = "done", True
+        return True
     st["code"] = code_version()
     st["rebase"] = ["base", "best"]
     return True
 
 
-def new_state(sid: str, photos: list, areas: list, max_evals: int, seed: int = 0) -> dict:
+def new_state(sid: str, photos: list, areas: list, max_evals: int, seed: int = 0, kind: str = "tune") -> dict:
+    """kind "tune": the pattern search. kind "neighbours": every number moved
+    once (up a quarter of its range) from the values in use, every score
+    kept, nothing applied -- to see which moves reach other areas' scores."""
     keys = [k.key for k in knobs.KNOBS if k.area in areas]
     base = knobs.current()
-    return {
+    if kind == "neighbours":
+        max_evals = len(keys) + 1
+    return {"kind": kind,
         "sid": sid, "created": time.time(), "status": "running", "areas": areas, "photos": photos,
         "keys": keys, "base": {k: base[k] for k in keys}, "x": {k: base[k] for k in keys},
         "step": START_STEP, "round": 0, "evals": 0, "max_evals": max_evals, "seed": seed,
@@ -451,6 +484,20 @@ def next_candidate(st: dict) -> Optional[dict]:
     """The next move to try, or None when the study is finished."""
     if st["best_obj"] is None:
         return {"values": dict(st["x"]), "change": None, "results": {}}
+    if st.get("kind") == "neighbours":
+        if st.get("queue") is None or (not st["queue"] and st["evals"] <= 1 and not st.get("queued")):
+            st["queue"], st["queued"] = [[k, 1] for k in st["keys"]], True
+        while st["queue"]:
+            key, sign = st["queue"].pop(0)
+            k = knobs.BY_KEY[key]
+            to = _move(k, st["base"][key], NEIGHBOUR_STEP, sign)
+            if to == st["base"][key]:
+                to = _move(k, st["base"][key], NEIGHBOUR_STEP, -sign)
+            if to != st["base"][key]:
+                values = dict(st["base"])
+                values[key] = to
+                return {"values": values, "change": [key, st["base"][key], to, sign], "results": {}}
+        return None
     if st.get("rebase"):
         role = st["rebase"][0]
         values = {**st["x"], **st["base"]} if role == "base" else dict(st["x"])
@@ -489,7 +536,8 @@ def finish_candidate(st: dict) -> dict:
             "objective": round(mean, 2), "complete": complete,
             "metrics": {pid: {k: r.get(k) for k in ("score", "held_mean", "bumps", "shape_iou", "face_err_pct", "spike_pct", "hair_flow",
                                                     "face_err_eyes", "face_err_brows", "face_err_nose", "face_err_mouth", "face_err_jaw",
-                                                    "mouth_open_diff", "eyes_open_diff", "layering", "fit_kp", "ear_err", "nape_bumps", "error")}
+                                                    "mouth_open_diff", "eyes_open_diff", "layering", "fit_kp", "ear_err", "nape_bumps", "stands",
+                                                    "overhang_pct", "error")}
                         for pid, r in c["results"].items()}}
     if c.get("role"):
         # the same values built again with new code
@@ -505,6 +553,12 @@ def finish_candidate(st: dict) -> dict:
         st["best_per_photo"] = dict(per)
         st["base_per_photo"] = dict(per)
         line["kept"] = "baseline"
+        line["all"] = {pid: {k_: v_ for k_, v_ in r.items() if isinstance(v_, (int, float)) and not isinstance(v_, bool)}
+                       for pid, r in c["results"].items()}
+    elif st.get("kind") == "neighbours":
+        line["kept"] = False
+        line["all"] = {pid: {k_: v_ for k_, v_ in r.items() if isinstance(v_, (int, float)) and not isinstance(v_, bool)}
+                       for pid, r in c["results"].items()}
     elif complete and mean > st["best_obj"] + MIN_GAIN:
         key, _, to, sign = c["change"]
         line["kept"] = True
@@ -526,10 +580,88 @@ def finish_candidate(st: dict) -> dict:
 def trails(st: dict) -> bool:
     """The candidate is already clearly worse on the photos built so far."""
     c = st["cand"]
+    if st.get("kind") == "neighbours":
+        return False  # every score of every move is wanted
     if c["change"] is None or not c["results"]:
         return False
     lost = [st["best_per_photo"].get(pid, 0.0) - r.get("objective", -100.0) for pid, r in c["results"].items()]
     return float(np.mean(lost)) > GIVE_UP
+
+
+NEIGHBOUR_STEP = 0.25
+# each score's own areas: a move from any other area that shifts it is a
+# neighbour's effect
+METRIC_HOME = {
+    "face_err_pct": ["face", "face parts"], "face_err_eyes": ["face parts"], "face_err_brows": ["face parts"],
+    "face_err_nose": ["face parts", "face"], "face_err_mouth": ["face parts"], "face_err_jaw": ["face"],
+    "mouth_open_diff": ["face parts"], "eyes_open_diff": ["face parts"], "hair_flow": ["hair pattern"],
+    "layering": ["clothes", "headwear", "neck"], "ear_err": ["ears"], "nape_bumps": ["neck", "hair"],
+    "bumps": ["hair", "clothes"], "shape_iou": ["clothes"], "fit_kp": ["bones"], "held_mean": ["clothes", "bones"],
+    "spike_pct": ["clothes", "hair"], "min_wall_mm": ["clothes"], "overhang_pct": ["clothes"], "stands": ["bones"],
+}
+CROSS_Z = 2.0  # a move shifting a score by this many of its usual shifts counts
+
+
+def neighbour_effects(lines: list) -> dict:
+    """From a neighbours study's log: for every number moved, how much each
+    score shifted (mean over the photos), in units of that score's usual
+    shift across all moves; the moves that reach other areas' scores, and
+    area by area how strongly one reaches the next."""
+    base = next((l for l in lines if l.get("kept") == "baseline"), None)
+    moves = [l for l in lines if l.get("change") and l.get("all")]
+    if base is None or not moves:
+        return {}
+    metrics = sorted({m for l in moves for r in l["all"].values() for m in r} & set(METRIC_HOME))
+    delta = {}
+    for l in moves:
+        key = l["change"][0]
+        d = {}
+        for m in metrics:
+            vals = [r[m] - base["all"][pid][m] for pid, r in l["all"].items()
+                    if m in r and pid in base["all"] and m in base["all"][pid]]
+            if vals:
+                d[m] = float(np.mean(vals))
+        delta[key] = d
+    scale = {}
+    for m in metrics:
+        a = np.abs([d[m] for d in delta.values() if m in d])
+        scale[m] = float(np.median(a[a > 0])) if (a > 0).any() else 0.0
+    cross, area_mat = [], {}
+    for key, d in delta.items():
+        a_k = knobs.BY_KEY[key].area if key in knobs.BY_KEY else "?"
+        for m, v in d.items():
+            if not scale.get(m):
+                continue
+            z = v / scale[m]
+            for home in METRIC_HOME[m]:
+                if home != a_k:
+                    cell = area_mat.setdefault(a_k, {})
+                    cell[home] = max(cell.get(home, 0.0), round(abs(z), 1))
+            if a_k not in METRIC_HOME[m] and abs(z) >= CROSS_Z:
+                cross.append({"knob": key, "area": a_k, "score": m, "score_areas": METRIC_HOME[m], "shift": round(v, 3),
+                              "z": round(z, 1)})
+    cross.sort(key=lambda c: -abs(c["z"]))
+    return {"cross": cross, "areas": area_mat, "moves": len(moves)}
+
+
+def area_groups(effects: dict, areas: list) -> list:
+    """Areas that reach each other's scores strongly, joined: they are tuned
+    together, so a gain in one isn't paid for by its neighbour."""
+    parent = {a: a for a in areas}
+
+    def find(a):
+        while parent[a] != a:
+            a = parent[a]
+        return a
+
+    for a, row in (effects.get("areas") or {}).items():
+        for b, z in row.items():
+            if a in parent and b in parent and z >= 2 * CROSS_Z:
+                parent[find(a)] = find(b)
+    groups = {}
+    for a in areas:
+        groups.setdefault(find(a), []).append(a)
+    return sorted(groups.values(), key=lambda g: (-len(g), g))
 
 
 def summary_values(st: dict) -> list:

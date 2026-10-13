@@ -108,10 +108,17 @@
     <div class="hint" id="min-hint"></div>
     <div class="row">
       <button id="pause">Pause</button>
+      <button id="finish">Finish now</button>
       <button class="primary" id="apply">Apply the best values</button>
       <button id="copy">Copy summary for Claude</button>
     </div>
     <div class="hint" id="action-hint"></div>
+    <div id="effects" hidden>
+      <h2>Neighbour effects: moves that reach other areas' scores</h2>
+      <div class="hint" id="effects-hint"></div>
+      <div class="scroll"><table id="areas-mat"></table></div>
+      <div class="scroll"><table id="cross"></table></div>
+    </div>
     <h2>Before → best, per photo</h2>
     <div class="photos" id="photos"></div>
     <h2>Kept moves</h2>
@@ -175,9 +182,10 @@ async function loadList() {
   if (data.tuned.stale && data.tuned.stale.length) $("tuned").innerHTML += `<div class="hint">Dropped (the code changed since): ${data.tuned.stale.map(short).join(", ")}</div>`;
   $("clear-tuned").hidden = !tv.length;
   $("ap-on").checked = data.autopilot.on;
-  $("ap-rule").textContent = `When a study finishes, the server ${data.auto_rule}, then starts the next on the same photos with the next area of numbers, from the values in use. Each study must beat the last, so the bar rises by itself.`;
+  $("ap-rule").textContent = `With new code it first measures how the areas reach each other's scores (a neighbours run), then tunes the areas that reach each other together. When a study finishes, the server ${data.auto_rule}, then starts the next on the same photos from the values in use. Each study must beat the last, so the bar rises by itself.` +
+    (data.autopilot.groups ? ` Tuned together now: ${data.autopilot.groups.map((g) => g.join(" + ")).join(" · ")}.` : "");
   const sel = $("study-select");
-  sel.innerHTML = data.studies.map((s) => `<option value="${s.sid}">${new Date(s.created * 1000).toLocaleString()} · ${s.photos.length} photos · ${s.status}</option>`).join("");
+  sel.innerHTML = data.studies.map((s) => `<option value="${s.sid}">${new Date(s.created * 1000).toLocaleString()} · ${s.kind === "neighbours" ? "neighbours" : s.areas.join(" + ")} · ${s.status}</option>`).join("");
   $("study").hidden = !data.studies.length;
   if (data.studies.length) {
     if (!current || !data.studies.find((s) => s.sid === current)) current = data.studies[0].sid;
@@ -210,6 +218,7 @@ async function loadStudy() {
     `Showing and applying only results at or above ${s.min_score}` + (s.hidden.moves || s.hidden.kept ? ` · hidden below it: ${s.hidden.moves} moves, ${s.hidden.kept} kept` : "") + ".";
   $("pause").textContent = s.status === "running" ? "Pause" : "Resume";
   $("pause").disabled = s.status === "done";
+  $("finish").disabled = s.status === "done";
   $("apply").disabled = !s.apply_ok;
   $("action-hint").textContent = (s.applied ? `Applied ${new Date(s.applied * 1000).toLocaleString()}. ` : "") +
     (s.judged ? `Judged by itself: ${s.judged.applied ? "applied" : "not applied"} (${s.judged.why}).` : "");
@@ -234,11 +243,23 @@ async function loadStudy() {
   $("log").innerHTML = "<tr><th>#</th><th>Move</th><th>Score</th><th>Kept</th></tr>" +
     s.log.slice().reverse().map((l) => `<tr><td>${l.i}</td><td>${l.change ? `${esc(short(l.change[0]))} ${fmt(l.change[1])} → ${fmt(l.change[2])}` : "start"}</td><td>${l.objective}${l.complete ? "" : " (dropped early)"}</td><td>${l.kept === true ? `<span class="up">+${l.gain}</span>` : l.kept === "baseline" ? "start" : typeof l.kept === "string" ? esc(l.kept) : "–"}</td></tr>`).join("");
   $("formula").textContent = s.objective_formula;
+  $("effects").hidden = s.kind !== "neighbours";
+  if (s.kind === "neighbours") {
+    const e = s.effects || {};
+    $("effects-hint").textContent = e.moves ? `${e.moves} numbers moved one at a time (a quarter of each one's range). A shift is counted in units of that score's usual shift across all the moves; ${(e.cross || []).length} moves shift another area's score by 2 or more of those.` : "Measuring…";
+    const areas = Object.keys(e.areas || {});
+    const cols = [...new Set(areas.flatMap((a) => Object.keys(e.areas[a])))];
+    $("areas-mat").innerHTML = areas.length ? `<tr><th>Moving ↓ reaches →</th>${cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>` +
+      areas.map((a) => `<tr><td>${esc(a)}</td>${cols.map((c) => { const z = e.areas[a][c]; return `<td class="${z >= 4 ? "down" : z >= 2 ? "" : "dim"}">${z ?? "–"}</td>`; }).join("")}</tr>`).join("") : "";
+    $("cross").innerHTML = (e.cross || []).length ? "<tr><th>Number moved</th><th>Its area</th><th>Score it shifts</th><th>Shift</th><th>× usual</th></tr>" +
+      e.cross.slice(0, 60).map((c) => `<tr><td>${esc(short(c.knob))}</td><td>${esc(c.area)}</td><td>${esc(c.score)} <span class="dim">(${esc(c.score_areas.join(", "))})</span></td><td>${c.shift}</td><td>${c.z}</td></tr>`).join("") : "";
+  }
   clearTimeout(timer);
   if (s.status === "running") timer = setTimeout(loadStudy, 15000);
 }
 
 $("study-select").onchange = (e) => { current = e.target.value; loadStudy(); };
+$("finish").onclick = async () => { await api(`/api/study/${current}/finish`, { method: "POST" }); loadList(); };
 $("min-set").onclick = async () => {
   if ($("min").value === "") return;
   await api(`/api/study/${current}/threshold?value=${encodeURIComponent($("min").value)}`, { method: "POST" });

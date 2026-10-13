@@ -33,7 +33,8 @@ class Item:
     def done(self) -> bool:
         flags = all(v is True or v == "n/a" for v in (self.read, self.sculpt, self.critic))
         # a bone shaped by the reference body has no numbers of its own to tune
-        return flags and (bool(self.knobs) or self.sculpt == "n/a" or self.group.startswith("Bones"))
+        # (a bone shaped by the reference body, a print check: no numbers of their own to tune)
+        return flags and (bool(self.knobs) or self.sculpt == "n/a" or self.group.startswith(("Bones", "Printing", "Whole figure")))
 
 
 SR = "silhouette_relief."
@@ -324,5 +325,71 @@ def _bones() -> list:
     return out
 
 
+def _body_regions() -> list:
+    ref = "the reference body posed and fitted to the photo, widths fitted to its outline"
+    depth = [SR + "_REF_DEPTH_MARGIN", SR + "_REF_EDGE_SLACK", SR + "_REF_SIDE_SMOOTH"]
+    return [
+        Item("body.shoulders", "Body", "Shoulders", True, True, depth + [BR + "_STRETCH_PRIOR"], True,
+             ref + "; shoulder width (held) and the clavicles' fit score it"),
+        Item("body.chest", "Body", "Chest", True, True, depth + [SR + "_REF_DRAPE"], True, ref + "; chest width and depth (ANSUR) score it"),
+        Item("body.waist", "Body", "Waist", True, True, depth, True, ref + "; waist width and depth (ANSUR) score it"),
+        Item("body.hips", "Body", "Hips", True, True, depth, True, ref + "; the outline and the hips' points score it"),
+        Item("body.arms", "Body", "Arms: upper and fore", True, True, [BR + "_STRETCH_PRIOR", BR + "_STRETCH_RANGE"], True,
+             "posed to the photo's shoulder, elbow, wrist; lengths fitted; the joint miss scores it"),
+        Item("body.hands", "Body", "Hands and fingers", True, True, [SR + "_REF_HAND_SHRINK", SR + "_KNUCKLE"], True,
+             "posed to the photo's hand points, sized; the joint miss scores it"),
+        Item("body.legs", "Body", "Legs: thighs, knees, shins", True, True, [BR + "_STRETCH_PRIOR", SR + "_PATELLA"], True,
+             "posed to hip, knee, ankle; lengths fitted (when the legs show)"),
+        Item("body.feet", "Body", "Feet", True, True, [BR + "_STRETCH_RANGE", SR + "_MALLEOLUS"], True,
+             "heel and big toe matched, the foot sized (when the feet show)"),
+        Item("body.posture", "Body", "Posture: lean, turn, crossed arms", True, True, [SR + "_REF_HAND_SHRINK"], True,
+             "the fit's own posture limits; the joint miss and the outline score it"),
+        Item("body.head_size", "Body", "Head size against the body", True, True, [SR + "_REF_HEAD_MARGIN"], True,
+             "fitted (head scale); head width and depth score it"),
+    ]
+
+
+def _printing() -> list:
+    return [
+        Item("print.sealed", "Printing", "Sealed (watertight)", NA, True, [], True, "the Lab's score: −25 if not"),
+        Item("print.walls", "Printing", "Thinnest wall printable (0.8 mm)", NA, True, [SR + "_REF_EAR_THICK"], True, "the Lab's score: −20 if thinner"),
+        Item("print.spikes", "Printing", "No spikes or sharp folds", NA, True, [SR + "_HAIR_SMOOTH", SR + "_REF_SIDE_SMOOTH"], True, "spikes %"),
+        Item("print.stands", "Printing", "Stands on its base", NA, True, [], True, "its centre over the base's inner 80%"),
+        Item("print.overhang", "Printing", "Overhangs (supports needed)", NA, True, [SR + "_HAT_PEAK"], True, "% facing steeply down"),
+        Item("print.thin_parts", "Printing", "Thin parts: ears, fingers, the cap's peak", NA, True, [SR + "_REF_EAR_THICK"], True,
+             "the thinnest-wall check"),
+        Item("print.height", "Printing", "Height (150 mm) and base disk", NA, True, [], True, "fixed by the builder"),
+    ]
+
+
+def _whole() -> list:
+    return [
+        Item("whole.outline", "Whole figure", "Outline matches the photo", True, True, [SR + "_REF_EDGE_SLACK"], True, "shape match %"),
+        Item("whole.likeness", "Whole figure", "Face likeness", True, True, [SR + "_FACE_RELIEF_WITH_DEPTH"], True,
+             "face embedding (SFace) and face points"),
+        Item("whole.depth", "Whole figure", "Front to back: head, chest, waist depth", True, True, [SR + "_REF_DEPTH_MARGIN"], True,
+             "against ANSUR II proportions"),
+        Item("whole.sides_back", "Whole figure", "Sides and back smooth (nothing the photo didn't show)", NA, True,
+             [SR + "_REF_SIDE_SMOOTH", SR + "_REF_BACK_SMOOTH"], True, "bumps on the sides, back and top"),
+        Item("whole.symmetry", "Whole figure", "Left and right as balanced as the photo's", False, False,
+             note="not measured yet"),
+        Item("whole.repeatable", "Whole figure", "Same photo, same model", NA, True, [], True, "seeded: builds are repeatable"),
+    ]
+
+
+def _more_worn() -> list:
+    out = [
+        Item("worn.hair_accessory", "More worn", "Hair clips, flowers in the hair", True, True, [SR + "_HAIR_SHELL_MAX"], False,
+             "part of the hair's volume (an accessory touching the hair); not scored on its own"),
+    ]
+    for key, name in (("headband", "Headbands"), ("headwrap", "Head wraps, hijabs, turbans"), ("hood", "Hoods"),
+                      ("piercings", "Piercings"), ("rings", "Rings"), ("bracelets", "Bracelets"), ("badges", "Badges, medals, pins"),
+                      ("lanyard", "Lanyards, ID badges"), ("zips", "Zips"), ("necklines", "Necklines: V, crew, collared"),
+                      ("socks", "Socks, tights"), ("heels", "Heels, boots"), ("backpack", "Backpacks")):
+        out.append(Item(f"worn.{key}", "More worn", name, False, False))
+    return out
+
+
 def items() -> list:
-    return _face() + _head() + _worn() + _clothes() + _overlaps() + _bones()
+    return (_face() + _head() + _worn() + _clothes() + _overlaps() + _body_regions() + _printing() + _whole() + _more_worn()
+            + _bones())

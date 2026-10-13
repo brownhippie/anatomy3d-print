@@ -147,6 +147,8 @@ def autopilot_state() -> dict:
 
 
 def _judge(st: dict) -> "tuple[bool, str]":
+    if st.get("kind") == "neighbours":
+        return False, "a neighbours run: it measures, it doesn't tune"
     if not st.get("kept") or st.get("best_obj") is None or st.get("base_obj") is None:
         return False, "nothing kept"
     gain = st["best_obj"] - st["base_obj"]
@@ -187,19 +189,33 @@ def autopilot_step(generation_lock: threading.Lock) -> bool:
         return True
     if st["status"] != "done":
         return False
-    # the next study: same photos, next area, from the values in use now
-    area = AUTO_AREAS[ap["next"] % len(AUTO_AREAS)]
+    # with this code, first measure how the areas reach each other (once);
+    # then tune the areas that do, together, one group after the next
+    code = study.code_version()
+    nb = [x for _, _, x in studies if x.get("kind") == "neighbours" and x.get("code") == code and not x.get("stale")]
+    if not nb:
+        kind, areas, ap_next = "neighbours", list(knobs.AREAS), ap
+    else:
+        last_nb = nb[-1]
+        if ap.get("groups_from") != last_nb["sid"]:
+            lines = [json.loads(x) for x in (STUDY_ROOT / last_nb["sid"] / "log.jsonl").read_text().splitlines() if x.strip()] \
+                if (STUDY_ROOT / last_nb["sid"] / "log.jsonl").exists() else []
+            ap = {**ap, "groups": study.area_groups(study.neighbour_effects(lines), list(knobs.AREAS)),
+                  "groups_from": last_nb["sid"], "next": 0}
+        groups = ap.get("groups") or [[a] for a in AUTO_AREAS]
+        kind, areas, ap_next = "tune", groups[ap["next"] % len(groups)], {**ap, "next": ap["next"] + 1}
     sid = uuid.uuid4().hex[:10]
     nd = STUDY_ROOT / sid
     (nd / "p").mkdir(parents=True)
     for p in st["photos"]:
         shutil.copy2(d / "p" / p["file"], nd / "p" / p["file"])
-    new = study.new_state(sid, st["photos"], [area], AUTO_EVALS, seed=int(time.time()) % 1000)
+    new = study.new_state(sid, st["photos"], areas, AUTO_EVALS * max(1, len(areas) // 2), seed=int(time.time()) % 1000,
+                          kind=kind)
     new["started"] = time.time()
     new["auto"] = True
     with _lock:
         _write(nd / "state.json", new)
-        _write(_autopilot_path(), {**ap, "next": ap["next"] + 1})
+        _write(_autopilot_path(), ap_next)
     return True
 
 
@@ -304,7 +320,8 @@ def _summary(st: dict) -> dict:
         "evals": st["evals"], "max_evals": st["max_evals"], "round": st["round"], "step": st["step"],
         "base_obj": st["base_obj"], "best_obj": st["best_obj"], "kept": len(st["kept"]),
         "building": None if st["cand"] is None else {"change": st["cand"]["change"], "done": len(st["cand"]["results"])},
-        "applied": st.get("applied"), "judged": st.get("judged"), "auto": st.get("auto", False),
+        "applied": st.get("applied"), "judged": st.get("judged"), "auto": st.get("auto", False), "kind": st.get("kind", "tune"),
+        "stale": st.get("stale", False),
     }
 
 
@@ -392,7 +409,8 @@ def get_study(sid: str, log: int = 60):
         lines = [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
     t = _renders(sid)
     floor = _min_score(st)
-    shown = [x for x in lines if x.get("kept") == "baseline" or str(x.get("kept", "")).startswith("rebuilt")
+    neighbours = st.get("kind") == "neighbours"
+    shown = [x for x in lines if neighbours or x.get("kept") == "baseline" or str(x.get("kept", "")).startswith("rebuilt")
              or floor is None or x.get("objective", -1e9) >= floor]
     kept_shown = [k for k in st["kept"] if floor is None or k["objective"] >= floor]
     return {
@@ -401,6 +419,8 @@ def get_study(sid: str, log: int = 60):
         "hidden": {"moves": len(lines) - len(shown), "kept": len(st["kept"]) - len(kept_shown)},
         "apply_ok": bool(st["kept"]) and st["best_obj"] is not None and (floor is None or st["best_obj"] >= floor),
         "objective_formula": study.OBJECTIVE,
+        "kind": st.get("kind", "tune"),
+        "effects": study.neighbour_effects(lines) if neighbours else None,
         "values": study.summary_values(st),
         "kept_moves": kept_shown,
         "base_per_photo": st["base_per_photo"], "best_per_photo": st["best_per_photo"],
@@ -461,7 +481,7 @@ def threshold(sid: str, value: Optional[float] = None):
 @router.post("/{sid}/{action}")
 def control(sid: str, action: str):
     d = _dir(sid)
-    if action not in ("pause", "resume", "apply"):
+    if action not in ("pause", "resume", "apply", "finish"):
         raise HTTPException(404, "Unknown action.")
     with _lock:
         st = _read(d / "state.json", {})
@@ -474,6 +494,9 @@ def control(sid: str, action: str):
                 result = knobs.save_tuned(values, source=f"study {sid}")
             _tuned_status.update(result)
             st["applied"] = time.time()
+        elif action == "finish":
+            # stop here with what it has (the autopilot judges it as finished)
+            st["status"], st["finished"], st["cand"] = "done", time.time(), None
         elif st.get("status") != "done":
             if action == "resume":
                 for other in STUDY_ROOT.iterdir():
