@@ -857,6 +857,8 @@ _HAIR_CURL = 0.012  # a curl is this across ...
 _HAIR_CURL_DEPTH = 0.0025  # ... and stands this proud
 _HAIR_COIL = 0.006  # tight coils: this across ...
 _HAIR_COIL_DEPTH = 0.0015  # ... this proud
+_HAIR_ROPE_W = 0.015  # braids, locs: a rope is this wide when the photo didn't measure it ...
+_HAIR_ROPE_DEPTH = 0.003  # ... and the grooves between ropes this deep either way
 _HAIRLINE_EDGE = 0.004  # the pattern ends over this at the hairline
 _PARTING_DEPTH = 0.0015  # a parting's groove
 # Each part of the face, read from the photo (face_parts.py) and shaped by
@@ -890,8 +892,9 @@ _KNUCKLE = 0.0015  # the knuckles
 _C7 = 0.003  # the knob at the base of the nape
 _EARRING_PROUD = 0.004  # an earring stands this proud
 # how much of each a kind of hair gets: strands, waves, curls, coils
-_HAIR_KIND_MIX = {"sleek": (0.35, 0, 0, 0), "straight": (1, 0, 0, 0), "wavy": (0.8, 1, 0, 0),
-                  "curly": (0.25, 0, 1, 0), "coily": (0, 0, 0, 1)}
+# (strands, waves, curls, coils, ropes)
+_HAIR_KIND_MIX = {"sleek": (0.35, 0, 0, 0, 0), "straight": (1, 0, 0, 0, 0), "wavy": (0.8, 1, 0, 0, 0),
+                  "curly": (0.25, 0, 1, 0, 0), "coily": (0, 0, 0, 1, 0), "corded": (0.3, 0, 0, 0, 1)}
 
 
 def _raster_depth(gx, gy, depth, faces, shape):
@@ -1704,7 +1707,8 @@ def _wave_phase(c2: np.ndarray, s2: np.ndarray, region: np.ndarray, crown) -> np
 def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, face_mesh, y0, x0, scale, pad, px_per_m):
     """The hair's pattern as offsets (photo px, outward) for its front and
     back surfaces: strands along the photo's own strand directions, the
-    waves it measured, curls or coils -- as much of each as the reading's
+    waves it measured, curls or coils, the ropes of braids and locs along
+    the strands' course -- as much of each as the reading's
     kind of hair takes (_HAIR_KIND_MIX). Ends at the hairline; fades where
     the surface turns side-on (pressed onto a side-facing surface, detail
     stands out as ridges). The back of the head: strands falling down, or
@@ -1758,9 +1762,11 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
         sd = float(a[reg].std()) if reg.any() else 0.0
         return (a - float(a[reg].mean())) / sd if sd > 1e-9 else np.zeros_like(a)
 
-    w_s, w_w, w_c, w_k = mix
+    w_s, w_w, w_c, w_k, w_r = mix
     wl = reading.get("wave_px")
     wl_cells = max(wl * scale if wl else _HAIR_WAVE_LEN * per_cell, 4.0)
+    rw = reading.get("rope_px")
+    rope_cells = max(rw * scale if rw else _HAIR_ROPE_W * per_cell, 2.0)
 
     def pattern(fc2, fs2, back_side, seed):
         rng = np.random.default_rng(seed)
@@ -1778,6 +1784,12 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
                 d = max(size_ * per_cell, 1.5)
                 bp = gaussian_filter(rng.standard_normal(shape), d / 4) - gaussian_filter(rng.standard_normal(shape), d / 2)
                 out += w_ * depth_ * unit(gaussian_filter(np.abs(unit(bp)), d / 6))
+        if w_r:
+            # ropes: blobs a rope wide drawn out along the strands, rounded
+            # over (tanh) with grooves between
+            noise = gaussian_filter(rng.standard_normal(shape), rope_cells / 3)
+            half = int(np.clip(6 * rope_cells, 4, 90))
+            out += w_r * _HAIR_ROPE_DEPTH * np.tanh(1.5 * unit(_lic(noise, fc2, fs2, half)))
         return out * px_per_m  # metres -> photo px
 
     out_f = pattern(c2, s2, False, 0)

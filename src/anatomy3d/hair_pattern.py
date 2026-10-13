@@ -19,12 +19,16 @@ forehead.
   brows.
 - Parting: on top of the head, the line the strands fall away from to
   either side.
+- Ropes (braids, cornrows, locs, twists): the hair's detail lives at the
+  width of its ropes as much as at strand scale (loose hair's fades past
+  its strands; sleek hair's is all shading); the ropes' width from the
+  brightness across them repeating.
 """
 from typing import Optional
 
 import numpy as np
 
-KINDS = ["sleek", "straight", "wavy", "curly", "coily"]
+KINDS = ["sleek", "straight", "wavy", "curly", "coily", "corded"]
 _MIN_HAIR_PX = 400
 _MIN_HAIR = 0.03  # less hair than this (x the face's size squared) shows: nothing to read
 _DERIV = 0.004  # brightness derivatives: Gaussian sigma, x the face's size
@@ -39,6 +43,15 @@ _SLEEK = 0.25
 _COMBED = 0.5
 _WAVY_SWING = 24.0
 _COILY = 0.85
+# ropes: detail at a hundredth of the face's size over detail at strand
+# scale, and shading's over strand's -- measured on 20 photos (MIT,
+# huggingface.co/datasets/nrhone/male-black-hairstyles): braids, cornrows,
+# locs and twists 0.93-1.40, fades, afros, 360 waves and buzz cuts 0.50-0.87
+# (a sleek flat top 0.97, but its shading 4.8 where ropes' is 0.8-1.4)
+_ROPE = 0.9
+_ROPE_SHADE = 1.6
+_ROPE_FINE = 0.5  # and textured: ropes' fineness 0.69-1.1 (a sleek updo's rope ratio is 1.01, its fineness 0.21)
+_ROPE_W = (0.03, 0.2)  # a rope's width, x the face's size
 _PART_MIN = 1.0  # how clearly the strands fall away either side of a parting (-1..2)
 
 
@@ -152,6 +165,45 @@ def _fineness(gray: np.ndarray, hair: np.ndarray, size: float) -> float:
     return float(fine / (coarse + 1e-6))
 
 
+def _ropes(gray: np.ndarray, hair: np.ndarray, size: float, seed: int = 0):
+    """(detail at rope scale / at strand scale, shading / strand scale, the
+    ropes' width in px or None): difference-of-Gaussians bands of the
+    hair's evened-out brightness in its middle; the width from brightness
+    sampled across the ropes' course repeating (its autocorrelation's
+    clearest peak)."""
+    from scipy.ndimage import gaussian_filter, map_coordinates
+
+    theta, coh, g = _structure(gray, hair, max(1.0, 0.012 * size), max(2.0, 0.05 * size))
+    core = hair & (gaussian_filter(hair.astype(np.float32), 0.02 * size) > 0.9)
+    if core.sum() < 50:
+        return 0.0, 0.0, None
+
+    def band(sc):
+        sg = max(0.5, sc * size)
+        return float(np.std((gaussian_filter(g, sg) - gaussian_filter(g, 1.6 * sg))[core]))
+
+    fine = band(0.004) + 1e-6
+    rope, shade = band(0.01) / fine, band(0.035) / fine
+    width = None
+    ys, xs = np.nonzero(core & (coh > 0.25))
+    if len(ys) >= 50:
+        rng = np.random.default_rng(seed)
+        k = rng.choice(len(ys), min(400, len(ys)), replace=False)
+        y, x = ys[k].astype(np.float64), xs[k].astype(np.float64)
+        th = theta[ys[k], xs[k]]
+        L = int(0.35 * size)
+        t = np.arange(-L, L + 1)
+        v = map_coordinates(gaussian_filter(g, max(0.5, 0.004 * size)),
+                            [y[:, None] + np.cos(th)[:, None] * t, x[:, None] - np.sin(th)[:, None] * t], order=1, mode="nearest")
+        v = (v - v.mean(1, keepdims=True)) / (v.std(1, keepdims=True) + 1e-6)
+        ac = np.array([np.mean(v[:, :v.shape[1] - j] * v[:, j:]) for j in range(L)])
+        best = 0.02
+        for j in range(max(int(_ROPE_W[0] * size), 1), min(int(_ROPE_W[1] * size), L - 1)):
+            if ac[j] >= ac[j - 1] and ac[j] >= ac[j + 1] and ac[j] - ac[:j].min() > best:
+                best, width = ac[j] - ac[:j].min(), float(j)
+    return float(rope), float(shade), width
+
+
 def _hairline(labels: np.ndarray, f: np.ndarray, hair_label: int, hat_label: int):
     """Across the forehead, the first row of hair going up from the brows
     (photo px), or None where the forehead runs into a hat or past the head."""
@@ -243,8 +295,11 @@ def read_hair(rgb: np.ndarray, labels: np.ndarray, box, face_mesh: np.ndarray, h
     swing, wave_px = _waves(theta, coh, hair, size)
     fine = _fineness(gray, hair, size)
     c = float(coh[hair].mean())
+    rope, shade, rope_px = _ropes(gray, hair, size)
     if fine < _SLEEK:
         kind = "sleek"
+    elif rope >= _ROPE and shade <= _ROPE_SHADE and fine >= _ROPE_FINE:
+        kind = "corded"
     elif c >= _COMBED:
         kind = "wavy" if swing >= _WAVY_SWING else "straight"
     else:
@@ -255,4 +310,5 @@ def read_hair(rgb: np.ndarray, labels: np.ndarray, box, face_mesh: np.ndarray, h
         part = None
     return {"box": (bx0, by0, bx1, by1), "theta": theta, "coherence": coh, "size_px": size, "parting": part,
             "kind": kind, "coherence_mean": round(c, 3), "swing_deg": round(swing, 1),
-            "wave_px": wave_px if kind == "wavy" else None, "fineness": round(fine, 3), "hairline": hairline}
+            "wave_px": wave_px if kind == "wavy" else None, "fineness": round(fine, 3), "hairline": hairline,
+            "rope": round(rope, 3), "rope_shade": round(shade, 3), "rope_px": rope_px if kind == "corded" else None}

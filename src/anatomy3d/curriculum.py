@@ -99,7 +99,9 @@ def _head() -> list:
              "ears under hair aren't built; a seen ear stands off the head with its root on the skull; the ears' reach scores it"),
         Item("hair.parting", "Hair", "Parting", True, True, [SR + "_PARTING_DEPTH"], True,
              "the line strands fall away from on top of the head (only a clear, steady one); a groove; hair flow scores the strands"),
-        Item("hair.braids", "Hair", "Braids, locs", False, False),
+        Item("hair.braids", "Hair", "Braids, locs", True, True, [SR + "_HAIR_ROPE_W", SR + "_HAIR_ROPE_DEPTH"], True,
+             "hair whose detail lives at rope width (braids, cornrows, locs, twists; measured on 20 labelled photos, all called right); "
+             "ropes along the strands' course; hair flow scores their course, bumps the back"),
     ]
 
 
@@ -133,7 +135,7 @@ _GARMENTS = [
 _STEP = [SR + "_CLOTH_LAYER", SR + "_CLOTH_STEP_SPAN"]
 # garments the overlaps score covers (a sure pair with something it lies over or under)
 _SCORED = {"shirt", "tshirt", "jacket", "suit", "coat", "sweater", "hoodie", "dress", "skirt", "trousers", "jeans", "shorts",
-           "kimono", "tie", "belt", "lapels", "hems", "shoes", "bag", "watch"}
+           "kimono", "tie", "belt", "lapels", "hems", "shoes", "bag", "watch", "gloves"}
 
 
 def _clothes() -> list:
@@ -399,8 +401,12 @@ def _more_worn() -> list:
                             ("backpack", "Backpacks", "the strap named; over clothes; the overlaps score checks it")):
         k = [SR + "_HAT_PEAK"] if note == hatlike else _STEP
         out.append(Item(f"worn.{key}", "More worn", name, True, True, k, True, note))
-    for key, name in (("piercings", "Piercings"), ("rings", "Rings")):
-        out.append(Item(f"worn.{key}", "More worn", name, False, False, note="too small to name on CLIPSeg's 352 px crops"))
+    out.append(Item("worn.piercings", "More worn", "Piercings", NA, NA, critic=NA, note=(
+        "in the ears they're earrings (named and built); a stud in the nose, lip or brow is ~3 mm across, "
+        "0.3 mm on a 150 mm figure: under a 0.4 mm nozzle, and too small to name on CLIPSeg's 352 px crops")))
+    out.append(Item("worn.rings", "More worn", "Rings", NA, NA, critic=NA, note=(
+        "a ring stands ~1.5 mm off its finger: 0.15 mm on a 150 mm figure, under a 0.4 mm nozzle; "
+        "too small to name on CLIPSeg's 352 px crops")))
     return out
 
 

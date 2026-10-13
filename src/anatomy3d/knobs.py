@@ -57,6 +57,8 @@ KNOBS = [
     Knob(_SR, "_HAIR_CURL_DEPTH", 0.001, 0.005, "hair pattern", "a curl stands this proud (m)"),
     Knob(_SR, "_HAIR_COIL", 0.003, 0.012, "hair pattern", "a tight coil is this across (m)"),
     Knob(_SR, "_HAIR_COIL_DEPTH", 0.0005, 0.003, "hair pattern", "a coil stands this proud (m)"),
+    Knob(_SR, "_HAIR_ROPE_W", 0.008, 0.03, "hair pattern", "braids, locs: a rope is this wide when the photo didn't measure it (m)"),
+    Knob(_SR, "_HAIR_ROPE_DEPTH", 0.001, 0.006, "hair pattern", "braids, locs: grooves between ropes this deep either way (m)"),
     Knob(_SR, "_HAIRLINE_EDGE", 0.002, 0.01, "hair pattern", "the pattern ends over this at the hairline (m)"),
     Knob(_SR, "_PARTING_DEPTH", 0.0, 0.004, "hair pattern", "a parting's groove (m)"),
     # what's worn on the head

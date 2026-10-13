@@ -185,7 +185,9 @@ def front_in_photo(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInput
 
 # which lies over which, for the overlaps check -- only pairs whose order a
 # front photo leaves in no doubt (hair beside a face can be in front of the
-# cheek or behind the head; a hand is skin lying over clothes: left out)
+# cheek or behind the head; a hand is skin lying over clothes: left out;
+# a gloved hand lies over the clothes it rests on, a glove's cuff over the
+# bare wrist)
 _ALL_WORN = ("shirt", "tshirt", "sweater", "jacket", "suit", "coat", "dress", "hoodie", "kimono", "skirt", "trousers", "jeans", "shorts")
 _OUTER = {
     "hat": ("hair", "face", "forehead"), "glasses": ("face", "forehead"), "mask": ("face",),
@@ -197,7 +199,7 @@ _OUTER = {
     "belt": ("trousers", "jeans", "skirt", "dress", "shorts", "kimono"),
     "collar": ("neck",),
     "hair": ("forehead",), "earring": ("hair", "neck", "face"),
-    "hand": _ALL_WORN, "watch": ("wrist",), "bracelet": ("wrist",),
+    "hand": _ALL_WORN, "gloves": _ALL_WORN + ("wrist",), "watch": ("wrist",), "bracelet": ("wrist",),
     "necklace": ("neck", "shirt", "tshirt", "dress", "sweater", "kimono"),
     "badge": _ALL_WORN, "lanyard": _ALL_WORN, "backpack": _ALL_WORN, "strap": _ALL_WORN, "buttons": _ALL_WORN, "pocket": _ALL_WORN,
     "zip": _ALL_WORN, "shoes": ("socks",), "trousers": ("shoes", "socks"), "jeans": ("shoes", "socks"), "skirt": ("socks",),
