@@ -62,6 +62,7 @@ _EAR_STANDS = (0.08, 0.6)  # how far out of the head's line an ear can stand
 _EAR_LENGTH = (0.75, 1.3)  # how long an ear can be
 _EAR_TURN = (-0.35, 0.8)  # radians an ear may swing in toward / out from the head
 _EAR_SCALE = (0.8, 1.5)
+_EAR_BEND = 0.015  # the swing reaches all of it this far (metres) out from the ear's root
 _MAX_FOREARM_LIFT = (0.10, 0.18)  # metres folded forearms/hands stand off the torso's front: median, most
 _REST_MAX = 0.10  # fit: a folded forearm's surface stays within this of the torso's front
 
@@ -259,11 +260,15 @@ def measure_ears(photo_mask: np.ndarray, face_mesh: Optional[np.ndarray], px_per
     return ears, report
 
 
-def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: dict, info: Optional[dict] = None) -> np.ndarray:
+def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: dict, faces: Optional[np.ndarray] = None,
+               px_per_m: float = 1000.0, info: Optional[dict] = None) -> np.ndarray:
     """Each ear of the posed body (photo px) sized, moved up or down and
     swung out from the head about its front edge until it starts, ends and
     reaches as far out as the photo's (measure_ears). Turned in the head's
-    own frame; the skin around the ear follows partway."""
+    own frame; the skin around the ear follows partway. The swing grows
+    from nothing where the ear grows out of the head to all of it
+    _EAR_BEND (metres) out along the ear (given the faces): the root stays
+    on the skull, as a real ear's does."""
     V = np.asarray(V, dtype=np.float64)
     A = np.asarray(head_axes, dtype=np.float64)  # columns: the head's left, back, up (photo px frame)
     out = V.copy()
@@ -278,12 +283,29 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
         lc = loc[core]
         hinge = np.array([u * (u * lc[:, 0]).min(), lc[:, 1].min(), (lc[:, 2].min() + lc[:, 2].max()) / 2.0])
         rel = loc - hinge
+        bend = np.ones(len(V))
+        if faces is not None:
+            from scipy.sparse import coo_matrix
+            from scipy.sparse.csgraph import dijkstra
+
+            F = np.asarray(faces, dtype=np.int64)
+            e = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+            e = e[core[e].all(axis=1)]
+            g = coo_matrix((np.linalg.norm(V[e[:, 0]] - V[e[:, 1]], axis=1), (e[:, 0], e[:, 1])), shape=(len(V), len(V)))
+            # the root: ear vertices with a neighbour outside the ear
+            ee = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+            cross = core[ee[:, 0]] != core[ee[:, 1]]
+            root = np.unique(ee[cross][core[ee[cross]]])
+            if len(root):
+                d = dijkstra(g, directed=False, indices=root, min_only=True)
+                k = np.clip(np.where(np.isfinite(d), d, 0.0) / (_EAR_BEND * px_per_m), 0.0, 1.0)
+                bend = np.where(core, k * k * (3.0 - 2.0 * k), 0.0)
         # outward on the photo: only measurable when the head faces it
         u_img = float(np.sign(u * A[0, 0]))
         fit_turn = t.get("outer") is not None and abs(A[0, 0]) > 0.5
 
         def moved(p):
-            kk, dz, phi = np.exp(p[0]), p[1], p[2]
+            kk, dz, phi = np.exp(p[0]), p[1], p[2] * bend
             r = kk * rel
             a = r[:, 0] * np.cos(phi) + u * r[:, 1] * np.sin(phi)
             bk = -u * r[:, 0] * np.sin(phi) + r[:, 1] * np.cos(phi)

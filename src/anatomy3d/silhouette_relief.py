@@ -1064,7 +1064,8 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
     if reference.get("ears") and reference.get("ear_w") is not None and reference.get("head_axes") is not None:
         from .body_reference import place_ears
 
-        V = place_ears(V, np.asarray(reference["ear_w"], dtype=np.float64), reference["head_axes"], reference["ears"])
+        V = place_ears(V, np.asarray(reference["ear_w"], dtype=np.float64), reference["head_axes"], reference["ears"],
+                       faces=F, px_per_m=float(reference["px_per_m"]))
 
     # Its hands are open with the fingers spread -- rarely how a photo shows
     # them -- and stood out as shelves and fins: shrink them into the wrist
