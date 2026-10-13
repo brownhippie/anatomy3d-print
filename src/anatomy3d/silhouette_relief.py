@@ -399,7 +399,59 @@ _CLOTHING = 1.12  # sleeves and jacket over the bare-body measurements
 _ARM_IN_FRONT_FRAC = 0.3  # share of the forearm lying across the torso that marks it as crossed in front
 
 
-def _arm_layout(pose: Optional[dict], grid_mask: np.ndarray, y0: int, x0: int, scale: float, pad: int) -> Optional[dict]:
+# Side widths from height. ANSUR II male means, each a fraction of stature
+# (4,082 men; spread in brackets): head length 0.1137 (4%), neck
+# circumference/pi 0.0721 (7%), chest depth 0.1446 (10%), waist depth
+# 0.1355 (14%), buttock depth 0.1401 (11%), thigh circumference/pi 0.1134,
+# lower-thigh (knee) 0.0742, calf 0.0711, ankle 0.0416, biceps (flexed)
+# 0.0650, forearm (flexed) 0.0562, wrist 0.0319.
+_DEPTH_OF_STATURE = {
+    "head": 0.1137, "neck": 0.0721, "chest": 0.1446, "waist": 0.1355, "buttock": 0.1401,
+    "thigh": 0.1134, "knee": 0.0742, "calf": 0.0711, "ankle": 0.0416,
+    "upperarm": 0.0650, "forearm": 0.0562, "wrist": 0.0319,
+}
+# Scale anchors (fraction of stature): shoulder joints (biacromial), the
+# outline across the shoulders (bideltoid), and three face measures. A
+# portrait's head usually looks bigger than average next to the shoulders
+# (it's nearer the camera), so the head and the body each get their own
+# scale; measured on the Obama photo the face put stature 30% above what
+# the shoulders did, the three face measures within 6% of each other.
+_ANCHOR_OF_STATURE = {"biacromial": 0.23682, "bideltoid": 0.29085, "bizygomatic": 0.08131,
+                      "menton_sellion": 0.0699, "interpupillary": 0.0365, "ankle_height": 0.0415}
+_CLOTHES = 1.06  # ANSUR measured minimal clothing; the photo shows clothes
+
+
+def _body_scales(pose: dict, face_mesh: Optional[np.ndarray], mask: np.ndarray) -> dict:
+    """Stature in photo pixels for the body and for the head."""
+    import statistics
+
+    A = _ANCHOR_OF_STATURE
+    body = []
+    ls, rs = np.array(pose["left_shoulder"]), np.array(pose["right_shoulder"])
+    body.append(float(np.linalg.norm(ls - rs)) / A["biacromial"])
+    sy = int(round((ls[1] + rs[1]) / 2))
+    rows = [r for r in range(max(sy, 0), min(sy + 40, mask.shape[0])) if mask[r].any()]
+    if rows:
+        w = max(float(np.ptp(np.flatnonzero(mask[r]))) for r in rows)
+        body.append(w / 1.05 / A["bideltoid"])  # jacket or sleeves over the deltoids
+    if "left_ankle" in pose and "right_ankle" in pose:
+        top = int(np.flatnonzero(mask.any(axis=1))[0])
+        full = (max(pose["left_ankle"][1], pose["right_ankle"][1]) - top) / (1.0 - A["ankle_height"])
+        body = [full]  # the whole figure is in the photo: that IS the height
+    s_body = float(statistics.median(body))
+    s_head = s_body
+    if face_mesh is not None:
+        fm = face_mesh
+        d = lambda a, b: float(np.linalg.norm(fm[a, :2] - fm[b, :2]))  # noqa: E731
+        head = [d(234, 454) / A["bizygomatic"], d(152, 168) / A["menton_sellion"]]
+        if len(fm) >= 474:
+            head.append(d(468, 473) / A["interpupillary"])
+        s_head = float(statistics.median(head))
+    return {"body": s_body, "head": s_head}
+
+
+def _arm_layout(pose: Optional[dict], grid_mask: np.ndarray, y0: int, x0: int, scale: float, pad: int,
+                face_mesh: Optional[np.ndarray] = None, photo_mask: Optional[np.ndarray] = None) -> Optional[dict]:
     """Arm tubes and the torso band from pose points (photo pixels).
     Returns None when there aren't two shoulders to size things from."""
     if not pose or "left_shoulder" not in pose or "right_shoulder" not in pose:
@@ -415,6 +467,45 @@ def _arm_layout(pose: Optional[dict], grid_mask: np.ndarray, y0: int, x0: int, s
     if sw < 8.0:
         return None
     rows, cols = np.mgrid[0:gh, 0:gw].astype(np.float64)
+    scales = _body_scales(pose, face_mesh, photo_mask) if photo_mask is not None else None
+    # arm radius (grid px) at shoulder / elbow / wrist / hand: from height
+    # when known, else from the shoulder-joint distance as before
+    if scales is not None:
+        sb = scales["body"] * scale * _CLOTHES / 2.0
+        r_of = {"shoulder": _DEPTH_OF_STATURE["upperarm"] * sb, "elbow": 0.5 * (_DEPTH_OF_STATURE["upperarm"] + _DEPTH_OF_STATURE["forearm"]) * sb,
+                "wrist": _DEPTH_OF_STATURE["wrist"] * sb, "hand": _ARM_R["hand"] * sw * _CLOTHING}
+    else:
+        r_of = {k: _ARM_R[k] * sw * _CLOTHING for k in _ARM_R}
+
+    def sleeve_half_width(a, b, r_guess):
+        """Half the arm's visible width across its axis, from the outline
+        where only one side runs into the body (a hanging arm). None where
+        both sides do (an arm lying across the chest)."""
+        ab = b - a
+        L = float(np.linalg.norm(ab))
+        if L < 4:
+            return None
+        n = np.array([-ab[1], ab[0]]) / L
+        got = []
+        for t in np.linspace(0.25, 0.75, 9):
+            c = a + t * ab
+            dists = []
+            for sgn in (1, -1):
+                k = 0
+                lim = int(3 * r_guess) + 2
+                while k < lim:
+                    q = c + sgn * (k + 1) * n
+                    qi, qj = int(round(q[0])), int(round(q[1]))
+                    if not (0 <= qi < gh and 0 <= qj < gw) or not grid_mask[qi, qj]:
+                        break
+                    k += 1
+                dists.append(k if k < lim else None)
+            seen = [x for x in dists if x is not None]
+            if seen:
+                got.append(min(seen))
+        if len(got) < 4:
+            return None
+        return float(np.median(got))
 
     # torso band: shoulders down, centred between shoulders (and hips if seen)
     sy, scx = (ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0
@@ -456,7 +547,16 @@ def _arm_layout(pose: Optional[dict], grid_mask: np.ndarray, y0: int, x0: int, s
         # how much of the tube rests on the torso's front, per chain point
         on = {"shoulder": 0.0, "elbow": 0.5 if in_front else 0.0, "wrist": 1.0 if in_front else 0.0, "hand": 1.0 if in_front else 0.0}
         for (na, a), (nb, b) in zip(chain[:-1], chain[1:]):
-            ra, rb = _ARM_R[na] * sw * _CLOTHING, _ARM_R[nb] * sw * _CLOTHING
+            ra, rb = r_of[na], r_of[nb]
+            if na in ("shoulder", "elbow") and nb in ("elbow", "wrist"):
+                # An arm is close to round, so its depth should follow the
+                # width it shows in the photo (a sleeve is wider than the
+                # bare arm the height-based size describes) -- where that
+                # width can be read and is plausible.
+                hw = sleeve_half_width(a, b, 0.5 * (ra + rb))
+                if hw is not None and 0.7 * 0.5 * (ra + rb) <= hw <= 2.0 * 0.5 * (ra + rb):
+                    k = hw / (0.5 * (ra + rb))
+                    ra, rb = ra * k, rb * k
             ab = b - a
             L2 = float(ab @ ab) or 1.0
             t = np.clip(((rows - a[0]) * ab[0] + (cols - a[1]) * ab[1]) / L2, 0.0, 1.0)
@@ -473,7 +573,8 @@ def _arm_layout(pose: Optional[dict], grid_mask: np.ndarray, y0: int, x0: int, s
     arm = grid_mask & (best > -0.25 * r_px)  # a little past the tube: sleeves are looser than the arm
     arm_only = arm & ~band
     return {"arm": arm, "arm_only": arm_only, "r": r_px / scale, "d": d_px / scale, "w": w_on,
-            "shoulder_row": sy, "hip_row": sy + torso_len, "centre_col": cx_row}
+            "shoulder_row": sy, "hip_row": sy + torso_len, "centre_col": cx_row, "scales": scales,
+            "grid": (y0, x0, scale, pad)}
 
 
 _TORSO_PROFILE = {}
@@ -494,6 +595,86 @@ def _torso_profile() -> dict:
 # Template levels that are torso alone: above u=0.2 the base mesh's
 # A-posed arms are still joined to the shoulders, below u=1.1 the legs part.
 _TORSO_U = (0.2, 1.1)
+
+
+def _scale_to_height(torso_half: np.ndarray, body_mask: np.ndarray, layout: dict, face_mesh: Optional[np.ndarray],
+                     pose: dict) -> np.ndarray:
+    """Rescale the body's half-thickness so its depth through the centre
+    line at each height is a man's depth there for this person's height
+    (_DEPTH_OF_STATURE), instead of following the outline's front width --
+    which clothes, arms and pose all distort. The head is scaled by the
+    head's own size, the body by the body's; each leg separately. The
+    shape across each row is kept, only its depth changes."""
+    from scipy.ndimage import gaussian_filter1d
+
+    sc = layout.get("scales")
+    if not sc:
+        return torso_half
+    y0, x0, scale, pad = layout["grid"]
+    to_row = lambda y: (y - y0) * scale + pad  # noqa: E731
+    D = _DEPTH_OF_STATURE
+    sb, sh = sc["body"] * _CLOTHES, sc["head"] * 1.04  # hair over the head
+    sy, hy = layout["shoulder_row"], layout["hip_row"]
+    anchors = []  # (grid row, centre-line depth in photo px)
+    if face_mesh is not None:
+        eye = to_row((face_mesh[33, 1] + face_mesh[263, 1]) / 2.0)
+        chin = to_row(float(face_mesh[:468, 1].max()))
+        anchors += [(eye, D["head"] * sh), (chin + 0.45 * (sy - chin), D["neck"] * np.sqrt(sh * sb))]
+    anchors += [(sy, 0.9 * D["chest"] * sb), (sy + 0.25 * (hy - sy), D["chest"] * sb),
+                (sy + 0.65 * (hy - sy), D["waist"] * sb), (hy, D["buttock"] * sb)]
+    anchors.sort()
+    ar = np.array([a[0] for a in anchors])
+    ad = np.array([a[1] for a in anchors])
+    gh, gw = body_mask.shape
+    out = torso_half.copy()
+    g_rows, g_vals = [], []
+    for r in range(gh):
+        if r > hy:
+            break
+        row = body_mask[r]
+        on = np.flatnonzero(row)
+        if not len(on):
+            continue
+        c = int(round(layout["centre_col"][r]))
+        c = c if 0 <= c < gw and row[c] else int(on[np.argmin(np.abs(on - c))])
+        cur = 2.0 * float(torso_half[r, c])
+        if cur <= 0:
+            continue
+        g_rows.append(r)
+        # above the top anchor (eye level) the head narrows to the crown:
+        # scale it by the eye-level factor so it keeps its own rounding
+        g_vals.append(np.nan if r < ar[0] else float(np.interp(r, ar, ad)) / cur)
+    if g_rows:
+        gv = np.array(g_vals)
+        known = np.flatnonzero(np.isfinite(gv))
+        if len(known):
+            gv[: known[0]] = gv[known[0]]
+            g = np.clip(gaussian_filter1d(gv, max(3.0, 0.02 * gh), mode="nearest"), 0.4, 2.5)
+            for r, k in zip(g_rows, g):
+                out[r] *= k
+    # legs: each leg's own run, below the hips
+    kn = [pose[k][1] for k in ("left_knee", "right_knee") if k in pose]
+    an = [pose[k][1] for k in ("left_ankle", "right_ankle") if k in pose]
+    if kn:
+        kr = to_row(float(np.mean(kn)))
+        ak = to_row(float(np.mean(an))) if an else kr + (kr - hy)
+        lr = np.array([hy, hy + 0.2 * (kr - hy), kr, kr + 0.3 * (ak - kr), ak])
+        ld = np.array([D["buttock"] * sb * 0.8, D["thigh"] * sb, D["knee"] * sb, D["calf"] * sb, D["ankle"] * sb])
+        gmap = np.zeros((gh, gw))
+        wmap = np.zeros((gh, gw), dtype=bool)
+        for r in range(int(np.ceil(hy)) + 1, gh):
+            row = body_mask[r]
+            edges = np.flatnonzero(np.diff(np.concatenate(([0], row.astype(np.int8), [0]))))
+            for a, b in zip(edges[0::2], edges[1::2]):
+                cc = (a + b - 1) // 2
+                cur = 2.0 * float(torso_half[r, cc])
+                if cur > 0:
+                    gmap[r, a:b] = np.clip(float(np.interp(r, lr, ld)) / cur, 0.4, 2.5)
+                    wmap[r, a:b] = True
+        if wmap.any():
+            gs = _masked_blur(gmap, wmap, max(3.0, 0.015 * gh))
+            out = np.where(wmap, torso_half * gs, out)
+    return out
 
 
 def _human_torso(torso_half: np.ndarray, body_mask: np.ndarray, layout: dict):
@@ -599,6 +780,177 @@ def _with_arms(layout: dict, grid_mask: np.ndarray, torso_front: np.ndarray, tor
     return front, np.minimum(back, front)
 
 
+# A human body posed to the photo (body_reference.py) knows what the outline
+# can't: where the head sits over the torso, the back of the skull and the
+# nape, the curve of the back, forearms resting on the belly. Its front and
+# back become the base surfaces; the photo still gives the outline, the fine
+# relief and the face. Each part is grown by its own measured gap to the
+# outline first (suit over the torso and arms, hair over the head).
+_REF_CLOTH_RANGE = (-0.025, 0.03)  # most a part shrinks (slimmer than the reference) / grows (clothes, hair), metres
+_REF_CLOTH_DEPTH = 0.5  # share of a clothing layer's side gap it adds front and back
+_REF_BARE_PARTS = ("hand.L", "hand.R")
+_REF_RELIEF_MAX = 0.015  # photo-depth detail on top of the reference, metres
+_REF_BACK_SMOOTH = 0.012  # clothing over the back: smoothing radius, metres
+
+
+def _raster_depth(gx, gy, depth, faces, shape):
+    """Nearest and farthest surface depth at each grid cell's centre (cells
+    no triangle covers stay +/-inf). Sampling at the centre, not over the
+    cell, keeps a round edge's thickness falling smoothly to zero inside
+    the cell it ends in."""
+    a, b, c = faces[:, 0], faces[:, 1], faces[:, 2]
+    xa, xb, xc, ya, yb, yc = gx[a], gx[b], gx[c], gy[a], gy[b], gy[c]
+    cx0 = np.ceil(np.minimum(np.minimum(xa, xb), xc)).astype(np.int64)
+    cx1 = np.floor(np.maximum(np.maximum(xa, xb), xc)).astype(np.int64)
+    cy0 = np.ceil(np.minimum(np.minimum(ya, yb), yc)).astype(np.int64)
+    cy1 = np.floor(np.maximum(np.maximum(ya, yb), yc)).astype(np.int64)
+    den = (yb - yc) * (xa - xc) + (xc - xb) * (ya - yc)
+    k = np.maximum(cx1 - cx0, cy1 - cy0) + 1
+    use = (cx1 >= cx0) & (cy1 >= cy0) & (np.abs(den) > 1e-12)
+    near = np.full(shape, np.inf)
+    far = np.full(shape, -np.inf)
+    for kk in np.unique(k[use]):
+        sel = np.flatnonzero(use & (k == kk))
+        oy, ox = np.divmod(np.arange(kk * kk), kk)
+        for part in np.array_split(sel, max(1, len(sel) * kk * kk // 4_000_000 + 1)):
+            px = cx0[part, None] + ox[None, :]
+            py = cy0[part, None] + oy[None, :]
+            l1 = ((yb - yc)[part, None] * (px - xc[part, None]) + (xc - xb)[part, None] * (py - yc[part, None])) / den[part, None]
+            l2 = ((yc - ya)[part, None] * (px - xc[part, None]) + (xa - xc)[part, None] * (py - yc[part, None])) / den[part, None]
+            l3 = 1.0 - l1 - l2
+            ok = ((l1 >= -1e-9) & (l2 >= -1e-9) & (l3 >= -1e-9) & (px <= cx1[part, None]) & (py <= cy1[part, None])
+                  & (px >= 0) & (px < shape[1]) & (py >= 0) & (py < shape[0]))
+            d = l1 * depth[a[part], None] + l2 * depth[b[part], None] + l3 * depth[c[part], None]
+            np.minimum.at(near, (py[ok], px[ok]), d[ok])
+            np.maximum.at(far, (py[ok], px[ok]), d[ok])
+    return near, far
+
+
+def _vertex_normals(V, F):
+    fn = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    vn = np.zeros_like(V)
+    for j in range(3):
+        np.add.at(vn, F[:, j], fn)
+    return vn / (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-12)
+
+
+def _mesh_laplacian(F, n):
+    e = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    adj = sparse.coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n)).tocsr()
+    adj = ((adj + adj.T) > 0).astype(np.float64)
+    return sparse.diags(np.asarray(adj.sum(axis=1)).ravel()) - adj
+
+
+def _harmonic_fill(lap, known, values):
+    """Values at `known` vertices spread smoothly over the rest of the mesh."""
+    n = lap.shape[0]
+    x = np.zeros(n)
+    x[known] = values
+    unk = np.setdiff1d(np.arange(n), known)
+    if len(unk) and len(known):
+        L = lap.tocsr()
+        sub = (L[unk][:, unk] + sparse.identity(len(unk)) * 1e-6).tocsc()
+        x[unk] = spsolve(sub, -(L[unk][:, known] @ x[known]))
+    return x
+
+
+def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int, scale: float, pad: int,
+                        face_mesh: Optional[np.ndarray]):
+    """Front and back (photo px, z toward camera) of the posed reference body
+    on the build grid, grown to the outline, and the cells it covers."""
+    from scipy.ndimage import binary_closing, binary_dilation, binary_erosion
+
+    V = np.asarray(reference["vertices"], dtype=np.float64).copy()  # x right, y down, depth toward the back
+    F = np.asarray(reference["faces"], dtype=np.int64)
+    shape = grid_mask.shape
+    d_in = distance_transform_edt(grid_mask)
+    d_out = distance_transform_edt(~grid_mask)
+
+    def grid_xy(P):
+        return (P[:, 0] - x0) * scale + pad, (P[:, 1] - y0) * scale + pad
+
+    part_w = reference.get("part_w")
+    if part_w is not None:
+        # Each rim vertex (on the body's outline as the camera sees it)
+        # measures its own gap to the photo's outline; the gaps spread
+        # smoothly over the whole surface, hands stay bare, and the body
+        # grows along its normals. Repeated so the grown rim is re-measured.
+        names = [str(n) for n in reference["part_names"]]
+        lo, hi = (v * float(reference["px_per_m"]) for v in _REF_CLOTH_RANGE)
+        V0, nrm0 = V.copy(), _vertex_normals(V, F)
+        bare = np.zeros(len(V), dtype=bool)
+        for name in _REF_BARE_PARTS:
+            if name in names:
+                bare |= part_w[:, names.index(name)] > 0.5
+        head = part_w[:, names.index("head")] if "head" in names else np.zeros(len(V))
+        depth_share = 1.0 - (1.0 - _REF_CLOTH_DEPTH) * (1.0 - head)
+        lap = _mesh_laplacian(F, len(V))
+        total = np.zeros(len(V))
+        for _ in range(3):
+            gx, gy = grid_xy(V)
+            near, _ = _raster_depth(gx, gy, V[:, 2], F, shape)
+            cov = binary_closing(np.isfinite(near), iterations=1)
+            rim = binary_dilation(cov & ~binary_erosion(cov), iterations=1)
+            r = np.clip(np.rint(gy).astype(int), 0, shape[0] - 1)
+            c = np.clip(np.rint(gx).astype(int), 0, shape[1] - 1)
+            inb = (gy >= 0) & (gy < shape[0]) & (gx >= 0) & (gx < shape[1])
+            on_rim = inb & rim[r, c] & (np.abs(_vertex_normals(V, F)[:, 2]) < 0.35) & ~bare
+            gap = np.where(grid_mask[r, c], d_in[r, c], -d_out[r, c]) / scale
+            known = np.flatnonzero(on_rim | bare)
+            want = np.where(bare[known], 0.0, np.clip(total[known] + gap[known], lo, hi))
+            total = _harmonic_fill(lap, known, want)
+            step = nrm0 * total[:, None]
+            step[:, 2] *= depth_share
+            V = V0 + step
+
+    # Its hands are open with the fingers spread -- rarely how a photo shows
+    # them -- and stood out as shelves and fins: leave them to the outline.
+    if part_w is not None:
+        hand = np.zeros(len(V), dtype=bool)
+        for name in _REF_BARE_PARTS:
+            if name in names:
+                hand |= part_w[:, names.index(name)] > 0.5
+        F = F[~hand[F].all(axis=1)]
+        used = np.unique(F)
+        remap = np.full(len(V), -1)
+        remap[used] = np.arange(len(used))
+        V, F = V[used], remap[F]
+    # the body mesh is coarse (13.7k vertices): smooth it before sampling so
+    # its triangles don't show as flat facets
+    from trimesh.remesh import subdivide_loop
+
+    V, F = subdivide_loop(V, F, iterations=2)
+    gx, gy = grid_xy(V)
+    near, far = _raster_depth(gx, gy, V[:, 2], F, shape)
+    cov = np.isfinite(near) & np.isfinite(far)
+    if not cov.any():
+        return None
+    front, back = np.where(cov, -near, 0.0), np.where(cov, -far, 0.0)
+    # the photo shows clothes, the body is bare: clothing doesn't follow the
+    # back's small folds and creases. Smooth the back, fading out toward the
+    # edge so the rim stays where it is.
+    sig = _REF_BACK_SMOOTH * float(reference["px_per_m"]) * scale
+    fade = np.clip(distance_transform_edt(cov) / (2.0 * sig), 0.0, 1.0)
+    back = fade * _masked_blur(back, cov, sig) + (1.0 - fade) * back
+    if face_mesh is not None:
+        # the reference's own face is a generic one: over the inner face keep
+        # only its broad curve, the photo's face relief goes on top later.
+        # Fades out well inside the head's edge, which stays the reference's.
+        fm = np.asarray(face_mesh)[:, :2]
+        fx, fy = (fm[:, 0] - x0) * scale + pad, (fm[:, 1] - y0) * scale + pad
+        face_w = max(float(np.ptp(fx)), 1.0)
+        nx, ny = fx[1], fy[1]  # nose tip
+        ix, iy = nx + 0.7 * (fx - nx), ny + 0.7 * (fy - ny)
+        zone = np.zeros(shape, dtype=np.float32)
+        zone[np.clip(np.rint(iy).astype(int), 0, shape[0] - 1), np.clip(np.rint(ix).astype(int), 0, shape[1] - 1)] = 1.0
+        zone = gaussian_filter(zone, 0.08 * face_w)
+        zone = np.clip(2.0 * zone / max(float(zone.max()), 1e-6), 0.0, 1.0)
+        zone *= np.clip(distance_transform_edt(cov) / (0.12 * face_w), 0.0, 1.0)
+        broad = _masked_blur(front, cov, 0.12 * face_w)
+        front = zone * broad + (1.0 - zone) * front
+    return front, back, cov
+
+
 def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
     """Front-surface offset (photo pixels) carrying the face's own shape --
     brow, eye sockets, nose, lips, cheekbones, jaw -- from the 478 face
@@ -682,6 +1034,7 @@ def build_silhouette_relief_mesh(
     face_strength: Optional[float] = None,
     smooth: bool = True,
     pose: Optional[dict] = None,
+    reference: Optional[dict] = None,
 ) -> BodyMesh:
     """Combination Lab switches (defaults are the current production build):
     `profile` -- cross-section shape: "tent" (9 Oct: straight ramp from the
@@ -862,7 +1215,8 @@ def build_silhouette_relief_mesh(
     # thickness comes from the outline WITHOUT the arm-only parts (see
     # _arm_layout); without them the whole outline is inflated as before.
     # people only: on an animal the pose detector can invent a human skeleton
-    layout = _arm_layout(pose, grid_mask, y0, x0, scale, pad) if pose and animal_frac <= _CROP_MAX_ANIMAL_FRAC else None
+    layout = (_arm_layout(pose, grid_mask, y0, x0, scale, pad, face_mesh=face_mesh, photo_mask=mask)
+              if pose and animal_frac <= _CROP_MAX_ANIMAL_FRAC else None)
     body_mask = grid_mask & ~layout["arm_only"] if layout is not None else grid_mask
     body_dist = distance_transform_edt(body_mask).astype(np.float32) / scale if layout is not None else dist
     if profile == "tent":
@@ -901,10 +1255,53 @@ def build_silhouette_relief_mesh(
                 / scale
             )
     if layout is not None:
-        torso_front, torso_back = _human_torso(np.where(body_mask, half_thickness_raw, 0.0), body_mask, layout)
-        front0, back0 = _with_arms(layout, grid_mask, torso_front, torso_back, limb_depth_scale, dist)
+        sized = _scale_to_height(np.where(body_mask, half_thickness_raw, 0.0), body_mask, layout, face_mesh, pose)
+        torso_front, torso_back = _human_torso(sized, body_mask, layout)
+        front0, back0 = _with_arms(layout, grid_mask, torso_front, torso_back, max(limb_depth_scale, 0.95), dist)
     else:
         front0, back0 = half_thickness_raw, -half_thickness_raw
+    ref = (_reference_surfaces(reference, grid_mask, y0, x0, scale, pad, face_mesh)
+           if reference is not None and layout is not None else None)
+    photo_cells = grid_mask
+    if ref is not None:
+        rf, rb, cov = ref
+        # where the reference runs just past the pixel outline, its own round
+        # edge closes the solid; cutting it at the pixel steps left a wall
+        # stepping row by row along the whole outline
+        # Slivers of outline the reference falls just short of go too, and
+        # only photo-only areas wide enough to matter (a jacket flaring past
+        # the body) keep the outline-based thickness.
+        from scipy.ndimage import binary_opening
+
+        ring = cov & (distance_transform_edt(~grid_mask) <= 2.0)
+        wide_gap = binary_opening(grid_mask & ~cov, iterations=2)
+        grid_mask = ring | wide_gap
+        # below the photo's bottom edge the outline was only a guess at the
+        # legs; the reference's own legs replace it
+        synthetic = (y0 + (np.arange(gh) - pad) / scale) >= orig_h
+        grid_mask[synthetic] = cov[synthetic]
+        grid_mask[:pad], grid_mask[-pad:], grid_mask[:, :pad], grid_mask[:, -pad:] = False, False, False, False
+        inside = grid_mask & cov
+        # keep the outline-based body's depth position; the reference's shape
+        shift = float(np.median(((front0 + back0) / 2.0 - (rf + rb) / 2.0)[inside]))
+        rf, rb = rf + shift, rb + shift
+        r_mid, r_half = (rf + rb) / 2.0, np.maximum((rf - rb) / 2.0, 0.0)
+        # cells it doesn't reach keep the outline-based thickness, centred on
+        # the nearest reference depth
+        idx = distance_transform_edt(~inside, return_distances=False, return_indices=True)
+        gap = grid_mask & ~inside
+        r_mid = np.where(gap, _masked_blur(r_mid[idx[0], idx[1]], grid_mask, 3.0), r_mid)
+        r_half = np.where(gap, np.minimum((front0 - back0) / 2.0, _masked_blur(r_half[idx[0], idx[1]], grid_mask, 3.0)), r_half)
+        # smooth only where the reference meets the outline-based fill: at
+        # the reference's own edge the thickness of the last cell is what
+        # places the edge between cells (averaging it with the thicker cells
+        # inside stepped the edge row by row), and smoothing the mid-depth
+        # alone pushed the front's steps (chin over neck) into the back
+        seam = np.clip(4.0 * gaussian_filter(gap.astype(np.float32), 1.5), 0.0, 1.0)
+        r_mid = seam * _masked_blur(r_mid, grid_mask, 1.0) + (1.0 - seam) * r_mid
+        r_half = seam * _masked_blur(r_half, grid_mask, 1.0) + (1.0 - seam) * r_half
+        front0 = np.where(grid_mask, r_mid + r_half, 0.0)
+        back0 = np.where(grid_mask, r_mid - r_half, 0.0)
     mid0 = np.where(grid_mask, (front0 + back0) / 2.0, 0.0)
     if edge == "hard":
         # Original edge: a soft floor so thickness never reaches 0, with the
@@ -956,7 +1353,7 @@ def build_silhouette_relief_mesh(
         # synthetic leg extension too -- it was never photographed, so
         # its "sampled" values are just whatever nearest-neighbor pixel
         # estimate_relative_depth happened to clamp to, not real signal.
-        real_grid_mask = grid_mask & real_pixel
+        real_grid_mask = photo_cells & real_pixel
         subj_vals = sampled[real_grid_mask]
         std = subj_vals.std() if subj_vals.size else 0.0
         if std > 1e-9:
@@ -976,8 +1373,16 @@ def build_silhouette_relief_mesh(
             # of its width. Parts nearer than average still bulge forward.
             if profile == "poisson":
                 broad = _masked_blur(d_norm, real_grid_mask, max(0.05 * max(gh, gw), 1.0))
-                d_norm = np.maximum(broad, 0.0) + (d_norm - broad)
-            front = np.maximum(front0 + half_thickness * d_norm * depth_strength, mid0 + min_half_thickness * 0.3)
+                # with a posed reference body the broad shape is its own
+                d_norm = (d_norm - broad) if ref is not None else np.maximum(broad, 0.0) + (d_norm - broad)
+            d_norm = np.where(photo_cells, d_norm, 0.0)
+            relief = half_thickness * d_norm * depth_strength
+            if ref is not None:
+                # the reference already gives the big shapes (a hand on the
+                # belly, the head's forward reach): the photo adds detail only
+                cap = _REF_RELIEF_MAX * float(reference["px_per_m"])
+                relief = np.clip(relief, -cap, cap)
+            front = np.maximum(front0 + relief, mid0 + min_half_thickness * 0.3)
             back = back0
             # Synthetic extension rows keep the plain symmetric guess
             # (real_pixel False -> front==back==half_thickness mid/span)

@@ -114,7 +114,10 @@ def simplify_for_output(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Tri
     # instead. A slightly different target count collapses different
     # edges, so try a few before giving up.
     for factor in (1.0, 1.15, 1.3, 1.6, 2.0):
-        simplified = mesh.simplify_quadric_decimation(face_count=int(target_faces * factor))
+        count = int(target_faces * factor)
+        if count >= len(mesh.faces):
+            break
+        simplified = mesh.simplify_quadric_decimation(face_count=count)
         simplified.merge_vertices()
         trimesh.repair.fill_holes(simplified)
         simplified.fix_normals()

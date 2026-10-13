@@ -4,6 +4,9 @@ from typing import Callable, List, Optional, Union
 
 # A no-op default so every call site below can unconditionally call
 # `progress_cb(...)` without an `if progress_cb` guard at every checkpoint.
+# people only: on an animal the pose detector can invent a human skeleton
+_REFERENCE_MAX_ANIMAL_FRAC = 0.15
+
 _NO_PROGRESS: Callable[[str, float], None] = lambda stage, frac: None
 
 import numpy as np
@@ -291,8 +294,12 @@ def run_silhouette_relief_pipeline(
     progress_cb: Callable[[str, float], None] = _NO_PROGRESS,
     thickness: float = 1.0,
     face_strength: Optional[float] = None,
+    body: str = "male",
 ) -> None:
-    """`bust_mode`: see build_silhouette_relief_mesh's own docstring --
+    """`body`: "male" or "female" -- which reference body is posed to the
+    photo (body_reference.py) for the depth the outline can't show.
+
+    `bust_mode`: see build_silhouette_relief_mesh's own docstring --
     for a photo that was always meant to show only the upper body, not
     a standing figure cropped by accident. The output still gets a flat
     base disk to stand on either way (see add_base_disk below).
@@ -374,6 +381,19 @@ def run_silhouette_relief_pipeline(
     except Exception as exc:  # noqa: BLE001 - without it the arms are just part of the outline, as before
         print(f"Note: arm separation skipped ({exc}).")
 
+    reference = None
+    if pose and animal_frac <= _REFERENCE_MAX_ANIMAL_FRAC:
+        progress_cb("Posing a reference body", 0.41)
+        try:
+            from .body_reference import fit_body_reference
+
+            fitted = fit_body_reference(pose, face_mesh, alpha > 0.5, gender=body)
+            if fitted is not None:
+                print(f"Reference body ({body}): {'used' if fitted['matched'] else 'not used, no match'} -- {fitted['report']}")
+                reference = fitted if fitted["matched"] else None
+        except Exception as exc:  # noqa: BLE001 - without it the outline-based shapes are used, as before
+            print(f"Note: reference body skipped ({exc}).")
+
     progress_cb("Building relief mesh", 0.45)
     body = build_silhouette_relief_mesh(
         alpha,
@@ -385,6 +405,7 @@ def run_silhouette_relief_pipeline(
         face_mesh=face_mesh,
         face_strength=face_strength,
         pose=pose,
+        reference=reference,
     )
 
     progress_cb("Finishing mesh", 0.78)

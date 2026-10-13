@@ -755,9 +755,9 @@ document.addEventListener("visibilitychange", () => {
 // ---- Quick adjustments (Result tab) ----
 // Thickness previews live by stretching the shown model front to back
 // (the base disk stays as it is); the server bakes it into the STL on the
-// next generate. Face detail and photo depth need a rebuild.
+// next generate. Face detail, photo depth and body need a rebuild.
 const ADJUST_KEY = "figuro_adjust";
-const adjust = { thickness: 1, face_detail: "normal", photo_depth: "normal" };
+const adjust = { thickness: 1, face_detail: "normal", photo_depth: "normal", body: "male" };
 try { Object.assign(adjust, JSON.parse(localStorage.getItem(ADJUST_KEY) || "{}")); } catch (e) { /* defaults */ }
 let bakedThickness = null; // thickness the shown result was built with; null = not a result (e.g. a Lab build)
 const adjustPanel = document.getElementById("adjust");
@@ -866,6 +866,7 @@ async function generate() {
   form.append("thickness", String(adjust.thickness));
   form.append("face_detail", adjust.face_detail);
   form.append("photo_depth", adjust.photo_depth);
+  form.append("body", adjust.body);
   if (cropBaseField.style.display !== "none" && cropFrac < 0.999) {
     form.append("crop_frac", String(cropFrac));
   }

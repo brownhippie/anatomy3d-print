@@ -190,10 +190,12 @@ class LabInputs:
     capsule_unavailable: Optional[str]
     bust_hint: bool
     pose: Optional[dict] = None  # joint -> (x_px, y_px) on the full-size photo
+    reference: Optional[dict] = None  # body_reference.fit_body_reference result, when it matched
 
 
-def prepare_inputs(photo_path: str) -> LabInputs:
-    """Everything that depends only on the photo, computed once per run."""
+def prepare_inputs(photo_path: str, body: str = "male") -> LabInputs:
+    """Everything that depends only on the photo, computed once per run.
+    `body`: which reference body is posed to the photo ("male"/"female")."""
     from .depth_source import estimate_relative_depth
     from .face_features import find_face_mesh
     from .person_segmenter import detect_person_alpha_with_source
@@ -237,7 +239,17 @@ def prepare_inputs(photo_path: str) -> LabInputs:
         pose = detect_pose_points(rgb)
     except Exception:  # noqa: BLE001
         pose = {}
-    return LabInputs(rgb, alpha_std, alpha_bir, float(animal_frac), depth, face_mesh, mask, capsule, unavailable, bust, pose)
+    reference = None
+    if pose and animal_frac <= 0.15:
+        try:
+            from .body_reference import fit_body_reference
+
+            fitted = fit_body_reference(pose, face_mesh, mask, gender=body)
+            reference = fitted if fitted is not None and fitted["matched"] else None
+        except Exception:  # noqa: BLE001 - builds fall back to outline-based shapes
+            reference = None
+    return LabInputs(rgb, alpha_std, alpha_bir, float(animal_frac), depth, face_mesh, mask, capsule, unavailable, bust, pose,
+                     reference)
 
 
 def _capsule_inputs(photo_path: str, rgb_full: np.ndarray) -> dict:
@@ -323,6 +335,7 @@ def build(code: str, inputs: LabInputs):
             layer_rescue=o["rescue"],
             smooth=o["smooth"] == "on",
             pose=inputs.pose,
+            reference=getattr(inputs, "reference", None),
         )
     return add_base_disk(body, HEIGHT_MM)
 

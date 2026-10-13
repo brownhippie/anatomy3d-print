@@ -255,6 +255,7 @@ async def api_generate(
     thickness: float = Form(1.0),
     face_detail: str = Form("normal"),
     photo_depth: str = Form("normal"),
+    body: str = Form("male"),
 ):
     if crop_frac is not None and not 0 < crop_frac <= 1:
         raise HTTPException(400, f"crop_frac must be in (0, 1], got {crop_frac}")
@@ -262,7 +263,9 @@ async def api_generate(
         raise HTTPException(400, f"thickness must be between 0.5 and 2.0, got {thickness}")
     if face_detail not in _FACE_DETAIL or photo_depth not in _PHOTO_DEPTH:
         raise HTTPException(400, "face_detail and photo_depth must each be 'off', 'normal' or 'strong'.")
-    tweaks = {"thickness": thickness, "face_detail": face_detail, "photo_depth": photo_depth}
+    if body not in ("male", "female"):
+        raise HTTPException(400, "body must be 'male' or 'female'.")
+    tweaks = {"thickness": thickness, "face_detail": face_detail, "photo_depth": photo_depth, "body": body}
     if method not in ("capsule", "trellis", "silhouette_relief"):
         raise HTTPException(400, f"Unknown method '{method}' -- use 'capsule', 'trellis', or 'silhouette_relief'.")
     if method in ("trellis", "silhouette_relief") and len(images) != 1:
@@ -340,7 +343,7 @@ def _run_job(
     builds the final result the client's status poll will see, and writes
     it into _job_state; never raises back into that thread's caller since
     there is no caller left listening by the time this runs."""
-    tweaks = tweaks or {"thickness": 1.0, "face_detail": "normal", "photo_depth": "normal"}
+    tweaks = tweaks or {"thickness": 1.0, "face_detail": "normal", "photo_depth": "normal", "body": "male"}
     thickness = tweaks["thickness"]
     face_strength = _FACE_DETAIL[tweaks["face_detail"]]
     depth_strength = _PHOTO_DEPTH[tweaks["photo_depth"]]
@@ -394,6 +397,7 @@ def _run_job(
                 depth_strength=depth_strength or 0.5,
                 thickness=thickness,
                 face_strength=face_strength,
+                body=tweaks.get("body", "male"),
                 bust_mode=is_bust,
                 crop_frac=crop_frac,
                 # Continue the count from where the capsule attempt stopped
@@ -444,6 +448,7 @@ def _run_job(
                 depth_strength=depth_strength or 0.5,
                 thickness=thickness,
                 face_strength=face_strength,
+                body=tweaks.get("body", "male"),
                 bust_mode=bust_mode,
                 crop_frac=crop_frac,
                 progress_cb=report_progress,
