@@ -45,6 +45,8 @@ THUMB = (720, 480)
 HELD_W = 0.3
 BUMP_W = 3.0
 FLOW_W = 0.1
+EAR_W = 0.2  # the ears' reach beside the head off the photo's, % of the face's width
+NAPE_W = 1.0  # the back of the neck's bumps, %
 FIT_W = 0.5  # the posed body's joints (and bone lengths) on the photo's: its miss, % of the shoulders' width
 LAYER_W = 0.05  # overlaps kept: what lies over what in the photo is in front on the model (0..100)
 OPEN_W = 20.0  # mouth and eyes as open as in the photo (lid / lip gap over width)
@@ -54,7 +56,8 @@ OBJECTIVE = (f"study score = Lab score + {HELD_W} × held mean − {BUMP_W} × b
              f"+ {FLOW_W} × hair flow (the model's strands along the photo's, −100…100) "
              f"− {OPEN_W} × (how much more or less open the mouth and eyes are than in the photo) "
              f"+ {LAYER_W} × overlaps kept (% of the photo's sure over/under boundaries the model has the right way round) "
-             f"− {FIT_W} × the posed body's joint miss (% of shoulder width)")
+             f"− {FIT_W} × the posed body's joint miss (% of shoulder width) "
+             f"− {EAR_W} × the ears' reach off the photo's (% of face width) − {NAPE_W} × the nape's bumps (%)")
 
 
 # ---------------------------------------------------------------- critics
@@ -178,7 +181,7 @@ def front_in_photo(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInput
 # front photo leaves in no doubt (hair beside a face can be in front of the
 # cheek or behind the head; a hand is skin lying over clothes: left out)
 _OUTER = {
-    "hat": ("hair", "face"), "glasses": ("face",), "mask": ("face",),
+    "hat": ("hair", "face", "forehead"), "glasses": ("face", "forehead"), "mask": ("face",),
     "jacket": ("shirt", "tshirt", "sweater", "tie", "dress", "trousers", "jeans", "skirt", "shorts"),
     "suit": ("shirt", "tshirt", "sweater", "tie", "dress", "trousers", "jeans", "skirt", "shorts"),
     "coat": ("shirt", "tshirt", "sweater", "tie", "dress", "jacket", "suit", "hoodie"),
@@ -186,6 +189,7 @@ _OUTER = {
     "scarf": ("shirt", "tshirt", "sweater", "jacket", "suit", "coat", "dress", "hoodie", "kimono"),
     "belt": ("trousers", "jeans", "skirt", "dress", "shorts", "kimono"),
     "collar": ("neck",),
+    "hair": ("forehead",), "earring": ("hair", "neck", "face"),
 }
 LAYER_MIN_MM = 0.1
 
@@ -197,7 +201,7 @@ def _codes(inputs: "lab.LabInputs", H: int, W: int):
     from .clothes import GARMENTS, NAMES
     from .head_parts import FACE_SKIN, GLASSES, HAIR, HAT, MASK
 
-    names = ["", "hat", "hair", "face", "glasses", "mask", "neck", "collar"] + list(GARMENTS)
+    names = ["", "hat", "hair", "face", "glasses", "mask", "neck", "collar", "forehead", "earring"] + list(GARMENTS)
     code = np.zeros((H, W), np.uint8)
     parts = inputs.parts or {}
     cl = parts.get("clothes")
@@ -211,11 +215,27 @@ def _codes(inputs: "lab.LabInputs", H: int, W: int):
             band = (np.arange(H)[:, None] > chin) & (np.arange(H)[:, None] < chin + 0.6 * face_h)
             skin = cl["labels"] == NAMES.index("skin") + 1
             code[band & skin] = names.index("neck")
-            code[band & (code >= names.index("collar") + 1)] = names.index("collar")
+            code[band & (code >= names.index("earring") + 1)] = names.index("collar")
     if parts.get("labels") is not None:
         hl = parts["labels"]
         for lab_, nm in ((HAT, "hat"), (HAIR, "hair"), (FACE_SKIN, "face"), (GLASSES, "glasses"), (MASK, "mask")):
             code[hl == lab_] = names.index(nm)
+        if inputs.face_mesh is not None:
+            from .head_parts import ACCESSORY
+
+            fm = np.asarray(inputs.face_mesh)[:, :2]
+            yy, xx = np.mgrid[0:H, 0:W]
+            brow = float((fm[105, 1] + fm[334, 1]) / 2)
+            ruler = float(fm[2, 1] - brow)
+            # the forehead: face skin above the brows between the temples (hair
+            # surely lies over it at the hairline)
+            fh = (hl == FACE_SKIN) & (yy < brow) & (xx > min(fm[54, 0], fm[284, 0])) & (xx < max(fm[54, 0], fm[284, 0]))
+            code[fh] = names.index("forehead")
+            # earrings: an accessory hanging from below the ears, beside the face
+            fw = float(abs(fm[454, 0] - fm[234, 0]))
+            side = (xx < fm[234, 0] + 0.1 * fw) | (xx > fm[454, 0] - 0.1 * fw)
+            ear_rows = (yy > float(fm[2, 1]) - 0.5 * ruler) & (yy < float(fm[152, 1]) + 1.5 * ruler)
+            code[(hl == ACCESSORY) & side & ear_rows] = names.index("earring")
     return code, names
 
 
@@ -255,12 +275,76 @@ def layering(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") ->
     return {"layering": round(100.0 * hits / total, 1), "layering_n": total}
 
 
+def ears_fit(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
+    """The ears from the front: row by row between the brows and the nose's
+    base, how far the model's outline reaches each side against the
+    photo's, % of the face's width (0 = the same). Sides where the photo's
+    ear is under hair are left out."""
+    if inputs.face_mesh is None or inputs.reference is None:
+        return {}
+    fm = np.asarray(inputs.face_mesh)[:, :2]
+    ears = inputs.reference.get("ears") or {}
+    r0, r1 = int((fm[105, 1] + fm[334, 1]) / 2), int(fm[2, 1])
+    fw = float(abs(fm[454, 0] - fm[234, 0]))
+    cx = float((fm[234, 0] + fm[454, 0]) / 2)
+    box = (int(cx - 1.5 * fw), r0, int(cx + 1.5 * fw), r1 + 1)
+    z, have, k = front_in_photo(preview, floor, inputs, box)
+    mask = inputs.photo_mask
+    errs = []
+    for side, sgn in (("R", -1), ("L", 1)):
+        if (ears.get(side) or {}).get("hidden"):
+            continue
+        for ry in range(z.shape[0]):
+            py = int(box[1] + ry * k)
+            if not 0 <= py < mask.shape[0]:
+                continue
+            row = np.flatnonzero(mask[py, max(box[0], 0):min(box[2], mask.shape[1])])
+            mrow = np.flatnonzero(have[ry])
+            if not len(row) or not len(mrow):
+                continue
+            p_edge = (row.max() if sgn > 0 else row.min()) + max(box[0], 0)
+            m_edge = box[0] + (mrow.max() if sgn > 0 else mrow.min()) * k
+            errs.append(abs(p_edge - m_edge) / fw)
+    if len(errs) < 4:
+        return {}
+    return {"ear_err": round(100.0 * float(np.mean(errs)), 1)}
+
+
+def nape_bumps(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
+    """The back of the neck between the hairline and the collar, behind and
+    below the ears: % of it standing more than BUMP_MM off a smoothed copy
+    of itself (it should be smooth, with only its broad curves)."""
+    if inputs.face_mesh is None:
+        return {}
+    fm = np.asarray(inputs.face_mesh)[:, :2]
+    ys, xs = np.nonzero(inputs.photo_mask)
+    my0, my1, mx0, mx1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    v, n = preview.vertices, preview.vertex_normals
+    top = float(v[:, 1].max())
+    above = v[v[:, 1] > floor]
+    mm = (top - floor) / (my1 - my0)
+    mx_c, px_c = (above[:, 0].min() + above[:, 0].max()) / 2, (mx0 + mx1) / 2
+    face_h = float(np.ptp(fm[:468, 1]))
+    y_hi = top - (float(fm[2, 1]) - my0) * mm  # the nose's base: about the nape's hairline
+    y_lo = top - (float(fm[152, 1]) + 0.6 * face_h - my0) * mm  # into the collar
+    half = 0.6 * float(abs(fm[454, 0] - fm[234, 0])) * mm
+    cx = mx_c + ((fm[234, 0] + fm[454, 0]) / 2 - px_c) * mm
+    zone = (v[:, 1] < y_hi) & (v[:, 1] > y_lo) & (np.abs(v[:, 0] - cx) < half) & (n[:, 2] < -0.2)
+    if zone.sum() < 30:
+        return {}
+    smooth = preview.copy()
+    trimesh.smoothing.filter_taubin(smooth, lamb=0.5, nu=0.53, iterations=12)
+    off = np.abs(np.einsum("ij,ij->i", v - smooth.vertices, n))[zone]
+    return {"nape_bumps": round(100.0 * float((off > BUMP_MM).mean()), 2)}
+
+
 def objective(m: dict) -> float:
     return float(m.get("score", -100.0) + HELD_W * m.get("held_mean", 0.0) - BUMP_W * m.get("bumps", 0.0)
                  + FLOW_W * m.get("hair_flow", 0.0)
                  - OPEN_W * (m.get("mouth_open_diff", 0.0) + m.get("eyes_open_diff", 0.0))
                  + LAYER_W * m.get("layering", 0.0)
-                 - FIT_W * 100.0 * (m.get("fit_kp") or 0.0))
+                 - FIT_W * 100.0 * (m.get("fit_kp") or 0.0)
+                 - EAR_W * m.get("ear_err", 0.0) - NAPE_W * m.get("nape_bumps", 0.0))
 
 
 def evaluate(inputs: "lab.LabInputs", values: dict):
@@ -277,7 +361,7 @@ def evaluate(inputs: "lab.LabInputs", values: dict):
     if inputs.reference is not None:
         m["fit_kp"] = inputs.reference["report"].get("kp_median")  # the posed body's miss of the photo's joints
     m.update(bumps(preview, _floor(preview)))
-    for critic in (hair_flow, layering):
+    for critic in (hair_flow, layering, ears_fit, nape_bumps):
         try:
             m.update(critic(preview, _floor(preview), inputs))
         except Exception:  # noqa: BLE001 - a photo it can't apply to just doesn't score it
@@ -405,7 +489,7 @@ def finish_candidate(st: dict) -> dict:
             "objective": round(mean, 2), "complete": complete,
             "metrics": {pid: {k: r.get(k) for k in ("score", "held_mean", "bumps", "shape_iou", "face_err_pct", "spike_pct", "hair_flow",
                                                     "face_err_eyes", "face_err_brows", "face_err_nose", "face_err_mouth", "face_err_jaw",
-                                                    "mouth_open_diff", "eyes_open_diff", "layering", "fit_kp", "error")}
+                                                    "mouth_open_diff", "eyes_open_diff", "layering", "fit_kp", "ear_err", "nape_bumps", "error")}
                         for pid, r in c["results"].items()}}
     if c.get("role"):
         # the same values built again with new code

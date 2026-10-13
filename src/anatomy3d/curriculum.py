@@ -71,7 +71,7 @@ def _face() -> list:
              "photo depth where the face faces the camera"),
         Item("face.ears", "Face", "Ears: size, place, swept back, under hair", True, True,
              [SR + "_REF_EAR_HAIR", SR + "_REF_EAR_SINK", SR + "_REF_EAR_THICK", BR + "_EAR_DROP", BR + "_EAR_KINK", BR + "_EAR_BEND",
-              BR + "_EAR_UNDER_HAIR"], False, "3D ears measured from the photo; a score of their own to come"),
+              BR + "_EAR_UNDER_HAIR"], True, "3D ears measured from the photo; the ears' reach beside the head scores them"),
     ]
 
 
@@ -88,12 +88,14 @@ def _head() -> list:
                                "_HAIR_CURL", "_HAIR_CURL_DEPTH", "_HAIR_COIL", "_HAIR_COIL_DEPTH")], True,
              "read from the photo's own strands; hair flow scores it"),
         Item("hair.hairline", "Hair", "Hairline over the forehead", True, True, [SR + "_HAIRLINE_EDGE", SR + "_HAIR_FEATHER", SR + "_HAIR_FRINGE"],
-             False, "read; the pattern ends at it; a score of its own to come"),
-        Item("hair.nape", "Hair", "Nape and behind the ears: hairline to collar", False, False,
-             [SR + "_HAIR_NAPE_EDGE", SR + "_HAIR_NECK_BEHIND"], False,
-             "smooth with its curves (nape hollow, the muscle behind the ear); built from what covers it: hair, collar, hood, scarf"),
-        Item("hair.behind_ear", "Hair", "The gap between the hair and the back of the ear", False, False, [], False,
-             "open where the photo shows the ear standing off the head, filled only where hair does"),
+             True, "read; the pattern ends at it; the overlaps score checks hair standing over the forehead"),
+        Item("hair.nape", "Hair", "Nape and behind the ears: hairline to collar", True, True,
+             [SR + "_HAIR_NAPE_EDGE", SR + "_HAIR_NECK_BEHIND", SR + "_C7", SR + "_REF_BACK_SMOOTH"], True,
+             "smooth with its curves; built from what covers it (the hair's reach round the back, the collar's rise, a bare nape's C7); "
+             "the nape's bumps score it"),
+        Item("hair.behind_ear", "Hair", "The gap between the hair and the back of the ear", True, True,
+             [SR + "_REF_EAR_HAIR", BR + "_EAR_UNDER_HAIR", SR + "_REF_EAR_SINK"], True,
+             "ears under hair aren't built; a seen ear stands off the head with its root on the skull; the ears' reach scores it"),
         Item("hair.parting", "Hair", "Parting", False, False),
         Item("hair.braids", "Hair", "Braids, locs", False, False),
     ]
@@ -101,15 +103,17 @@ def _head() -> list:
 
 def _worn() -> list:
     return [
-        Item("wear.cap", "Headwear", "Cap or hat, its peak", True, True, [SR + "_HAT_PEAK"], False),
-        Item("wear.mask", "Headwear", "Face mask", True, True, [SR + "_MASK_SPAN"], False),
-        Item("wear.glasses", "Headwear", "Glasses, sunglasses", True, True, [SR + "_GLASSES_SPAN", SR + "_GLASSES_FRAME"], False),
-        Item("wear.earrings", "Headwear", "Earrings", False, False),
-        Item("neck.neck", "Neck", "Neck", True, True, [], True, "from the reference body's neck"),
+        Item("wear.cap", "Headwear", "Cap or hat, its peak", True, True, [SR + "_HAT_PEAK"], True, "the overlaps score checks it over hair"),
+        Item("wear.mask", "Headwear", "Face mask", True, True, [SR + "_MASK_SPAN"], True, "the overlaps score checks it over the face"),
+        Item("wear.glasses", "Headwear", "Glasses, sunglasses", True, True, [SR + "_GLASSES_SPAN", SR + "_GLASSES_FRAME"], True,
+             "the overlaps score checks them over the face"),
+        Item("wear.earrings", "Headwear", "Earrings", True, True, [SR + "_EARRING_PROUD"], True,
+             "an accessory below the ears beside the face; the overlaps score checks it over hair and neck"),
+        Item("neck.neck", "Neck", "Neck", True, True, [SR + "_REF_BACK_SMOOTH"], True, "from the reference body's neck; the nape's bumps score it"),
         Item("neck.collar", "Neck", "Collar, round the back too", True, True,
-             [SR + "_NECK_COLLAR", SR + "_NECK_COLLAR_BELOW", SR + "_NECK_COLLAR_RISE"], False),
-        Item("neck.scarf", "Neck", "Scarf, roll neck", True, True, [SR + "_NECK_WEAR_MAX"], False),
-        Item("neck.necklace", "Neck", "Necklace", True, True, [SR + "_NECK_LACE"], False),
+             [SR + "_NECK_COLLAR", SR + "_NECK_COLLAR_BELOW", SR + "_NECK_COLLAR_RISE"], True, "the overlaps score checks it round the neck"),
+        Item("neck.scarf", "Neck", "Scarf, roll neck", True, True, [SR + "_NECK_WEAR_MAX"], True, "the overlaps score checks it over clothes"),
+        Item("neck.necklace", "Neck", "Necklace", False, True, [SR + "_NECK_LACE"], False, "shaped from the neck's band; not named on the photo yet"),
     ]
 
 
@@ -180,7 +184,7 @@ def _overlaps() -> list:
         Item("over.hand_clothes", "Overlaps", "Hand or arm in front of the body", True, True, [SR + "_REF_HAND_SHRINK"], False,
              "crossed arms and hands on the body, from the posed reference; not scored yet"),
         Item("over.strap", "Overlaps", "Bag strap over clothes", True, True, _STEP, False, "named and stepped; not scored yet"),
-        Item("over.earrings", "Overlaps", "Earrings by the hair", False, False),
+        Item("over.earrings", "Overlaps", "Earrings by the hair", True, True, [SR + "_EARRING_PROUD"], True, "the overlaps score checks it"),
     ]
 
 
@@ -274,22 +278,38 @@ assert len(_BONES) == 206, len(_BONES)
 _ROLE_STATUS = {
     "measure": dict(read=False, sculpt=False, critic=False, note_add="length not yet measured from the photo"),
     "landmark": dict(read=NA, sculpt=False, critic=False, note_add="ridge/knob where bare: not yet"),
+    "landmark_done": dict(read=True, sculpt=True, critic=True,
+                          note_add="shaped where the photo shows bare skin there, placed from the posed body's joints (their miss scores it)"),
+    "face_landmark": dict(read=True, sculpt=True, critic=True, note_add="in the face's landmark shape; the face's points score it"),
     "shape": dict(read=NA, sculpt=True, critic=True, note_add="from the reference body (bumps and depth checks score it)"),
     "inside": dict(read=NA, sculpt=NA, critic=NA, note_add="nothing of its own to shape at this size"),
 }
 # bones measured now: by the face landmarks (nasal, mandible), the pose's
 # widths (hip bone), or the reference fit's bone lengths (body_reference._STRETCH)
 _MEASURED_NOW = {"Nasal", "Mandible", "Clavicle", "Hip bone", "Humerus", "Radius", "Ulna", "Femur", "Tibia"}
+_FOOT = ("Metatarsal", "Calcaneus")
 _HAND = ("Metacarpal", "Finger")
 
 
 def _bones() -> list:
     out = []
     for i, (name, region, role, rig, note) in enumerate(_BONES):
+        base_ = name.split(" (")[0]
+        if role == "landmark" and base_ in ("Frontal", "Zygomatic", "Temporal"):
+            role = "face_landmark"
+        elif role == "landmark" and base_ == "Occipital":
+            role = "shape"  # the reference head's own (under hair on most photos)
+        elif role == "landmark" and base_ == "Calcaneus":
+            role = "measure"  # the heel: a point of the photo's the fit matches
+        elif role == "landmark" and base_ in ("Cervical C7", "Sternum", "Patella", "Fibula"):
+            role = "landmark_done"
         st = dict(_ROLE_STATUS[role])
         add = st.pop("note_add")
         base = name.split(" (")[0]
-        if role == "measure" and (base in _MEASURED_NOW or base.startswith(_HAND)):
+        if role == "measure" and base.startswith(_FOOT):
+            st.update(read=True, sculpt=True, critic=True)
+            add = "measured as the foot's size (heel and big toe in the photo, when the feet show)"
+        elif role == "measure" and (base in _MEASURED_NOW or base.startswith(_HAND)):
             st.update(read=True, sculpt=True, critic=True)
             add = ("measured as the hand's size (the hand's points against the reference's)" if base.startswith(_HAND) else
                    "its length fitted to the photo's points; the fit's joint miss scores it" if base in

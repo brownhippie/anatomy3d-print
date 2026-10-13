@@ -880,6 +880,14 @@ _CLOTH_LAYER = 0.0025  # one layer's step
 _CLOTH_STEP_SPAN = 0.015  # the step eases back to the garment's own surface over this
 _TIE_THICK = 0.002  # a tie stands this proud of the shirt (on top of its layer step)
 _BELT_THICK = 0.002
+# Bones that show under bare skin (_bony_landmarks), metres on the person:
+_CLAVICLE = 0.003  # the collarbones' ridge
+_STERNAL_NOTCH = 0.003  # the hollow between them at the neck's base
+_PATELLA = 0.004  # a kneecap
+_MALLEOLUS = 0.003  # the ankle's knobs either side
+_KNUCKLE = 0.0015  # the knuckles
+_C7 = 0.003  # the knob at the base of the nape
+_EARRING_PROUD = 0.004  # an earring stands this proud
 # how much of each a kind of hair gets: strands, waves, curls, coils
 _HAIR_KIND_MIX = {"sleek": (0.35, 0, 0, 0), "straight": (1, 0, 0, 0), "wavy": (0.8, 1, 0, 0),
                   "curly": (0.25, 0, 1, 0), "coily": (0, 0, 0, 1)}
@@ -1940,6 +1948,52 @@ def _clothes_relief(reading: dict, front: np.ndarray, cells: np.ndarray, y0: int
     return np.where(cells, gaussian_filter(step, 0.8) * facing * np.clip(near * 3, 0, 1), 0.0)
 
 
+def _bony_landmarks(reference: dict, pose: Optional[dict], skin: np.ndarray, neck_bare: bool, y0: int, x0: int, scale: float,
+                    pad: int):
+    """(front, back) offsets (photo px, outward) for the bones that show
+    under bare skin: the collarbones' ridges and the notch between them,
+    kneecaps, the ankles' knobs, the knuckles, and the knob at the base of
+    the nape. Placed from the posed reference body's joints (and the
+    photo's own hand points); only where the photo shows skin there."""
+    gh, gw = skin.shape
+    ppm = float(reference["px_per_m"])
+    J = {k: np.asarray(v[:2], np.float64) for k, v in reference.get("joints_px", {}).items()}
+    rr, cc = np.mgrid[0:gh, 0:gw]
+    py, px = y0 + (rr - pad) / scale, x0 + (cc - pad) / scale  # each cell in photo px
+    front, back = np.zeros((gh, gw)), np.zeros((gh, gw))
+
+    def blob(c, r_m):
+        return np.exp(-((px - c[0]) ** 2 + (py - c[1]) ** 2) / (2 * (r_m * ppm) ** 2))
+
+    def ridge(a, b, r_m):
+        ab = b - a
+        t = np.clip(((px - a[0]) * ab[0] + (py - a[1]) * ab[1]) / max(ab @ ab, 1e-9), 0, 1)
+        d2 = (px - (a[0] + t * ab[0])) ** 2 + (py - (a[1] + t * ab[1])) ** 2
+        return np.exp(-d2 / (2 * (r_m * ppm) ** 2)) * np.sin(np.pi * t) ** 0.5
+
+    if "left_shoulder" in J and "right_shoulder" in J:
+        ls, rs = J["left_shoulder"], J["right_shoulder"]
+        sw = float(np.linalg.norm(ls - rs))
+        notch = (ls + rs) / 2 + np.array([0.0, -0.02 * sw])
+        for sh in (ls, rs):
+            front += _CLAVICLE * ppm * ridge(notch + 0.12 * (sh - notch), notch + 0.85 * (sh - notch), 0.008)
+        front -= _STERNAL_NOTCH * ppm * blob(notch + np.array([0.0, 0.03 * sw]), 0.012)
+        if neck_bare:
+            back += _C7 * ppm * blob(notch + np.array([0.0, -0.08 * sw]), 0.015)
+    for sd in ("left", "right"):
+        if f"{sd}_knee" in J:
+            front += _PATELLA * ppm * blob(J[f"{sd}_knee"], 0.025)
+        if f"{sd}_ankle" in J:
+            for dx in (-1, 1):
+                front += _MALLEOLUS * ppm * blob(J[f"{sd}_ankle"] + np.array([dx * 0.033 * ppm, 0.0]), 0.01)
+        if pose and all(f"{sd}_{k}" in pose for k in ("wrist", "index", "pinky")):
+            w_, i_, p_ = (np.asarray(pose[f"{sd}_{k}"], np.float64) for k in ("wrist", "index", "pinky"))
+            for t in np.linspace(0, 1, 4):  # index to little finger, at the knuckles
+                front += _KNUCKLE * ppm * blob(w_ + 0.75 * ((i_ * (1 - t) + p_ * t) - w_), 0.005)
+    soft = gaussian_filter(skin.astype(np.float64), 1.0)
+    return front * soft, back
+
+
 def _wear_on_face(front: np.ndarray, grid_mask: np.ndarray, parts_g: np.ndarray, scale: float, px_per_m: float) -> np.ndarray:
     """What's worn on the face, on the front surface (photo px, toward the
     camera): a face mask is cloth stretched from the nose over the mouth to
@@ -2661,6 +2715,37 @@ def build_silhouette_relief_mesh(
                 front = front + _clothes_relief(clothes_read, front, grid_mask, y0, x0, scale, pad, float(reference["px_per_m"]))
             except Exception as exc:  # noqa: BLE001 - clothes keep their shape without steps
                 print(f"Note: clothes steps skipped ({exc}).")
+        if reference is not None:
+            try:
+                from .clothes import NAMES as _CN
+
+                skin_g = np.zeros((gh, gw), bool)
+                neck_bare = False
+                if clothes_read:
+                    lab_c = clothes_read["labels"]
+                    rr_ = np.clip(np.rint(y0 + (np.arange(gh) - pad) / scale).astype(int), 0, lab_c.shape[0] - 1)
+                    cc_ = np.clip(np.rint(x0 + (np.arange(gw) - pad) / scale).astype(int), 0, lab_c.shape[1] - 1)
+                    skin_g = (lab_c[rr_[:, None], cc_[None, :]] == _CN.index("skin") + 1) & grid_mask
+                    fm_ = np.asarray(face_mesh)
+                    band = (rr_ > fm_[152, 1]) & (rr_ < fm_[152, 1] + 0.3 * np.ptp(fm_[:468, 1]))
+                    neck_bare = bool(skin_g[band].mean() > 0.3) if band.any() and skin_g[band].size else False
+                bf, bb = _bony_landmarks(reference, pose, skin_g, neck_bare, y0, x0, scale, pad)
+                front = np.where(grid_mask, front + bf, front)
+                back = np.where(grid_mask, back - bb, back)
+                if parts_g is not None:
+                    from .head_parts import ACCESSORY
+
+                    fm_ = np.asarray(face_mesh)[:, :2]
+                    rows_g = (np.arange(gh)[:, None] - pad) / scale + y0
+                    cols_g = (np.arange(gw)[None, :] - pad) / scale + x0
+                    fw_ = abs(fm_[454, 0] - fm_[234, 0])
+                    ruler_ = fm_[2, 1] - (fm_[105, 1] + fm_[334, 1]) / 2
+                    ear_side = (cols_g < fm_[234, 0] + 0.1 * fw_) | (cols_g > fm_[454, 0] - 0.1 * fw_)
+                    ear_rows = (rows_g > fm_[2, 1] - 0.5 * ruler_) & (rows_g < fm_[152, 1] + 1.5 * ruler_)
+                    ring = (parts_g == ACCESSORY) & ear_side & ear_rows & grid_mask
+                    front = front + _EARRING_PROUD * float(reference["px_per_m"]) * gaussian_filter(ring.astype(np.float64), 1.0)
+            except Exception as exc:  # noqa: BLE001 - the body keeps its shape without them
+                print(f"Note: bony landmarks skipped ({exc}).")
         face_read = (parts or {}).get("face") if parts is not None else None
         if face_read:
             try:

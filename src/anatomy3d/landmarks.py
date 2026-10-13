@@ -64,7 +64,9 @@ MEDIAPIPE_JOINT_INDEX = {
     "right_ankle": 28,
 }
 
-_HEAD_POINT_INDEX = {"left_eye": 2, "right_eye": 5, "left_ear": 7, "right_ear": 8}
+_HEAD_POINT_INDEX = {"left_eye": 2, "right_eye": 5, "left_ear": 7, "right_ear": 8,
+                     # and the feet: heel and big toe (the reference body's foot length)
+                     "left_heel": 29, "right_heel": 30, "left_foot_index": 31, "right_foot_index": 32}
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"

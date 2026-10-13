@@ -91,6 +91,13 @@ KNOBS = [
     Knob(_SR, "_CLOTH_STEP_SPAN", 0.006, 0.04, "clothes", "the step eases back over this (m)"),
     Knob(_SR, "_TIE_THICK", 0.0, 0.005, "clothes", "a tie stands this proud of the shirt (m)"),
     Knob(_SR, "_BELT_THICK", 0.0, 0.005, "clothes", "a belt stands this proud (m)"),
+    Knob(_SR, "_CLAVICLE", 0.0, 0.006, "bones", "the collarbones' ridge under bare skin (m)"),
+    Knob(_SR, "_STERNAL_NOTCH", 0.0, 0.006, "bones", "the hollow between the collarbones (m)"),
+    Knob(_SR, "_PATELLA", 0.0, 0.008, "bones", "a bare kneecap (m)"),
+    Knob(_SR, "_MALLEOLUS", 0.0, 0.006, "bones", "the ankle's knobs (m)"),
+    Knob(_SR, "_KNUCKLE", 0.0, 0.003, "bones", "the knuckles (m)"),
+    Knob(_SR, "_C7", 0.0, 0.006, "bones", "the knob at the base of a bare nape (m)"),
+    Knob(_SR, "_EARRING_PROUD", 0.0, 0.008, "headwear", "an earring stands this proud (m)"),
     Knob(_BR, "_STRETCH_PRIOR", 0.01, 0.3, "bones", "how hard bone lengths hold to the reference's (cost per unit)"),
     Knob(_BR, "_STRETCH_RANGE", 0.05, 0.25, "bones", "most a bone may lengthen or shorten (share)"),
     # each part of the face

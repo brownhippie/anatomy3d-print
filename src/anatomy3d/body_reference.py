@@ -50,12 +50,14 @@ _STRETCH = {
     "clavicle": (["clavicle"], "shoulder01"),  # the shoulders' width
     "cervical": (["neck01", "neck02", "neck03"], "head"),  # the neck's length (C1-C7)
     "hand": (["wrist"], None),  # carpals, metacarpals, phalanges: the hand's size
+    "foot": (["foot"], None),  # tarsals, metatarsals, toes: the foot's size (heel and big toe in the photo)
 }
 _STRETCH_RANGE = 0.15
 _STRETCH_PRIOR = 0.05
 _HEAD_RANGE = 0.25  # head size, +/- share of the body model's
 _HEAD_PRIOR = 0.2
 _KP_WEIGHT = {"shoulder": 1.0, "elbow": 1.0, "wrist": 0.3, "hip": 0.7, "knee": 1.0, "ankle": 1.0}
+_FOOT_WEIGHT = 0.5
 # the fit is used only when it matches the photo
 _MAX_KP_ERR = 0.08  # median joint/face point miss, x shoulder distance
 _MIN_INSIDE = 0.95  # share of the body's visible points inside the outline, or within
@@ -225,6 +227,11 @@ def _photo_targets(pose: dict, face_mesh: Optional[np.ndarray]):
             names.append(k)
             xy.append(v)
             w.append(_KP_WEIGHT[kind])
+        elif kind in ("heel", "foot_index"):
+            # the feet: the body knows them as heel and big toe
+            names.append(k.replace("foot_index", "big_toe"))
+            xy.append(v)
+            w.append(_FOOT_WEIGHT)
     if face_mesh is not None:
         f = np.asarray(face_mesh)[:, :2]
         for n, p, wt in (("nose", f[1], 1.0), ("right_eye", (f[33] + f[133]) / 2, 1.0), ("left_eye", (f[362] + f[263]) / 2, 1.0),
