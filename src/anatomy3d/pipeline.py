@@ -381,6 +381,11 @@ def run_silhouette_relief_pipeline(
     except Exception as exc:  # noqa: BLE001 - without it the arms are just part of the outline, as before
         print(f"Note: arm separation skipped ({exc}).")
 
+    # A human face and both shoulders: a person, whatever the animal score
+    # says (measured: a chest-up crop of a man scored 0.92 "animal", which
+    # sent it down the animal path -- no body fit, invented legs).
+    if face_mesh is not None and "left_shoulder" in pose and "right_shoulder" in pose:
+        animal_frac = 0.0
     reference = None
     if pose and animal_frac <= _REFERENCE_MAX_ANIMAL_FRAC:
         progress_cb("Posing a reference body", 0.41)

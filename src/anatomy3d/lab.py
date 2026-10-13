@@ -239,6 +239,8 @@ def prepare_inputs(photo_path: str, body: str = "male") -> LabInputs:
         pose = detect_pose_points(rgb)
     except Exception:  # noqa: BLE001
         pose = {}
+    if face_mesh is not None and "left_shoulder" in pose and "right_shoulder" in pose:
+        animal_frac = 0.0  # a human face and shoulders: a person (see pipeline.py)
     reference = None
     if pose and animal_frac <= 0.15:
         try:

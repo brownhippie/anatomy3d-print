@@ -796,10 +796,9 @@ _REF_DEPTH_MARGIN = 1.10
 _REF_HEAD_MARGIN = 1.05
 _REF_HAND_SHRINK = 0.3  # hands shrunk to this share about the wrist
 _REF_HAIR = 0.012  # most the head grows front to back (hair), metres
-# How much body to build (see _reference_extent): the photo must show the
-# buttocks down to their fold, this far from hip joints to knees, for a full
-# figure; otherwise it ends at the hip line as a torso.
-_GLUTEAL_FOLD = 0.3
+# How much body to build (see _person_extent): a photo reaching this share
+# of the way from the hip joints to the knees counts as showing the legs.
+_KNEE_REACH = 0.9
 _REF_BARE_PARTS = ("hand.L", "hand.R")
 _REF_RELIEF_MAX = 0.015  # photo-depth detail on top of the reference, metres
 _REF_BACK_SMOOTH = 0.02  # clothing over the back: smoothing radius, metres
@@ -866,34 +865,22 @@ def _harmonic_fill(lap, known, values):
     return x
 
 
-def _reference_extent(reference: dict, mask: np.ndarray, bust_mode: bool):
-    """How much of the body to build. A photo that stops before the buttocks
-    are in down to their fold (or a bust by request) ends at the hip line as
-    a torso -- a partial seat or invented legs under a half-shown hip look
-    wrong. One that shows them gets the whole figure: the photo's outline,
-    then the fitted body's own legs below the photo's edge, to the feet.
-    Returns the outline to build from and "torso"/"full"."""
-    J = reference["joints_px"]
-    rows = np.flatnonzero(mask.any(axis=1))
-    bottom = int(rows[-1])
-    hip_y = (J["left_hip"][1] + J["right_hip"][1]) / 2.0
-    knee_y = (J["left_knee"][1] + J["right_knee"][1]) / 2.0
-    fold_y = hip_y + _GLUTEAL_FOLD * (knee_y - hip_y)
-    if bust_mode or bottom < fold_y:
-        cut = int(min(bottom, round(hip_y)))
-        out = mask.copy()
-        out[cut + 1:] = False
-        return out, "torso"
-    H, W = mask.shape
-    if bottom < H - 3:  # the feet are in the photo: nothing to add
-        return mask, "full"
-    V = np.asarray(reference["vertices"], dtype=np.float64)
-    Hn = max(H, int(np.ceil(V[:, 1].max())) + 3)
-    near, _ = _raster_depth(V[:, 0], V[:, 1], V[:, 2], np.asarray(reference["faces"], dtype=np.int64), (Hn, W))
-    out = np.zeros((Hn, W), dtype=bool)
-    out[:H] = mask
-    out[bottom + 1:] = np.isfinite(near[bottom + 1:])
-    return out, "full"
+def _person_extent(mask: np.ndarray, hip_y: Optional[float], knee_y: Optional[float], bust_mode: bool):
+    """How much of a person to build: never legs the photo doesn't show. A
+    photo that ends between the hips and the knees is cut back to the hip
+    line -- a torso, nothing half-shown below it; one that ends above the
+    hips, or reaches the knees and below, is built exactly as far as it
+    goes. A bust by request is cut at the hip line too. Returns the outline
+    and "torso" (ends at or above the hip line) or "photo" (goes past the
+    knees)."""
+    bottom = int(np.flatnonzero(mask.any(axis=1))[-1])
+    if hip_y is None or bottom <= hip_y:
+        return mask, "torso"
+    if knee_y is not None and not bust_mode and bottom >= hip_y + _KNEE_REACH * (knee_y - hip_y):
+        return mask, "photo"
+    out = mask.copy()
+    out[int(round(hip_y)) + 1:] = False
+    return out, "torso"
 
 
 def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int, scale: float, pad: int,
@@ -1237,8 +1224,22 @@ def build_silhouette_relief_mesh(
         reference = None
     extent = None
     if reference is not None:
-        mask, extent = _reference_extent(reference, mask, bust_mode)
-        bust_mode = bust_mode or extent == "torso"
+        J = reference["joints_px"]
+        hip_y = (J["left_hip"][1] + J["right_hip"][1]) / 2.0
+        knee_y = (J["left_knee"][1] + J["right_knee"][1]) / 2.0
+        mask, extent = _person_extent(mask, hip_y, knee_y, bust_mode)
+        bust_mode = True  # a person ends where the photo (or the hip line) does
+    elif pose and animal_frac <= _CROP_MAX_ANIMAL_FRAC and "left_shoulder" in pose and "right_shoulder" in pose:
+        # a person without a matched reference body: the same rule from the
+        # photo's own pose points (knees not found: estimated from the trunk)
+        hip_y = knee_y = None
+        if "left_hip" in pose and "right_hip" in pose:
+            hip_y = (pose["left_hip"][1] + pose["right_hip"][1]) / 2.0
+            sh_y = (pose["left_shoulder"][1] + pose["right_shoulder"][1]) / 2.0
+            knee_y = ((pose["left_knee"][1] + pose["right_knee"][1]) / 2.0 if "left_knee" in pose and "right_knee" in pose
+                      else hip_y + 0.8 * (hip_y - sh_y))
+        mask, extent = _person_extent(mask, hip_y, knee_y, bust_mode)
+        bust_mode = True
     elif not bust_mode:
         mask = _detect_crop_and_extend(mask, animal_frac=animal_frac)
 
@@ -1330,7 +1331,7 @@ def build_silhouette_relief_mesh(
     else:
         front0, back0 = half_thickness_raw, -half_thickness_raw
     ref = (_reference_surfaces(reference, grid_mask, y0, x0, scale, pad, face_mesh)
-           if reference is not None and layout is not None else None)
+           if reference is not None else None)
     photo_cells = grid_mask
     if ref is not None:
         rf, rb, cov = ref
@@ -1345,10 +1346,6 @@ def build_silhouette_relief_mesh(
         ring = cov & (distance_transform_edt(~grid_mask) <= 2.0)
         wide_gap = binary_opening(grid_mask & ~cov, iterations=2)
         grid_mask = ring | wide_gap
-        # below the photo's bottom edge the outline was only a guess at the
-        # legs; the reference's own legs replace it
-        synthetic = (y0 + (np.arange(gh) - pad) / scale) >= orig_h
-        grid_mask[synthetic] = cov[synthetic]
         grid_mask[:pad], grid_mask[-pad:], grid_mask[:, :pad], grid_mask[:, -pad:] = False, False, False, False
         inside = grid_mask & cov
         # keep the outline-based body's depth position; the reference's shape
