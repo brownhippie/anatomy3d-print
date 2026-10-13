@@ -440,6 +440,34 @@ def _three_views(mesh: trimesh.Trimesh, floor: float, sil, zf, px, size: "tuple[
     return canvas
 
 
+FACE_REGIONS = {
+    "eyes": [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7,
+             263, 466, 388, 387, 386, 385, 384, 398, 362, 382, 381, 380, 374, 373, 390, 249],
+    "brows": [70, 63, 105, 66, 107, 46, 53, 52, 65, 55, 300, 293, 334, 296, 336, 276, 283, 282, 295, 285],
+    "nose": [168, 6, 197, 195, 5, 4, 1, 19, 94, 2, 98, 327, 64, 294, 48, 278],
+    "mouth": [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146,
+              78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95],
+    "jaw": [234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288, 361, 323, 454],
+}
+
+
+def _face_part_errors(src: np.ndarray, dst: np.ndarray) -> dict:
+    """Per part of the face: the model's face points (found on its render)
+    against the photo's, after one alignment of the whole face; % of the
+    eye distance. Plus how open the mouth and eyes are, model vs photo."""
+    a, b = src - src.mean(0), dst - dst.mean(0)
+    u, s_, vt = np.linalg.svd(a.T @ b)
+    al = (s_.sum() / (a ** 2).sum()) * a @ (u @ vt)
+    eye = np.linalg.norm(dst[33] - dst[263])
+    out = {f"face_err_{k}": round(100.0 * float(np.linalg.norm(al[idx] - b[idx], axis=1).mean() / eye), 1)
+           for k, idx in FACE_REGIONS.items()}
+    ratio = lambda q, i, j, k, l: np.linalg.norm(q[i] - q[j]) / max(np.linalg.norm(q[k] - q[l]), 1e-6)  # noqa: E731
+    out["mouth_open_diff"] = round(float(abs(ratio(src, 13, 14, 78, 308) - ratio(dst, 13, 14, 78, 308))), 3)
+    out["eyes_open_diff"] = round(float(abs(ratio(src, 159, 145, 33, 133) - ratio(dst, 159, 145, 33, 133))
+                                        + abs(ratio(src, 386, 374, 263, 362) - ratio(dst, 386, 374, 263, 362))) / 2, 3)
+    return out
+
+
 def _procrustes_nme(src: np.ndarray, dst: np.ndarray) -> float:
     a, b = src - src.mean(0), dst - dst.mean(0)
     u, s, vt = np.linalg.svd(a.T @ b)
@@ -491,6 +519,7 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
             m["face_found"] = got is not None
             if got is not None:
                 m["face_err_pct"] = round(_procrustes_nme(got[:468, :2], inputs.face_mesh[:468, :2]), 1)
+                m.update(_face_part_errors(got[:468, :2], inputs.face_mesh[:468, :2]))
 
     s = m["shape_iou"] - 4.0 * m["spike_pct"] - (25.0 if not m["watertight"] else 0.0) - (20.0 if m["min_wall_mm"] < 0.8 else 0.0)
     if m.get("face_err_pct") is not None:

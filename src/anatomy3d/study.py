@@ -45,10 +45,12 @@ THUMB = (720, 480)
 HELD_W = 0.3
 BUMP_W = 3.0
 FLOW_W = 0.1
+OPEN_W = 20.0  # mouth and eyes as open as in the photo (lid / lip gap over width)
 BUMP_MM = 0.4  # bumps: % of the surface standing off its smoothed copy by more than this
 OBJECTIVE = (f"study score = Lab score + {HELD_W} × held mean − {BUMP_W} × bumps "
              f"(% of the sides, back and top standing more than {BUMP_MM} mm off a smoothed copy of themselves) "
-             f"+ {FLOW_W} × hair flow (the model's strands along the photo's, −100…100)")
+             f"+ {FLOW_W} × hair flow (the model's strands along the photo's, −100…100) "
+             f"− {OPEN_W} × (how much more or less open the mouth and eyes are than in the photo)")
 
 
 # ---------------------------------------------------------------- critics
@@ -139,7 +141,8 @@ def hair_flow(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -
 
 def objective(m: dict) -> float:
     return float(m.get("score", -100.0) + HELD_W * m.get("held_mean", 0.0) - BUMP_W * m.get("bumps", 0.0)
-                 + FLOW_W * m.get("hair_flow", 0.0))
+                 + FLOW_W * m.get("hair_flow", 0.0)
+                 - OPEN_W * (m.get("mouth_open_diff", 0.0) + m.get("eyes_open_diff", 0.0)))
 
 
 def evaluate(inputs: "lab.LabInputs", values: dict):
@@ -279,7 +282,9 @@ def finish_candidate(st: dict) -> dict:
     mean = float(np.mean(list(per.values()))) if per else -100.0
     line = {"i": st["evals"], "at": time.time(), "change": c["change"], "step": st["step"], "per_photo": per,
             "objective": round(mean, 2), "complete": complete,
-            "metrics": {pid: {k: r.get(k) for k in ("score", "held_mean", "bumps", "shape_iou", "face_err_pct", "spike_pct", "error")}
+            "metrics": {pid: {k: r.get(k) for k in ("score", "held_mean", "bumps", "shape_iou", "face_err_pct", "spike_pct", "hair_flow",
+                                                    "face_err_eyes", "face_err_brows", "face_err_nose", "face_err_mouth", "face_err_jaw",
+                                                    "mouth_open_diff", "eyes_open_diff", "error")}
                         for pid, r in c["results"].items()}}
     if c.get("role"):
         # the same values built again with new code

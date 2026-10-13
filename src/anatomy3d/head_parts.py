@@ -214,4 +214,11 @@ def detect_head_parts(rgb: np.ndarray, face_mesh: Optional[np.ndarray]) -> Optio
         hair = read_hair(rgb, out, (sx0, sy0, sx1, sy1), face_mesh, HAIR, HAT)
     except Exception:  # noqa: BLE001 - the hair's volume is still built without its pattern
         hair = None
-    return {"labels": out, "box": (sx0, sy0, sx1, sy1), "found": found, "hair": hair}
+    face = None
+    try:
+        from .face_parts import read_face
+
+        face = read_face(rgb, face_mesh, out)
+    except Exception:  # noqa: BLE001 - the face keeps its landmark shape without its parts
+        face = None
+    return {"labels": out, "box": (sx0, sy0, sx1, sy1), "found": found, "hair": hair, "face": face}

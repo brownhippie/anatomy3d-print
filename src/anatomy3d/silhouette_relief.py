@@ -858,6 +858,22 @@ _HAIR_CURL_DEPTH = 0.0025  # ... and stands this proud
 _HAIR_COIL = 0.006  # tight coils: this across ...
 _HAIR_COIL_DEPTH = 0.0015  # ... this proud
 _HAIRLINE_EDGE = 0.004  # the pattern ends over this at the hairline
+# Each part of the face, read from the photo (face_parts.py) and shaped by
+# _face_parts_relief, metres on the person:
+_EYE_INSET = 0.0015  # an open eye's ball sits this far behind its lids, rounding up to them
+_IRIS_DEPTH = 0.0004  # the iris, carved this shallow (a sculptor's eye)
+_LID_CREASE = 0.0006  # the crease above the upper lid
+_LID_LINE = 0.0005  # a closed eye's lid line
+_BROW_HEIGHT = 0.0012  # eyebrow hair stands this proud
+_NOSTRIL_DEPTH = 0.003  # a nostril's hollow
+_LIP_RIM = 0.0004  # the lips' edge stands this proud
+_MOUTH_LINE = 0.0008  # a closed mouth's line between the lips
+_MOUTH_DEPTH = 0.008  # an open mouth's dark, this far in
+_TEETH_INSET = 0.002  # teeth sit this far behind the lips
+_TONGUE_INSET = 0.004  # the tongue this far
+_SCAR_DEPTH = 0.0005  # a scar's groove
+_BEARD_THICK = 0.004  # a beard or moustache stands this proud
+_STUBBLE_DEPTH = 0.0003  # stubble's grain
 # how much of each a kind of hair gets: strands, waves, curls, coils
 _HAIR_KIND_MIX = {"sleek": (0.35, 0, 0, 0), "straight": (1, 0, 0, 0), "wavy": (0.8, 1, 0, 0),
                   "curly": (0.25, 0, 1, 0), "coily": (0, 0, 0, 1)}
@@ -1775,6 +1791,112 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
     return Rf, Rb
 
 
+def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int,
+                       px_per_m: float) -> np.ndarray:
+    """Offsets (photo px, toward the camera) for the face's parts on top of
+    the landmark relief: eyeballs behind their lids, irises, lid creases or
+    a closed lid's line, eyebrow hair, nostrils, the lips' edge, a closed
+    mouth's line or an open mouth's dark with its teeth and tongue set in,
+    scars, a beard, moustache or stubble."""
+    gh, gw = grid_shape
+    out = np.zeros((gh, gw))
+    if not reading:
+        return out
+    bx0, by0, bx1, by1 = reading["box"]
+    rr, cc = np.mgrid[0:gh, 0:gw]
+    py = (y0 + (rr - pad) / scale - by0).astype(np.float64)  # in the reading's box
+    px = (x0 + (cc - pad) / scale - bx0).astype(np.float64)
+    inbox = (py >= 0) & (py < by1 - by0 - 1) & (px >= 0) & (px < bx1 - bx0 - 1)
+    if not inbox.any():
+        return out
+    r0, r1 = np.flatnonzero(inbox.any(axis=1))[[0, -1]]
+    c0, c1 = np.flatnonzero(inbox.any(axis=0))[[0, -1]]
+    sub = (slice(r0, r1 + 1), slice(c0, c1 + 1))
+    PY, PX = py[sub], px[sub]
+    m = lambda v: v * px_per_m  # noqa: E731 - metres -> photo px
+    cell = 1.0 / scale  # photo px per grid cell
+
+    def sample(mask):
+        if mask is None:
+            return np.zeros(PY.shape)
+        a = map_coordinates(np.asarray(mask, np.float32), [PY, PX], order=1, mode="constant")
+        return gaussian_filter(a, 0.7)
+
+    def line(points, width_px):
+        """A soft line through `points` (photo px, the reading's box frame)."""
+        acc = np.zeros(PY.shape)
+        pts = np.asarray(points, np.float64)
+        for a, b_ in zip(pts[:-1], pts[1:]):
+            n = max(int(np.hypot(*(b_ - a)) / max(cell, 0.5)) + 1, 2)
+            for t in np.linspace(0, 1, n):
+                x, y = a * (1 - t) + b_ * t
+                acc = np.maximum(acc, np.exp(-((PX - x) ** 2 + (PY - y) ** 2) / (2 * max(width_px, 0.5) ** 2)))
+        return acc
+
+    f = np.asarray(face_mesh)[:, :2] - [bx0, by0]
+    rel = np.zeros(PY.shape)
+    # eyes
+    from .face_parts import EYE
+
+    for s_, e in reading.get("eyes", {}).items():
+        op = sample(e["opening"])
+        if e["open"]:
+            d = distance_transform_edt(e["opening"]) if e["opening"].any() else None
+            if d is not None and d.max() > 0:
+                dome = map_coordinates(np.sqrt(np.clip(d / d.max(), 0, 1)).astype(np.float32), [PY, PX], order=1, mode="constant")
+                rel -= op * m(_EYE_INSET) * (1.0 - dome)
+            ix, iy = e["iris"][0] - bx0, e["iris"][1] - by0
+            ri = max(e["iris_r_px"], 1.0)
+            rel -= op * m(_IRIS_DEPTH) * np.clip(1.0 - np.hypot(PX - ix, PY - iy) / ri, 0, 1) ** 0.5
+            upper = f[EYE[s_][:9]]
+            eye_w = float(np.ptp(upper[:, 0]))
+            rel -= m(_LID_CREASE) * line(upper - [0, 0.18 * eye_w], 0.02 * eye_w) * (1 - op)
+        else:
+            lid = f[EYE[s_][:9]]
+            rel -= m(_LID_LINE) * line(lid, 0.02 * float(np.ptp(lid[:, 0])))
+    # eyebrows
+    for b_ in reading.get("brows", {}).values():
+        rel += m(_BROW_HEIGHT) * gaussian_filter(sample(b_["mask"]), 1.0)
+    # nostrils
+    for n_ in reading.get("nostrils", []):
+        nx_, ny_ = n_["c"][0] - bx0, n_["c"][1] - by0
+        rel -= m(_NOSTRIL_DEPTH) * np.exp(-((PX - nx_) ** 2 + (PY - ny_) ** 2) / (2 * max(n_["r"], 1.0) ** 2))
+    # lips and mouth
+    from .face_parts import INNER_LIPS, OUTER_LIPS
+
+    mouth = reading.get("mouth", {})
+    size = reading.get("size_px", 100.0)
+    if not reading.get("masked"):
+        rel += m(_LIP_RIM) * line(np.vstack([f[OUTER_LIPS], f[OUTER_LIPS[:1]]]), 0.006 * size)
+        if mouth.get("open") and "inside" in mouth:
+            inside = sample(mouth["inside"])
+            depth = np.full(PY.shape, m(_MOUTH_DEPTH))
+            depth = np.where(sample(mouth["tongue"]) > 0.5, m(_TONGUE_INSET), depth)
+            depth = np.where(sample(mouth["teeth"]) > 0.5, m(_TEETH_INSET), depth)
+            rel -= inside * gaussian_filter(depth, 0.8)
+        else:
+            rel -= m(_MOUTH_LINE) * line(f[INNER_LIPS[:11]], 0.006 * size)
+    # scars
+    for sc in reading.get("scars", []):
+        pts = np.asarray(sc["points"]) - [bx0, by0]
+        if len(pts) > 1:
+            order = np.argsort(pts[:, 0] if np.ptp(pts[:, 0]) >= np.ptp(pts[:, 1]) else pts[:, 1])
+            rel -= m(_SCAR_DEPTH) * line(pts[order][:: max(1, len(pts) // 40)], max(sc["width_px"] / 2, 1.0))
+    # facial hair
+    fh = reading.get("facial_hair", {})
+    for k in ("beard", "moustache"):
+        if fh.get(k) is not None:
+            rel += m(_BEARD_THICK) * gaussian_filter(sample(fh[k]), 1.5)
+    if fh.get("stubble", 0) > 0:
+        from .face_parts import _poly
+
+        jaw = sample(_poly((by1 - by0, bx1 - bx0), f[[172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 291, 0, 61]]))
+        grain = gaussian_filter(np.random.default_rng(2).standard_normal(PY.shape), 0.6)
+        rel += fh["stubble"] * m(_STUBBLE_DEPTH) * jaw * grain / (grain.std() + 1e-9)
+    out[sub] = np.where(inbox[sub], rel, 0.0)
+    return out
+
+
 def _wear_on_face(front: np.ndarray, grid_mask: np.ndarray, parts_g: np.ndarray, scale: float, px_per_m: float) -> np.ndarray:
     """What's worn on the face, on the front surface (photo px, toward the
     camera): a face mask is cloth stretched from the nose over the mouth to
@@ -2490,6 +2612,19 @@ def build_silhouette_relief_mesh(
         back = mid - half_span
         if parts_g is not None and ref is not None:
             front = _wear_on_face(front, grid_mask, parts_g, scale, float(reference["px_per_m"]))
+        face_read = (parts or {}).get("face") if parts is not None else None
+        if face_read:
+            try:
+                ppm = float(reference["px_per_m"]) if reference is not None else (
+                    float(np.linalg.norm(face_mesh[10, :2] - face_mesh[152, :2])) / 0.18)
+                fp = _face_parts_relief(face_read, face_mesh, (gh, gw), y0, x0, scale, pad, ppm)
+                if parts_g is not None:
+                    from .head_parts import BODY_SKIN, FACE_SKIN, HAIR
+
+                    fp = fp * gaussian_filter(np.isin(parts_g, (FACE_SKIN, BODY_SKIN, HAIR)).astype(np.float32), 1.0)
+                front = np.where(grid_mask, front + fp, front)
+            except Exception as exc:  # noqa: BLE001 - the face keeps its landmark shape
+                print(f"Note: face parts skipped ({exc}).")
         if hair_rel is not None:
             front = np.where(grid_mask, front + hair_rel[0], front)
             back = np.where(grid_mask, back - hair_rel[1], back)
