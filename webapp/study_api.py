@@ -124,6 +124,94 @@ def clear_idle_caches() -> None:
             shutil.rmtree(d, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- autopilot
+# The server teaches itself: whenever no study runs it judges the last
+# finished one, applies it if it passes (below), and starts the next on the
+# same photos with the next area of numbers, from the values now in use --
+# so every study has to beat what the one before left, and the bar rises
+# by itself. A finished study is applied only when its best beats its start
+# by AUTO_GAIN on the mean and no photo got worse than AUTO_WORST.
+
+AUTO_EVALS = 120
+AUTO_GAIN = 0.5
+AUTO_WORST = 1.0
+AUTO_AREAS = ["hair", "hair pattern", "headwear", "neck", "ears", "clothes", "face"]
+
+
+def _autopilot_path() -> Path:
+    return STUDY_ROOT / "autopilot.json"
+
+
+def autopilot_state() -> dict:
+    return {"on": True, "next": 0, **_read(_autopilot_path(), {})}
+
+
+def _judge(st: dict) -> "tuple[bool, str]":
+    if not st.get("kept") or st.get("best_obj") is None or st.get("base_obj") is None:
+        return False, "nothing kept"
+    gain = st["best_obj"] - st["base_obj"]
+    if gain < AUTO_GAIN:
+        return False, f"gain {gain:.2f} under {AUTO_GAIN}"
+    worst = min(st["best_per_photo"].get(k, -1e9) - v for k, v in st["base_per_photo"].items())
+    if worst < -AUTO_WORST:
+        return False, f"a photo got worse by {-worst:.2f}"
+    return True, f"gain {gain:.2f}, no photo worse than {-min(worst, 0):.2f}"
+
+
+def autopilot_step(generation_lock: threading.Lock) -> bool:
+    """Called by the worker when no study runs. True if it did something."""
+    ap = autopilot_state()
+    if not ap["on"]:
+        return False
+    studies = []
+    for d in STUDY_ROOT.iterdir():
+        st = _read(d / "state.json", None) if d.is_dir() else None
+        if st:
+            studies.append((st["created"], d, st))
+    if not studies:
+        return False  # needs a first study (its photos) from someone
+    studies.sort(key=lambda t: t[0])
+    _, d, st = studies[-1]
+    if st["status"] == "paused":
+        return False  # paused by hand: leave it
+    if st["status"] == "done" and not st.get("judged"):
+        ok, why = _judge(st)
+        if ok:
+            values = {**knobs.current(), **st["x"]}
+            with generation_lock:
+                _tuned_status.update(knobs.save_tuned(values, source=f"study {st['sid']} (applied by itself)"))
+            st["applied"] = time.time()
+        st["judged"] = {"applied": ok, "why": why, "at": time.time()}
+        with _lock:
+            _write(d / "state.json", st)
+        return True
+    if st["status"] != "done":
+        return False
+    # the next study: same photos, next area, from the values in use now
+    area = AUTO_AREAS[ap["next"] % len(AUTO_AREAS)]
+    sid = uuid.uuid4().hex[:10]
+    nd = STUDY_ROOT / sid
+    (nd / "p").mkdir(parents=True)
+    for p in st["photos"]:
+        shutil.copy2(d / "p" / p["file"], nd / "p" / p["file"])
+    new = study.new_state(sid, st["photos"], [area], AUTO_EVALS, seed=int(time.time()) % 1000)
+    new["started"] = time.time()
+    new["auto"] = True
+    with _lock:
+        _write(nd / "state.json", new)
+        _write(_autopilot_path(), {**ap, "next": ap["next"] + 1})
+    return True
+
+
+@router.post("/autopilot")
+def set_autopilot(on: bool = True):
+    ap = autopilot_state()
+    ap["on"] = bool(on)
+    with _lock:
+        _write(_autopilot_path(), ap)
+    return ap
+
+
 def load_tuned_at_startup() -> None:
     _tuned_status.update(knobs.load_tuned())
 
@@ -147,7 +235,11 @@ def work_one(sid: str, generation_lock: threading.Lock) -> None:
         st = _read(d / "state.json", None)
     if not st or st.get("status") != "running":
         return
-    if st["cand"] is None and st["best_obj"] is not None and _repair(sid, st, generation_lock):
+    if st["cand"] is None and study.rebase_if_code_changed(st):
+        with _lock:
+            _write(d / "state.json", st)
+        return
+    if st["cand"] is None and st["best_obj"] is not None and not st.get("rebase") and _repair(sid, st, generation_lock):
         return
     if st["cand"] is None:
         st["cand"] = study.next_candidate(st)
@@ -175,10 +267,12 @@ def work_one(sid: str, generation_lock: threading.Lock) -> None:
         first = st["best_obj"] is None
         line = study.finish_candidate(st)
         t = _renders(sid)
+        role = str(line.get("kept", ""))
         if first and (t / "base").is_dir():
             shutil.copytree(t / "base", t / "best", dirs_exist_ok=True)
-        elif line.get("kept") is True and (t / "cand").is_dir():
-            shutil.copytree(t / "cand", t / "best", dirs_exist_ok=True)
+        elif (line.get("kept") is True or role.startswith("rebuilt")) and (t / "cand").is_dir():
+            dest = "base" if role == "rebuilt base (new code)" else "best"
+            shutil.copytree(t / "cand", t / dest, dirs_exist_ok=True)
         shutil.rmtree(t / "cand", ignore_errors=True)
     with _lock:
         now = _read(d / "state.json", {})
@@ -194,6 +288,15 @@ def work_one(sid: str, generation_lock: threading.Lock) -> None:
 # ---------------------------------------------------------------- API
 
 
+MIN_ABOVE_START = 0.5  # by default a study shows only what beats its start by this
+
+
+def _min_score(st: dict) -> Optional[float]:
+    if st.get("min_score") is not None:
+        return float(st["min_score"])
+    return None if st.get("base_obj") is None else round(float(st["base_obj"]) + MIN_ABOVE_START, 2)
+
+
 def _summary(st: dict) -> dict:
     return {
         "sid": st["sid"], "status": st["status"], "created": st["created"], "areas": st["areas"],
@@ -201,7 +304,7 @@ def _summary(st: dict) -> dict:
         "evals": st["evals"], "max_evals": st["max_evals"], "round": st["round"], "step": st["step"],
         "base_obj": st["base_obj"], "best_obj": st["best_obj"], "kept": len(st["kept"]),
         "building": None if st["cand"] is None else {"change": st["cand"]["change"], "done": len(st["cand"]["results"])},
-        "applied": st.get("applied"),
+        "applied": st.get("applied"), "judged": st.get("judged"), "auto": st.get("auto", False),
     }
 
 
@@ -213,10 +316,40 @@ def list_studies():
         if st:
             out.append(_summary(st))
     tuned = knobs.read_tuned()
-    return {"studies": out, "areas": knobs.AREAS, "objective": study.OBJECTIVE,
+    return {"studies": out, "areas": knobs.AREAS, "objective": study.OBJECTIVE, "autopilot": autopilot_state(),
+            "auto_rule": f"applies a finished study by itself when its mean beats its start by {AUTO_GAIN} and no photo got worse than {AUTO_WORST}",
             "tuned": {"source": tuned.get("source"), "at": tuned.get("at"), "values": tuned.get("values", {}),
                       "stale": _tuned_status["stale"]},
             "free_mb": round(_free() / 1e6)}
+
+
+@router.get("/checklist")
+def checklist():
+    """Everything being taught (anatomy3d/curriculum.py), with what the
+    studies have done for each item's numbers."""
+    from anatomy3d import curriculum
+
+    kept, tried = {}, {}
+    for d in STUDY_ROOT.iterdir():
+        st = _read(d / "state.json", None) if d.is_dir() else None
+        if not st:
+            continue
+        for key in st.get("keys", []):
+            tried[key] = tried.get(key, 0) + 1
+        for k in st.get("kept", []):
+            kept.setdefault(k["key"], []).append(round(float(k["gain"]), 2))
+    out, groups = [], {}
+    for it in curriculum.items():
+        g = groups.setdefault(it.group, {"group": it.group, "total": 0, "done": 0, "studied": 0})
+        g["total"] += 1
+        g["done"] += it.done()
+        studied = any(k in tried for k in it.knobs)
+        g["studied"] += studied
+        out.append({"id": it.id, "group": it.group, "name": it.name, "read": it.read, "sculpt": it.sculpt,
+                    "knobs": len(it.knobs), "critic": it.critic, "note": it.note, "rig": it.rig, "done": it.done(),
+                    "studied": studied, "kept_gains": [g_ for k in it.knobs for g_ in kept.get(k, [])]})
+    return {"groups": list(groups.values()), "items": out,
+            "total": len(out), "done": sum(i["done"] for i in out)}
 
 
 @router.post("")
@@ -258,16 +391,23 @@ def get_study(sid: str, log: int = 60):
     if p.exists():
         lines = [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
     t = _renders(sid)
+    floor = _min_score(st)
+    shown = [x for x in lines if x.get("kept") == "baseline" or str(x.get("kept", "")).startswith("rebuilt")
+             or floor is None or x.get("objective", -1e9) >= floor]
+    kept_shown = [k for k in st["kept"] if floor is None or k["objective"] >= floor]
     return {
         **_summary(st),
+        "min_score": floor,
+        "hidden": {"moves": len(lines) - len(shown), "kept": len(st["kept"]) - len(kept_shown)},
+        "apply_ok": bool(st["kept"]) and st["best_obj"] is not None and (floor is None or st["best_obj"] >= floor),
         "objective_formula": study.OBJECTIVE,
         "values": study.summary_values(st),
-        "kept_moves": st["kept"],
+        "kept_moves": kept_shown,
         "base_per_photo": st["base_per_photo"], "best_per_photo": st["best_per_photo"],
         "renders": {p["id"]: {w: f"/api/study/{sid}/render/{w}/{p['id']}.png" for w in ("base", "best")
                               if (t / w / f"{p['id']}.png").exists()} for p in st["photos"]},
-        "log": lines[-max(0, min(log, 500)):],
-        "log_count": len(lines),
+        "log": shown[-max(0, min(log, 500)):],
+        "log_count": len(shown),
     }
 
 
@@ -306,6 +446,18 @@ def clear_tuned():
     return {"ok": True}
 
 
+@router.post("/{sid}/threshold")
+def threshold(sid: str, value: Optional[float] = None):
+    """Only results scoring at least `value` show (and can be applied);
+    no value: back to the default (the start + MIN_ABOVE_START)."""
+    d = _dir(sid)
+    with _lock:
+        st = _read(d / "state.json", {})
+        st["min_score"] = value
+        _write(d / "state.json", st)
+    return {"min_score": _min_score(st)}
+
+
 @router.post("/{sid}/{action}")
 def control(sid: str, action: str):
     d = _dir(sid)
@@ -314,6 +466,9 @@ def control(sid: str, action: str):
     with _lock:
         st = _read(d / "state.json", {})
         if action == "apply":
+            floor = _min_score(st)
+            if st.get("best_obj") is None or (floor is not None and st["best_obj"] < floor):
+                raise HTTPException(409, f"The best result ({st.get('best_obj')}) is below the minimum score ({floor}).")
             values = {**knobs.current(), **st["x"]}
             with _generation_lock:  # no build mid-way while the numbers change
                 result = knobs.save_tuned(values, source=f"study {sid}")

@@ -200,6 +200,8 @@ def _worker_loop() -> None:
             turn += 1
             housekeeping()
             sid = study_api.active()
+            if sid is None and study_api.autopilot_step(_generation_lock):
+                continue
             run_id = _active_run()
             if sid and (run_id is None or turn % 3):  # a running study gets two turns to a run's one
                 run_id = None
@@ -330,10 +332,20 @@ def _item(run_id: str, r: dict, ratings: dict) -> dict:
 
 
 @router.get("/runs/{run_id}")
-def get_run(run_id: str, sort: str = "score", family: str = "all", offset: int = 0, limit: int = 40, only: str = "all"):
+def get_run(run_id: str, sort: str = "score", family: str = "all", offset: int = 0, limit: int = 40, only: str = "all",
+            min_score: Optional[float] = None):
+    """`min_score`: only combinations scoring at least this show; by
+    default what the production combination scored on this photo (nothing
+    below it is worth a look). Pass a very low number to see everything."""
     d = _run_dir(run_id)
     ratings = _read_json(d / "ratings.json", {})
-    rows = list(_results(d).values())
+    all_rows = list(_results(d).values())
+    prod = next((r for r in all_rows if r["code"] == lab.CODE_PRODUCTION and r["status"] == "ok"), None)
+    floor = min_score if min_score is not None else (prod.get("score") if prod else None)
+    if only == "failed":
+        floor = None  # the failures themselves, unscored
+    rows = [r for r in all_rows if floor is None or (r["status"] == "ok" and (r.get("score") or -1e9) >= floor)
+            or r["code"] in ratings]
     if family in ("C", "O"):
         rows = [r for r in rows if r["code"].startswith(family + "-")]
     if only == "rated":
@@ -356,6 +368,10 @@ def get_run(run_id: str, sort: str = "score", family: str = "all", offset: int =
     return {
         "run": _summary(d),
         "count": len(rows),
+        "min_score": floor,
+        "production_score": prod.get("score") if prod else None,
+        "hidden": len(all_rows) - len([r for r in all_rows if floor is None or (r["status"] == "ok" and (r.get("score") or -1e9) >= floor)
+                                       or r["code"] in ratings]),
         "items": [_item(run_id, r, ratings) for r in rows[offset:offset + limit]],
     }
 

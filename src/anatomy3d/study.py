@@ -34,7 +34,7 @@ import trimesh
 
 from . import knobs, lab
 
-CODE = "O-" + "0" * len(lab.FAMILIES["O"]["dims"])  # the production combination
+CODE = lab.CODE_PRODUCTION
 START_STEP = 0.25  # of a knob's range
 MIN_STEP = 1 / 32
 MIN_GAIN = 0.15  # a move is kept when the mean score rises by more than this
@@ -194,6 +194,34 @@ def prepare(photo_path: str, body: str, cache: Path) -> "lab.LabInputs":
 # ---------------------------------------------------------------- search
 
 
+_CODE_VERSION = None
+
+
+def code_version() -> str:
+    """A hash of the builder's own code: a study's scores only compare
+    within one version of it."""
+    global _CODE_VERSION
+    if _CODE_VERSION is None:
+        import hashlib
+
+        h = hashlib.sha1()
+        for f in sorted(Path(__file__).parent.glob("*.py")):
+            h.update(f.read_bytes())
+        _CODE_VERSION = h.hexdigest()[:12]
+    return _CODE_VERSION
+
+
+def rebase_if_code_changed(st: dict) -> bool:
+    """New code since the study's scores: build its start and its best
+    again before any more moves (else a move would be judged against a
+    score the old code made). True if it queued that."""
+    if st.get("code") == code_version() or st.get("best_obj") is None or st.get("cand") is not None:
+        return False
+    st["code"] = code_version()
+    st["rebase"] = ["base", "best"]
+    return True
+
+
 def new_state(sid: str, photos: list, areas: list, max_evals: int, seed: int = 0) -> dict:
     keys = [k.key for k in knobs.KNOBS if k.area in areas]
     base = knobs.current()
@@ -202,7 +230,7 @@ def new_state(sid: str, photos: list, areas: list, max_evals: int, seed: int = 0
         "keys": keys, "base": {k: base[k] for k in keys}, "x": {k: base[k] for k in keys},
         "step": START_STEP, "round": 0, "evals": 0, "max_evals": max_evals, "seed": seed,
         "queue": [], "improved": False, "best_obj": None, "base_obj": None, "best_per_photo": {}, "base_per_photo": {},
-        "cand": None, "kept": [],
+        "cand": None, "kept": [], "code": code_version(),
     }
 
 
@@ -215,6 +243,10 @@ def next_candidate(st: dict) -> Optional[dict]:
     """The next move to try, or None when the study is finished."""
     if st["best_obj"] is None:
         return {"values": dict(st["x"]), "change": None, "results": {}}
+    if st.get("rebase"):
+        role = st["rebase"][0]
+        values = {**st["x"], **st["base"]} if role == "base" else dict(st["x"])
+        return {"values": values, "change": None, "role": role, "results": {}}
     while True:
         if st["evals"] >= st["max_evals"]:
             return None
@@ -249,6 +281,15 @@ def finish_candidate(st: dict) -> dict:
             "objective": round(mean, 2), "complete": complete,
             "metrics": {pid: {k: r.get(k) for k in ("score", "held_mean", "bumps", "shape_iou", "face_err_pct", "spike_pct", "error")}
                         for pid, r in c["results"].items()}}
+    if c.get("role"):
+        # the same values built again with new code
+        role = c["role"]
+        st[f"{role}_obj"] = round(mean, 2)
+        st[f"{role}_per_photo"] = dict(per)
+        st["rebase"] = [r for r in st.get("rebase", []) if r != role]
+        line["kept"] = f"rebuilt {role} (new code)"
+        st["cand"] = None
+        return line
     if st["best_obj"] is None:
         st["best_obj"] = st["base_obj"] = round(mean, 2)
         st["best_per_photo"] = dict(per)

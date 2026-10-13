@@ -85,6 +85,7 @@ KNOBS = [
     Knob(_SR, "_REF_EDGE_SLACK", 0.008, 0.025, "clothes", "the body's edge may pass the photo outline by this (m)"),
     Knob(_SR, "_REF_DEPTH_MARGIN", 1.0, 1.2, "clothes", "body depth over the bare reference body"),
     Knob(_SR, "_REF_HEAD_MARGIN", 1.0, 1.12, "clothes", "head depth over the bare reference head"),
+    Knob(_SR, "_REF_HAND_SHRINK", 0.2, 0.5, "clothes", "hands on the body shrunk to this share about the wrist"),
     # face
     Knob(_SR, "_FACE_RELIEF_FADE_FRAC", 0.1, 0.3, "face", "face detail fades out over this share of the face"),
     Knob(_SR, "_FACE_RELIEF_SMOOTH_FRAC", 0.01, 0.03, "face", "face detail smoothing"),

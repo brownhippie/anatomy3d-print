@@ -71,6 +71,9 @@ TEMPLATES = [
 ]
 
 
+CODE_PRODUCTION = "O-" + "0" * len(FAMILIES["O"]["dims"])  # option 0 everywhere: what Generate builds
+
+
 def family_size(fam: str) -> int:
     return int(np.prod([len(d[2]) for d in FAMILIES[fam]["dims"]]))
 

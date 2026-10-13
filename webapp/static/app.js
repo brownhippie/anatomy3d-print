@@ -1015,10 +1015,17 @@ async function labLoadItems(reset) {
   if (!labState.runId) { labGrid.innerHTML = ""; labShowRun(null); return; }
   if (reset) { labState.items = []; labState.offset = 0; }
   const q = new URLSearchParams({ sort: labSort.value, family: labFamily.value, only: labOnly.value, offset: labState.offset, limit: 40 });
+  const labMin = document.getElementById("lab-min");
+  if (labMin.value !== "") q.set("min_score", labMin.value);
   const res = await fetch(`/api/lab/runs/${labState.runId}?${q}`);
   if (!res.ok) { labGrid.innerHTML = ""; return; }
   const data = await res.json();
   labShowRun(data.run);
+  // only what scores above the bar shows (by default: what Generate itself scores on this photo)
+  document.getElementById("lab-min-hint").textContent = data.min_score == null ? "" :
+    `Showing only combinations scoring at least ${data.min_score}` +
+    (labMin.value === "" && data.production_score != null ? " (what Generate itself scores on this photo)" : "") +
+    (data.hidden ? ` · ${data.hidden} below it hidden` : "") + ". Your rated ones always show.";
   labState.count = data.count;
   labState.items = labState.items.concat(data.items);
   labState.offset = labState.items.length;
@@ -1052,7 +1059,7 @@ labGrid.addEventListener("click", (e) => {
   if (card) labOpen(Number(card.dataset.i));
 });
 labMore.addEventListener("click", () => labLoadItems(false));
-[labSort, labFamily, labOnly].forEach((el) => el.addEventListener("change", () => labLoadItems(true)));
+[labSort, labFamily, labOnly, document.getElementById("lab-min")].forEach((el) => el.addEventListener("change", () => labLoadItems(true)));
 labRunSelect.addEventListener("change", () => {
   labState.runId = labRunSelect.value;
   try { localStorage.setItem(LAB_RUN_KEY, labState.runId); } catch (e) { /* ignore */ }

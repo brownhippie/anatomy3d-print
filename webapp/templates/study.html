@@ -51,6 +51,12 @@
     .pill.running { color: var(--ok); border-color: var(--ok); }
     .pill.done { color: var(--accent); border-color: var(--accent); }
     [hidden] { display: none !important; }
+    details.grp { border-top: 1px solid var(--border); padding: 8px 0; }
+    details.grp summary { cursor: pointer; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    details.grp summary .gname { font-weight: 600; min-width: 150px; }
+    .mini { flex: 1 1 120px; max-width: 220px; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+    .mini > div { height: 100%; background: var(--ok); }
+    .yes { color: var(--ok); } .no { color: var(--err); } .na { color: var(--text-dim); }
     @media (max-width: 520px) { .pair { grid-template-columns: 1fr; } }
     @media (min-width: 900px) { .photos { grid-template-columns: 1fr 1fr; } }
   </style>
@@ -70,6 +76,19 @@
     <div class="row"><button id="clear-tuned" hidden>Back to the code's own values</button></div>
   </section>
 
+  <section id="auto">
+    <h2>Teaching itself</h2>
+    <div class="row"><label class="chk"><input type="checkbox" id="ap-on" /> On</label><span class="hint" id="ap-rule"></span></div>
+  </section>
+
+  <section id="checklist">
+    <h2>Checklist: everything being taught</h2>
+    <div class="row" id="cl-total"></div>
+    <div class="bar"><div id="cl-bar"></div></div>
+    <div class="hint">Done = read from the photo, shaped, its numbers open to studies, and a score that measures it (or none needed: "n/a"). Studied = a study has worked on its numbers.</div>
+    <div id="cl-groups"></div>
+  </section>
+
   <section id="study" hidden>
     <div class="row" style="justify-content: space-between">
       <h2>Study</h2>
@@ -78,6 +97,13 @@
     <div class="row" id="stats"></div>
     <div class="bar"><div id="bar"></div></div>
     <div class="hint" id="now"></div>
+    <div class="row">
+      <label class="dim" for="min">Only results scoring at least</label>
+      <input type="number" id="min" step="0.25" style="width: 110px" />
+      <button id="min-set">Set</button>
+      <button id="min-reset">Default</button>
+    </div>
+    <div class="hint" id="min-hint"></div>
     <div class="row">
       <button id="pause">Pause</button>
       <button class="primary" id="apply">Apply the best values</button>
@@ -146,6 +172,8 @@ async function loadList() {
     : `<div class="hint">The code's own values (nothing applied from a study).</div>`;
   if (data.tuned.stale && data.tuned.stale.length) $("tuned").innerHTML += `<div class="hint">Dropped (the code changed since): ${data.tuned.stale.map(short).join(", ")}</div>`;
   $("clear-tuned").hidden = !tv.length;
+  $("ap-on").checked = data.autopilot.on;
+  $("ap-rule").textContent = `When a study finishes, the server ${data.auto_rule}, then starts the next on the same photos with the next area of numbers, from the values in use. Each study must beat the last, so the bar rises by itself.`;
   const sel = $("study-select");
   sel.innerHTML = data.studies.map((s) => `<option value="${s.sid}">${new Date(s.created * 1000).toLocaleString()} · ${s.photos.length} photos · ${s.status}</option>`).join("");
   $("study").hidden = !data.studies.length;
@@ -175,10 +203,14 @@ async function loadStudy() {
     ? (s.building.change ? `Trying ${short(s.building.change[0])}: ${fmt(s.building.change[1])} → ${fmt(s.building.change[2])} (${s.building.done}/${s.photos.length} photos built)` : `Building the starting point (${s.building.done}/${s.photos.length} photos)`)
       + ` · round ${s.round}, step ${fmt(s.step)} of each range`
     : s.status === "done" ? "Finished." : "";
+  if (document.activeElement !== $("min")) $("min").value = s.min_score ?? "";
+  $("min-hint").textContent = s.min_score == null ? "The bar is set once the starting score is in." :
+    `Showing and applying only results at or above ${s.min_score}` + (s.hidden.moves || s.hidden.kept ? ` · hidden below it: ${s.hidden.moves} moves, ${s.hidden.kept} kept` : "") + ".";
   $("pause").textContent = s.status === "running" ? "Pause" : "Resume";
   $("pause").disabled = s.status === "done";
-  $("apply").disabled = !s.kept;
-  $("action-hint").textContent = s.applied ? `Applied ${new Date(s.applied * 1000).toLocaleString()}.` : "";
+  $("apply").disabled = !s.apply_ok;
+  $("action-hint").textContent = (s.applied ? `Applied ${new Date(s.applied * 1000).toLocaleString()}. ` : "") +
+    (s.judged ? `Judged by itself: ${s.judged.applied ? "applied" : "not applied"} (${s.judged.why}).` : "");
   $("photos").innerHTML = s.photos.map((p) => {
     const r = s.renders[p.id] || {};
     const b = s.base_per_photo[p.id], n = s.best_per_photo[p.id];
@@ -198,13 +230,34 @@ async function loadStudy() {
       changed.map((v) => `<tr><td>${esc(short(v.key))}</td><td>${v.area}</td><td>${fmt(v.base)}</td><td>${fmt(v.best)}</td><td>${fmt(v.lo)}–${fmt(v.hi)}</td><td class="what">${esc(v.what)}</td></tr>`).join("")
     : `<tr><td class="dim">None yet.</td></tr>`;
   $("log").innerHTML = "<tr><th>#</th><th>Move</th><th>Score</th><th>Kept</th></tr>" +
-    s.log.slice().reverse().map((l) => `<tr><td>${l.i}</td><td>${l.change ? `${esc(short(l.change[0]))} ${fmt(l.change[1])} → ${fmt(l.change[2])}` : "start"}</td><td>${l.objective}${l.complete ? "" : " (dropped early)"}</td><td>${l.kept === true ? `<span class="up">+${l.gain}</span>` : l.kept === "baseline" ? "start" : "–"}</td></tr>`).join("");
+    s.log.slice().reverse().map((l) => `<tr><td>${l.i}</td><td>${l.change ? `${esc(short(l.change[0]))} ${fmt(l.change[1])} → ${fmt(l.change[2])}` : "start"}</td><td>${l.objective}${l.complete ? "" : " (dropped early)"}</td><td>${l.kept === true ? `<span class="up">+${l.gain}</span>` : l.kept === "baseline" ? "start" : typeof l.kept === "string" ? esc(l.kept) : "–"}</td></tr>`).join("");
   $("formula").textContent = s.objective_formula;
   clearTimeout(timer);
   if (s.status === "running") timer = setTimeout(loadStudy, 15000);
 }
 
 $("study-select").onchange = (e) => { current = e.target.value; loadStudy(); };
+$("min-set").onclick = async () => {
+  if ($("min").value === "") return;
+  await api(`/api/study/${current}/threshold?value=${encodeURIComponent($("min").value)}`, { method: "POST" });
+  loadStudy();
+};
+$("min-reset").onclick = async () => { await api(`/api/study/${current}/threshold`, { method: "POST" }); $("min").value = ""; loadStudy(); };
+
+const mark = (v) => (v === true ? `<span class="yes">✓</span>` : v === false ? `<span class="no">✗</span>` : `<span class="na">n/a</span>`);
+async function loadChecklist() {
+  const c = await api("/api/study/checklist");
+  $("cl-total").innerHTML = `<div class="stat"><span>Done</span><span class="big">${c.done} / ${c.total}</span></div>`;
+  $("cl-bar").style.width = `${(100 * c.done) / c.total}%`;
+  const open = new Set([...document.querySelectorAll("details.grp[open]")].map((d) => d.dataset.g));
+  $("cl-groups").innerHTML = c.groups.map((g) => {
+    const rows = c.items.filter((i) => i.group === g.group).map((i) =>
+      `<tr><td>${esc(i.name)}</td><td>${mark(i.read)}</td><td>${mark(i.sculpt)}</td><td>${i.knobs ? `<span class="yes">${i.knobs}</span>` : i.sculpt === "n/a" || i.group.startsWith("Bones") ? '<span class="na">–</span>' : '<span class="no">✗</span>'}</td><td>${mark(i.critic)}</td>
+       <td>${i.done ? '<span class="yes">done</span>' : '<span class="no">to do</span>'}</td><td>${i.studied ? (i.kept_gains.length ? `<span class="up">${i.kept_gains.length} kept</span>` : "yes") : "–"}</td><td class="what">${esc(i.note)}${i.rig ? ` <span class="dim">· rig: ${esc(i.rig)}</span>` : ""}</td></tr>`).join("");
+    return `<details class="grp" data-g="${esc(g.group)}" ${open.has(g.group) ? "open" : ""}><summary><span class="gname">${esc(g.group)}</span><span class="dim">${g.done} / ${g.total} done · ${g.studied} studied</span><span class="mini"><div style="width:${(100 * g.done) / g.total}%"></div></span></summary>
+      <div class="scroll"><table><tr><th>Item</th><th>Read</th><th>Shaped</th><th>Numbers</th><th>Score</th><th></th><th>Studied</th><th>Note</th></tr>${rows}</table></div></details>`;
+  }).join("");
+}
 $("pause").onclick = async () => {
   const s = await api(`/api/study/${current}`);
   await api(`/api/study/${current}/${s.status === "running" ? "pause" : "resume"}`, { method: "POST" });
@@ -212,10 +265,13 @@ $("pause").onclick = async () => {
 };
 $("apply").onclick = async () => {
   $("apply").disabled = true;
-  await api(`/api/study/${current}/apply`, { method: "POST" });
-  $("action-hint").textContent = "Applied: every build from now on uses these values.";
+  try {
+    await api(`/api/study/${current}/apply`, { method: "POST" });
+    $("action-hint").textContent = "Applied: every build from now on uses these values.";
+  } catch (e) { $("action-hint").textContent = e.message; }
   loadList();
 };
+$("ap-on").onchange = async () => { await api(`/api/study/autopilot?on=${$("ap-on").checked}`, { method: "POST" }); loadList(); };
 $("clear-tuned").onclick = async () => { await api("/api/study/tuned/clear", { method: "POST" }); loadList(); };
 $("copy").onclick = async () => {
   const s = await api(`/api/study/${current}?log=0`);
@@ -268,6 +324,7 @@ async function loadHousekeeping() {
 }
 
 loadList().catch((e) => { $("tuned").textContent = e.message; });
+loadChecklist().catch(() => {});
 loadHousekeeping().catch(() => {});
 loadStorage().catch(() => {});
 </script>
