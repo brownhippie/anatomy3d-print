@@ -495,5 +495,11 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
               "head_scale": round(1.0 + float(ph[-1]), 3),
               "matched": bool(kp_med <= _MAX_KP_ERR and inside_frac >= _MIN_INSIDE and lift_med <= _MAX_FOREARM_LIFT[0] and lift_max <= _MAX_FOREARM_LIFT[1]
                              and lean_legs <= _MAX_LEG_LEAN and lean_trunk <= _MAX_TRUNK_LEAN)}
-    return {"matched": report["matched"], "report": report, "vertices": px, "faces": body["faces"], "part_w": body["part_w"],
+    # every keypoint the body knows (photo px x, y, depth), visible or not:
+    # the builder decides from them how much of the body the photo shows
+    # the depth of each vertex's own bones: what the builder scales depth about
+    core_depth = s * (body["skin_w"][:, :, None] * pw[body["skin_idx"]]).sum(1)[:, 1]
+    allkp = (body["kp_w"][..., None] * px[body["kp_idx"]]).sum(1)
+    joints_px = {n: [round(float(a), 1) for a in allkp[i]] for i, n in enumerate(body["kp_names"])}
+    return {"matched": report["matched"], "report": report, "vertices": px, "joints_px": joints_px, "core_depth": core_depth, "faces": body["faces"], "part_w": body["part_w"],
             "part_names": np.array(body["part_names"]), "px_per_m": s}
