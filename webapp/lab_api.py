@@ -198,6 +198,7 @@ def _worker_loop() -> None:
         run_id = None
         try:
             turn += 1
+            housekeeping()
             sid = study_api.active()
             run_id = _active_run()
             if sid and (run_id is None or turn % 3):  # a running study gets two turns to a run's one
@@ -504,3 +505,84 @@ def drop_models(run_id: str):
         tmp.replace(d / "results.jsonl")
     _lab_bytes["total"] = None
     return {"freed_mb": round(freed / 1e6, 1), "free_mb": round(_disk_free() / 1e6)}
+
+
+# ---------------------------------------------------------------- housekeeping
+# The server clears out what nobody needs, on its own, so the volume never
+# fills: rebuilt STLs after a day, study input caches once a study stops,
+# and -- while the volume has under KEEP_FREE left or the Lab's folder is
+# over its cap -- the 3D previews of runs that aren't running, oldest first,
+# then their thumbnails (never a thumbnail you rated). Scores, ratings,
+# photos, studies' results and tuned.json are never touched. Everything
+# removed is logged to housekeeping.jsonl next to the Lab's folder.
+
+KEEP_FREE = float(os.environ.get("ANATOMY3D_KEEP_FREE_GB", "1")) * 1e9
+STL_TTL = 24 * 3600
+HOUSEKEEPING_EVERY = 600
+_housekeeping = {"last": 0.0}
+
+
+def _housekeeping_log() -> Path:
+    return LAB_ROOT.parent / "housekeeping.jsonl"
+
+
+def _note(what: str, freed: int) -> None:
+    if freed <= 0:
+        return
+    try:
+        with open(_housekeeping_log(), "a") as f:
+            f.write(json.dumps({"at": time.time(), "what": what, "freed_mb": round(freed / 1e6, 1)}) + "\n")
+    except OSError:
+        pass
+
+
+def housekeeping(force: bool = False) -> None:
+    now = time.time()
+    if not force and now - _housekeeping["last"] < HOUSEKEEPING_EVERY:
+        return
+    _housekeeping["last"] = now
+    runs = []
+    for d in LAB_ROOT.iterdir():
+        meta = _read_json(d / "meta.json", None) if d.is_dir() else None
+        if meta:
+            runs.append((meta.get("created", 0), d, meta))
+    runs.sort(key=lambda r: r[0])
+    for _, d, _ in runs:
+        old = [p for p in (d / "stl").glob("*.stl") if now - p.stat().st_mtime > STL_TTL] if (d / "stl").is_dir() else []
+        freed = sum(p.stat().st_size for p in old)
+        for p in old:
+            p.unlink(missing_ok=True)
+        _note(f"rebuilt STLs of run {d.name}", freed)
+    study_api.clear_idle_caches()
+
+    def short() -> bool:
+        return _disk_free() < KEEP_FREE or _folder_bytes() > LAB_MAX_BYTES
+
+    idle = [(d, meta) for _, d, meta in runs if meta.get("status") != "running"]
+    for d, _ in idle:
+        if not short():
+            break
+        if (d / "m").is_dir():
+            freed = _bytes(d / "m")
+            drop_models(d.name)
+            _note(f"3D previews of run {d.name}", freed)
+    for d, _ in idle:
+        if not short():
+            break
+        if (d / "t").is_dir():
+            rated = set(_read_json(d / "ratings.json", {}))
+            freed = 0
+            for p in (d / "t").glob("*.png"):
+                if p.stem not in rated:
+                    freed += p.stat().st_size
+                    p.unlink(missing_ok=True)
+            _lab_bytes["total"] = None
+            _note(f"unrated thumbnails of run {d.name}", freed)
+
+
+@router.get("/housekeeping")
+def housekeeping_log(limit: int = 30):
+    p = _housekeeping_log()
+    lines = [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
+    return {"removed": lines[-max(1, min(limit, 200)):][::-1], "keep_free_gb": round(KEEP_FREE / 1e9, 1),
+            "free_mb": round(_disk_free() / 1e6)}

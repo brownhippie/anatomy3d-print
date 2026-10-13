@@ -115,6 +115,11 @@
     <h2>Server storage</h2>
     <div class="hint" id="free"></div>
     <div class="scroll"><table id="storage"></table></div>
+    <details>
+      <summary class="dim">Removed automatically</summary>
+      <div class="hint" id="hk-rule"></div>
+      <div class="scroll"><table id="housekeeping"></table></div>
+    </details>
   </section>
 </div>
 <script>
@@ -254,7 +259,16 @@ async function loadStorage() {
   });
 }
 
+async function loadHousekeeping() {
+  const h = await api("/api/lab/housekeeping");
+  $("hk-rule").textContent = `The server keeps ${h.keep_free_gb} GB free on its own: rebuilt STLs go after a day, a stopped study's cached inputs go, and when space runs short the 3D previews of runs that aren't running go first (oldest first), then their unrated thumbnails. Scores, ratings, photos and approved values stay.`;
+  $("housekeeping").innerHTML = h.removed.length
+    ? "<tr><th>When</th><th>What</th><th>Freed</th></tr>" + h.removed.map((r) => `<tr><td>${new Date(r.at * 1000).toLocaleString()}</td><td>${esc(r.what)}</td><td>${r.freed_mb} MB</td></tr>`).join("")
+    : `<tr><td class="dim">Nothing yet.</td></tr>`;
+}
+
 loadList().catch((e) => { $("tuned").textContent = e.message; });
+loadHousekeeping().catch(() => {});
 loadStorage().catch(() => {});
 </script>
 </body>

@@ -110,6 +110,20 @@ def _repair(sid: str, st: dict, generation_lock: threading.Lock) -> bool:
     return False
 
 
+def clear_idle_caches() -> None:
+    """Renders kept in temp space move to the volume once it has room;
+    inputs cached for studies that aren't running go."""
+    if not CACHE_ROOT.is_dir():
+        return
+    for d in CACHE_ROOT.iterdir():
+        st = _read(STUDY_ROOT / d.name / "state.json", None)
+        if (d / "t").is_dir() and st is not None and _free() > MIN_FREE * 4:
+            shutil.copytree(d / "t", STUDY_ROOT / d.name / "t", dirs_exist_ok=True)
+            shutil.rmtree(d / "t", ignore_errors=True)
+        if st is None or (st.get("status") != "running" and not (d / "t").is_dir()):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def load_tuned_at_startup() -> None:
     _tuned_status.update(knobs.load_tuned())
 
