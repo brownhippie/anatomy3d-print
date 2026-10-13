@@ -45,12 +45,16 @@ THUMB = (720, 480)
 HELD_W = 0.3
 BUMP_W = 3.0
 FLOW_W = 0.1
+FIT_W = 0.5  # the posed body's joints (and bone lengths) on the photo's: its miss, % of the shoulders' width
+LAYER_W = 0.05  # overlaps kept: what lies over what in the photo is in front on the model (0..100)
 OPEN_W = 20.0  # mouth and eyes as open as in the photo (lid / lip gap over width)
 BUMP_MM = 0.4  # bumps: % of the surface standing off its smoothed copy by more than this
 OBJECTIVE = (f"study score = Lab score + {HELD_W} × held mean − {BUMP_W} × bumps "
              f"(% of the sides, back and top standing more than {BUMP_MM} mm off a smoothed copy of themselves) "
              f"+ {FLOW_W} × hair flow (the model's strands along the photo's, −100…100) "
-             f"− {OPEN_W} × (how much more or less open the mouth and eyes are than in the photo)")
+             f"− {OPEN_W} × (how much more or less open the mouth and eyes are than in the photo) "
+             f"+ {LAYER_W} × overlaps kept (% of the photo's sure over/under boundaries the model has the right way round) "
+             f"− {FIT_W} × the posed body's joint miss (% of shoulder width)")
 
 
 # ---------------------------------------------------------------- critics
@@ -139,10 +143,124 @@ def hair_flow(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -
     return {"hair_flow": round(100.0 * float(agree.sum() / (co[hh].sum() + 1e-9)), 1)}
 
 
+def front_in_photo(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs", box, max_px: int = 420):
+    """The model's front as heights over a box of the photo, in the photo's
+    own frame (the model scaled to the subject's height and centred on it,
+    as the Lab aligns them): (z mm, have, k photo px per raster px)."""
+    mask = inputs.photo_mask
+    ys, xs = np.nonzero(mask)
+    my0, my1, mx0, mx1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    v = preview.vertices
+    top = float(v[:, 1].max())
+    above = v[v[:, 1] > floor]
+    mm = (top - floor) / (my1 - my0)
+    mx_c, px_c = (above[:, 0].min() + above[:, 0].max()) / 2, (mx0 + mx1) / 2
+    bx0, by0, bx1, by1 = box
+    k = max(1.0, max(by1 - by0, bx1 - bx0) / max_px)
+    hgt, wid = int(np.ceil((by1 - by0) / k)), int(np.ceil((bx1 - bx0) / k))
+    cen = preview.triangles_center
+    yl, yh = top - (by1 - my0) * mm, top - (by0 - my0) * mm
+    xl, xh = mx_c + (bx0 - px_c) * mm, mx_c + (bx1 - px_c) * mm
+    sel = (cen[:, 1] > yl) & (cen[:, 1] < yh) & (cen[:, 0] > xl) & (cen[:, 0] < xh) & (preview.face_normals[:, 2] > 0.05)
+    z = np.full((hgt, wid), -np.inf)
+    if sel.sum() < 20:
+        return z, np.isfinite(z), k
+    sub = trimesh.Trimesh(v, preview.faces[sel], process=False)
+    pts, _ = trimesh.sample.sample_surface(sub, int(min(4 * hgt * wid, 1_500_000)), seed=0)
+    r = ((top - pts[:, 1]) / mm + my0 - by0) / k
+    c = ((pts[:, 0] - mx_c) / mm + px_c - bx0) / k
+    ok = (r >= 0) & (r < hgt) & (c >= 0) & (c < wid)
+    np.maximum.at(z, (r[ok].astype(int), c[ok].astype(int)), pts[ok, 2])
+    return z, np.isfinite(z), k
+
+
+# which lies over which, for the overlaps check -- only pairs whose order a
+# front photo leaves in no doubt (hair beside a face can be in front of the
+# cheek or behind the head; a hand is skin lying over clothes: left out)
+_OUTER = {
+    "hat": ("hair", "face"), "glasses": ("face",), "mask": ("face",),
+    "jacket": ("shirt", "tshirt", "sweater", "tie", "dress", "trousers", "jeans", "skirt", "shorts"),
+    "suit": ("shirt", "tshirt", "sweater", "tie", "dress", "trousers", "jeans", "skirt", "shorts"),
+    "coat": ("shirt", "tshirt", "sweater", "tie", "dress", "jacket", "suit", "hoodie"),
+    "tie": ("shirt", "tshirt"), "sweater": ("shirt", "tshirt"), "hoodie": ("shirt", "tshirt"),
+    "scarf": ("shirt", "tshirt", "sweater", "jacket", "suit", "coat", "dress", "hoodie", "kimono"),
+    "belt": ("trousers", "jeans", "skirt", "dress", "shorts", "kimono"),
+    "collar": ("neck",),
+}
+LAYER_MIN_MM = 0.1
+
+
+def _codes(inputs: "lab.LabInputs", H: int, W: int):
+    """One name per photo pixel for the overlaps check: the head parts' hat,
+    hair, face, glasses and mask; the garments; 'neck' for skin in the band
+    under the chin, 'collar' for any garment in that band."""
+    from .clothes import GARMENTS, NAMES
+    from .head_parts import FACE_SKIN, GLASSES, HAIR, HAT, MASK
+
+    names = ["", "hat", "hair", "face", "glasses", "mask", "neck", "collar"] + list(GARMENTS)
+    code = np.zeros((H, W), np.uint8)
+    parts = inputs.parts or {}
+    cl = parts.get("clothes")
+    if cl:
+        for i, k in enumerate(NAMES):
+            if k in GARMENTS:
+                code[cl["labels"] == i + 1] = names.index(k)
+        if inputs.face_mesh is not None:
+            fm = np.asarray(inputs.face_mesh)
+            chin, face_h = float(fm[152, 1]), float(np.ptp(fm[:468, 1]))
+            band = (np.arange(H)[:, None] > chin) & (np.arange(H)[:, None] < chin + 0.6 * face_h)
+            skin = cl["labels"] == NAMES.index("skin") + 1
+            code[band & skin] = names.index("neck")
+            code[band & (code >= names.index("collar") + 1)] = names.index("collar")
+    if parts.get("labels") is not None:
+        hl = parts["labels"]
+        for lab_, nm in ((HAT, "hat"), (HAIR, "hair"), (FACE_SKIN, "face"), (GLASSES, "glasses"), (MASK, "mask")):
+            code[hl == lab_] = names.index(nm)
+    return code, names
+
+
+def layering(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
+    """Where the photo shows one thing surely over another (a hat over hair,
+    glasses or a mask on the face, a jacket over the shirt, a tie on it, a
+    scarf over clothes, a belt round trousers, a collar round the neck): %
+    of those boundary points where the model has the outer one in front."""
+    from scipy.ndimage import zoom
+
+    H, W = inputs.photo_mask.shape
+    code, names = _codes(inputs, H, W)
+    pairs = np.zeros((len(names), len(names)), bool)  # pairs[a, b]: a lies over b
+    for a, inner in _OUTER.items():
+        for b in inner:
+            if a in names and b in names:
+                pairs[names.index(a), names.index(b)] = True
+    ys, xs = np.nonzero(inputs.photo_mask)
+    box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    z, have, k = front_in_photo(preview, floor, inputs, box)
+    o = code[box[1]:box[3], box[0]:box[2]]
+    o = zoom(o, (z.shape[0] / o.shape[0], z.shape[1] / o.shape[1]), order=0)[: z.shape[0], : z.shape[1]]
+    hits, total = 0, 0
+    h_, w_ = min(o.shape[0], z.shape[0]), min(o.shape[1], z.shape[1])
+    o, z = o[:h_, :w_], z[:h_, :w_]
+    for dy, dx in ((0, 2), (2, 0), (2, 2), (2, -2)):
+        ya, yb = slice(0, h_ - dy), slice(dy, h_)
+        xa, xb = (slice(0, w_ - dx), slice(dx, w_)) if dx >= 0 else (slice(-dx, w_), slice(0, w_ + dx))
+        A, B, ZA, ZB = o[ya, xa], o[yb, xb], z[ya, xa], z[yb, xb]
+        ok = np.isfinite(ZA) & np.isfinite(ZB)
+        a_over = pairs[A, B] & ok
+        b_over = pairs[B, A] & ok
+        hits += int((a_over & (ZA - ZB >= LAYER_MIN_MM)).sum() + (b_over & (ZB - ZA >= LAYER_MIN_MM)).sum())
+        total += int(a_over.sum() + b_over.sum())
+    if total < 20:
+        return {}
+    return {"layering": round(100.0 * hits / total, 1), "layering_n": total}
+
+
 def objective(m: dict) -> float:
     return float(m.get("score", -100.0) + HELD_W * m.get("held_mean", 0.0) - BUMP_W * m.get("bumps", 0.0)
                  + FLOW_W * m.get("hair_flow", 0.0)
-                 - OPEN_W * (m.get("mouth_open_diff", 0.0) + m.get("eyes_open_diff", 0.0)))
+                 - OPEN_W * (m.get("mouth_open_diff", 0.0) + m.get("eyes_open_diff", 0.0))
+                 + LAYER_W * m.get("layering", 0.0)
+                 - FIT_W * 100.0 * (m.get("fit_kp") or 0.0))
 
 
 def evaluate(inputs: "lab.LabInputs", values: dict):
@@ -156,11 +274,14 @@ def evaluate(inputs: "lab.LabInputs", values: dict):
         body = lab.build(CODE, inputs)
         m, preview, thumb = lab.score(CODE, body, inputs, thumb_size=THUMB)
     lab._sface.pop(id(inputs), None)  # keyed by object: never let a later photo reuse it
+    if inputs.reference is not None:
+        m["fit_kp"] = inputs.reference["report"].get("kp_median")  # the posed body's miss of the photo's joints
     m.update(bumps(preview, _floor(preview)))
-    try:
-        m.update(hair_flow(preview, _floor(preview), inputs))
-    except Exception:  # noqa: BLE001 - a photo without readable hair just doesn't score it
-        pass
+    for critic in (hair_flow, layering):
+        try:
+            m.update(critic(preview, _floor(preview), inputs))
+        except Exception:  # noqa: BLE001 - a photo it can't apply to just doesn't score it
+            pass
     m.pop("params", None)
     m["objective"] = round(objective(m), 2)
     return m, thumb
@@ -284,7 +405,7 @@ def finish_candidate(st: dict) -> dict:
             "objective": round(mean, 2), "complete": complete,
             "metrics": {pid: {k: r.get(k) for k in ("score", "held_mean", "bumps", "shape_iou", "face_err_pct", "spike_pct", "hair_flow",
                                                     "face_err_eyes", "face_err_brows", "face_err_nose", "face_err_mouth", "face_err_jaw",
-                                                    "mouth_open_diff", "eyes_open_diff", "error")}
+                                                    "mouth_open_diff", "eyes_open_diff", "layering", "fit_kp", "error")}
                         for pid, r in c["results"].items()}}
     if c.get("role"):
         # the same values built again with new code

@@ -261,6 +261,13 @@ def prepare_inputs(photo_path: str, body: str = "male", capsule_builder: bool = 
                 from .head_parts import detect_head_parts
 
                 parts = detect_head_parts(rgb, face_mesh)
+                if parts is not None:
+                    try:
+                        from .clothes import read_clothes
+
+                        parts["clothes"] = read_clothes(rgb, mask, face_mesh)
+                    except Exception:  # noqa: BLE001 - clothes unnamed then
+                        parts["clothes"] = None
             except Exception:  # noqa: BLE001 - without it hair and accessories go unnamed
                 parts = None
             fitted = fit_body_reference(pose, face_mesh, mask, gender=body, parts=parts)

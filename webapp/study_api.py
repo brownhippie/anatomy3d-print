@@ -135,7 +135,7 @@ def clear_idle_caches() -> None:
 AUTO_EVALS = 120
 AUTO_GAIN = 0.5
 AUTO_WORST = 1.0
-AUTO_AREAS = ["hair", "hair pattern", "headwear", "neck", "ears", "clothes", "face"]
+AUTO_AREAS = knobs.AREAS  # every area of numbers in turn
 
 
 def _autopilot_path() -> Path:

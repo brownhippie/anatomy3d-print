@@ -123,42 +123,63 @@ _GARMENTS = [
 ]
 
 
+_STEP = [SR + "_CLOTH_LAYER", SR + "_CLOTH_STEP_SPAN"]
+# garments the overlaps score covers (a sure pair with something it lies over or under)
+_SCORED = {"shirt", "tshirt", "jacket", "suit", "coat", "sweater", "hoodie", "dress", "skirt", "trousers", "jeans", "shorts",
+           "kimono", "tie", "belt", "lapels", "hems"}
+
+
 def _clothes() -> list:
     out = []
+    named = "named on the photo (CLIPSeg, where the body segmenter sees clothes)"
     for key, name in _GARMENTS:
         if key == "folds":
             out.append(Item("clothes.folds", "Clothes", name, True, True, [SR + "_REF_RELIEF_MAX", SR + "_REF_BACK_SMOOTH", SR + "_REF_SIDE_SMOOTH"],
                             True, "photo depth on surfaces facing the camera; bumps score the sides and back"))
-        elif key in ("shirt", "jacket"):
-            out.append(Item(f"clothes.{key}", "Clothes", name, False, True, [SR + "_REF_DRAPE", SR + "_REF_HANG"], False,
-                            "a man's chest draped as cloth; the garment itself not yet named"))
-        else:
+        elif key in ("buttons", "pockets"):
             out.append(Item(f"clothes.{key}", "Clothes", name, False, False))
+        elif key in ("lapels", "hems"):
+            out.append(Item(f"clothes.{key}", "Clothes", name, True, True, _STEP, True,
+                            "the jacket's edge stepping over the shirt / trousers; the overlaps score checks it"))
+        elif key == "sleeves":
+            out.append(Item("clothes.sleeves", "Clothes", name, True, True, _STEP, False,
+                            "the sleeve stepping over the wrist; not scored (a hand can lie over clothes too)"))
+        else:
+            knobs_ = _STEP + ([SR + "_TIE_THICK"] if key == "tie" else []) + ([SR + "_BELT_THICK"] if key == "belt" else [])
+            extra = [SR + "_REF_DRAPE", SR + "_REF_HANG"] if key in ("shirt", "jacket", "suit") else []
+            scored = key in _SCORED
+            out.append(Item(f"clothes.{key}", "Clothes", name, True, True, knobs_ + extra, scored,
+                            named + "; stepped over what it lies on" + ("; the overlaps score checks it" if scored else
+                                                                         "; nothing sure to check it against yet")))
     return out
 
 
 def _overlaps() -> list:
+    amb = "a front photo can't say which is in front here (both happen): not scored"
     return [
-        Item("over.hair_ears", "Overlaps", "Hair over the ears", True, True, [BR + "_EAR_UNDER_HAIR", SR + "_REF_EAR_HAIR"], False),
-        Item("over.hair_face", "Overlaps", "Hair over the forehead and cheeks", True, True, [SR + "_HAIR_FRINGE", SR + "_HAIR_FACE_MEET"], False),
-        Item("over.hair_neck", "Overlaps", "Hair beside and behind the neck", True, True, [SR + "_HAIR_NECK_BEHIND", SR + "_HAIR_HANG"], False),
-        Item("over.hair_clothes", "Overlaps", "Hair over shoulders and clothes", True, True, [SR + "_HAIR_LAYER"], False),
-        Item("over.hat_hair", "Overlaps", "Cap or hat over hair", True, True, [SR + "_HAT_PEAK"], False),
-        Item("over.glasses_face", "Overlaps", "Glasses over the face", True, True, [SR + "_GLASSES_SPAN", SR + "_GLASSES_FRAME"], False),
-        Item("over.mask_face", "Overlaps", "Mask over the face", True, True, [SR + "_MASK_SPAN"], False),
-        Item("over.collar_neck", "Overlaps", "Collar round the neck", True, True, [SR + "_NECK_COLLAR"], False),
-        Item("over.scarf_clothes", "Overlaps", "Scarf over clothes", True, True, [SR + "_NECK_WEAR_MAX"], False),
-        Item("over.necklace", "Overlaps", "Necklace over skin or clothes", True, True, [SR + "_NECK_LACE"], False),
-        Item("over.jacket_shirt", "Overlaps", "Jacket over shirt", False, False),
-        Item("over.tie_shirt", "Overlaps", "Tie over shirt", False, False),
-        Item("over.sweater_shirt", "Overlaps", "Sweater over shirt (collar out)", False, False),
-        Item("over.coat_all", "Overlaps", "Coat over everything", False, False),
-        Item("over.dress_legs", "Overlaps", "Dress or skirt over the legs", False, False),
-        Item("over.belt", "Overlaps", "Belt over clothes", False, False),
-        Item("over.sleeve_hand", "Overlaps", "Sleeve over the wrist", False, False),
+        Item("over.hair_ears", "Overlaps", "Hair over the ears", True, True, [BR + "_EAR_UNDER_HAIR", SR + "_REF_EAR_HAIR"], False, amb),
+        Item("over.hair_face", "Overlaps", "Hair over the forehead and cheeks", True, True, [SR + "_HAIR_FRINGE", SR + "_HAIR_FACE_MEET"], False, amb),
+        Item("over.hair_neck", "Overlaps", "Hair beside and behind the neck", True, True, [SR + "_HAIR_NECK_BEHIND", SR + "_HAIR_HANG"], False, amb),
+        Item("over.hair_clothes", "Overlaps", "Hair over shoulders and clothes", True, True, [SR + "_HAIR_LAYER"], False, amb),
+        Item("over.hat_hair", "Overlaps", "Cap or hat over hair", True, True, [SR + "_HAT_PEAK"], True, "the overlaps score checks it"),
+        Item("over.glasses_face", "Overlaps", "Glasses over the face", True, True, [SR + "_GLASSES_SPAN", SR + "_GLASSES_FRAME"], True,
+             "the overlaps score checks it"),
+        Item("over.mask_face", "Overlaps", "Mask over the face", True, True, [SR + "_MASK_SPAN"], True, "the overlaps score checks it"),
+        Item("over.collar_neck", "Overlaps", "Collar round the neck", True, True, [SR + "_NECK_COLLAR"] + _STEP, True,
+             "garments in the band under the chin over the neck's skin"),
+        Item("over.scarf_clothes", "Overlaps", "Scarf over clothes", True, True, [SR + "_NECK_WEAR_MAX"] + _STEP, True),
+        Item("over.necklace", "Overlaps", "Necklace over skin or clothes", True, True, [SR + "_NECK_LACE"], False, "not named on the photo yet"),
+        Item("over.jacket_shirt", "Overlaps", "Jacket over shirt", True, True, _STEP, True),
+        Item("over.tie_shirt", "Overlaps", "Tie over shirt", True, True, _STEP + [SR + "_TIE_THICK"], True),
+        Item("over.sweater_shirt", "Overlaps", "Sweater over shirt (collar out)", True, True, _STEP, True),
+        Item("over.coat_all", "Overlaps", "Coat over everything", True, True, _STEP, True),
+        Item("over.jacket_hem", "Overlaps", "Jacket's hem over trousers or skirt", True, True, _STEP, True),
+        Item("over.dress_legs", "Overlaps", "Dress or skirt over the legs", False, False, note="the legs under a skirt: not yet"),
+        Item("over.belt", "Overlaps", "Belt over clothes", True, True, _STEP + [SR + "_BELT_THICK"], True),
+        Item("over.sleeve_hand", "Overlaps", "Sleeve over the wrist", True, True, _STEP, False, amb),
         Item("over.hand_clothes", "Overlaps", "Hand or arm in front of the body", True, True, [SR + "_REF_HAND_SHRINK"], False,
-             "crossed arms and hands on the body, from the posed reference"),
-        Item("over.strap", "Overlaps", "Bag strap over clothes", False, False),
+             "crossed arms and hands on the body, from the posed reference; not scored yet"),
+        Item("over.strap", "Overlaps", "Bag strap over clothes", True, True, _STEP, False, "named and stepped; not scored yet"),
         Item("over.earrings", "Overlaps", "Earrings by the hair", False, False),
     ]
 
@@ -256,8 +277,10 @@ _ROLE_STATUS = {
     "shape": dict(read=NA, sculpt=True, critic=True, note_add="from the reference body (bumps and depth checks score it)"),
     "inside": dict(read=NA, sculpt=NA, critic=NA, note_add="nothing of its own to shape at this size"),
 }
-# bones the face landmarks already measure and shape
-_MEASURED_NOW = {"Nasal", "Mandible", "Clavicle", "Hip bone"}
+# bones measured now: by the face landmarks (nasal, mandible), the pose's
+# widths (hip bone), or the reference fit's bone lengths (body_reference._STRETCH)
+_MEASURED_NOW = {"Nasal", "Mandible", "Clavicle", "Hip bone", "Humerus", "Radius", "Ulna", "Femur", "Tibia"}
+_HAND = ("Metacarpal", "Finger")
 
 
 def _bones() -> list:
@@ -266,9 +289,16 @@ def _bones() -> list:
         st = dict(_ROLE_STATUS[role])
         add = st.pop("note_add")
         base = name.split(" (")[0]
-        if role == "measure" and base in _MEASURED_NOW:
+        if role == "measure" and (base in _MEASURED_NOW or base.startswith(_HAND)):
             st.update(read=True, sculpt=True, critic=True)
-            add = "measured now (face or pose points); fits the reference"
+            add = ("measured as the hand's size (the hand's points against the reference's)" if base.startswith(_HAND) else
+                   "its length fitted to the photo's points; the fit's joint miss scores it" if base in
+                   ("Humerus", "Radius", "Ulna", "Femur", "Tibia", "Clavicle") else "measured now (face or pose points)")
+            if base in ("Femur", "Tibia"):
+                add += " (when the legs are in the photo)"
+        elif base.startswith("Cervical C") and base != "Cervical C7":
+            st.update(read=True, sculpt=True, critic=True)
+            add = "the neck's length fitted to the photo (face to shoulders); the fit's joint miss scores it"
         out.append(Item(f"bone.{i:03d}", f"Bones: {region}", name, st["read"], st["sculpt"], [], st["critic"],
                         f"{role}: {note + '; ' if note else ''}{add}", rig))
     return out

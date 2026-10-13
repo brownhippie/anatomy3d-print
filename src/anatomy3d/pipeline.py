@@ -397,6 +397,10 @@ def run_silhouette_relief_pipeline(
                 from .head_parts import detect_head_parts
 
                 parts = detect_head_parts(rgb, face_mesh)
+                if parts is not None:
+                    from .clothes import read_clothes
+
+                    parts["clothes"] = read_clothes(rgb, alpha > 0.5, face_mesh)
             except Exception as exc:  # noqa: BLE001 - without it hair and accessories go unnamed, as before
                 print(f"Note: head parts skipped ({exc}).")
             fitted = fit_body_reference(pose, face_mesh, alpha > 0.5, gender=body, parts=parts)

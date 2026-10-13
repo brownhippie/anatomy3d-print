@@ -38,6 +38,21 @@ _PRIOR = {"root": 2.0, "spine": 6.0, "neck": 1.0, "head": 0.5, "clavicle": 6.0, 
 # average, in Anny's own units, and costs this much per unit
 _BUILD_RANGE = 0.5
 _BUILD_PRIOR = 0.02
+# Bones whose length the fit reads off the photo's points (both sides
+# together): name -> (the rig's bones in it, the joint it ends at; None:
+# the whole of it scaled about its first joint). A stretch of e lengthens
+# the bone by that share; everything below it moves along with it.
+_STRETCH = {
+    "humerus": (["upperarm01", "upperarm02"], "lowerarm01"),  # shoulder to elbow
+    "radius_ulna": (["lowerarm01", "lowerarm02"], "wrist"),  # elbow to wrist
+    "femur": (["upperleg01", "upperleg02"], "lowerleg01"),  # hip to knee
+    "tibia_fibula": (["lowerleg01", "lowerleg02"], "foot"),  # knee to ankle
+    "clavicle": (["clavicle"], "shoulder01"),  # the shoulders' width
+    "cervical": (["neck01", "neck02", "neck03"], "head"),  # the neck's length (C1-C7)
+    "hand": (["wrist"], None),  # carpals, metacarpals, phalanges: the hand's size
+}
+_STRETCH_RANGE = 0.15
+_STRETCH_PRIOR = 0.05
 _HEAD_RANGE = 0.25  # head size, +/- share of the body model's
 _HEAD_PRIOR = 0.2
 _KP_WEIGHT = {"shoulder": 1.0, "elbow": 1.0, "wrist": 0.3, "hip": 0.7, "knee": 1.0, "ankle": 1.0}
@@ -90,7 +105,11 @@ def _body(gender: str) -> dict:
     under = np.zeros(len(labels), dtype=bool)
     for j, p in enumerate(parents):
         under[j] = p >= 0 and (p == head or under[p])
+    joints = d[f"{gender}_joints"].astype(np.float64)
+    verts = d[f"{gender}_vertices"].astype(np.float64)
+    sdv, sdj = _stretch_bases(labels, parents, joints, verts, d["skin_idx"].astype(np.int64), skin_w)
     return {"labels": labels, "parents": parents, "head_bone": head, "head_desc": np.flatnonzero(under),
+            "stretch_dv": sdv, "stretch_dj": sdj,
             "head_w": part_w[:, [str(n) for n in d["part_names"]].index("head")],
             "verts": d[f"{gender}_vertices"].astype(np.float64), "joints": d[f"{gender}_joints"].astype(np.float64),
             "faces": d["faces"].astype(np.int64), "skin_idx": d["skin_idx"].astype(np.int64), "skin_w": skin_w,
@@ -98,6 +117,46 @@ def _body(gender: str) -> dict:
             "kp_w": d["kp_w"].astype(np.float64), "part_w": part_w, "part_names": [str(p) for p in d["part_names"]],
             "dverts": d[f"{gender}_dvertices"].astype(np.float64), "djoints": d[f"{gender}_djoints"].astype(np.float64),
             "ear_w": d["ear_w"].astype(np.float64)}
+
+
+def _stretch_bases(labels, parents, joints, verts, skin_idx, skin_w):
+    """Per _STRETCH entry: how every vertex and joint moves per unit of it,
+    in the rest pose (vertices on the bone slide by how far along it they
+    lie; everything below it by the whole lengthening)."""
+    nb, nv = len(labels), len(verts)
+    below = np.zeros((nb, nb), dtype=bool)  # below[a, b]: b hangs under a
+    for b in range(nb):
+        p = parents[b]
+        while p >= 0:
+            below[p, b] = True
+            p = parents[p]
+    W = np.zeros((nv, nb))
+    np.add.at(W, (np.repeat(np.arange(nv), skin_idx.shape[1]), skin_idx.ravel()), skin_w.ravel())
+    dv = np.zeros((len(_STRETCH), nv, 3))
+    dj = np.zeros((len(_STRETCH), nb, 3))
+    for i, (bones, tail) in enumerate(_STRETCH.values()):
+        sides = ("L", "R") if f"{bones[0]}.L" in labels else ("",)
+        for sd in sides:
+            nm = (lambda b: f"{b}.{sd}") if sd else (lambda b: b)  # noqa: E731
+            seg = [labels.index(nm(b)) for b in bones]
+            h = joints[seg[0]]
+            under = [b for b in np.flatnonzero(below[seg[0]]) if b not in seg]
+            w_under = W[:, under].sum(1) if under else np.zeros(nv)
+            if tail is None:
+                w_all = W[:, seg].sum(1) + w_under
+                dv[i] += w_all[:, None] * (verts - h)
+                for b in seg[1:] + under:
+                    dj[i, b] += joints[b] - h
+                continue
+            ax = joints[labels.index(nm(tail))] - h
+            length = float(np.linalg.norm(ax))
+            along = np.clip((verts - h) @ ax / length ** 2, 0.0, 1.0)
+            dv[i] += (w_under + W[:, seg].sum(1) * along)[:, None] * ax
+            for b in under:
+                dj[i, b] += ax
+            for b in seg[1:]:
+                dj[i, b] += ax * float(np.clip((joints[b] - h) @ ax / length ** 2, 0.0, 1.0))
+    return dv, dj
 
 
 def _rest(body: dict, ph: np.ndarray, idx: Optional[np.ndarray] = None):
@@ -114,6 +173,11 @@ def _rest(body: dict, ph: np.ndarray, idx: Optional[np.ndarray] = None):
     v = v + (k * hw)[:, None] * (v - c)
     j = j.copy()
     j[body["head_desc"]] = c + (1.0 + k) * (j[body["head_desc"]] - c)
+    e = ph[nbuild + 1:nbuild + 1 + len(body["stretch_dv"])]
+    if len(e) and np.any(e):
+        sdv = body["stretch_dv"] if idx is None else body["stretch_dv"][:, idx]
+        v = v + np.einsum("s,svi->vi", e, sdv)
+        j = j + np.einsum("s,sji->ji", e, body["stretch_dj"])
     return v, j
 
 
@@ -488,12 +552,39 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
         if p >= 0:
             desc[:, k] |= desc[:, p]
     sub_si, sub_sw = body["skin_idx"][sub], body["skin_w"][sub]
-    n_ph = len(body["dverts"]) + 1  # build, then head size
-    ph_range = np.array([_BUILD_RANGE] * (n_ph - 1) + [_HEAD_RANGE])
-    ph_prior = np.sqrt(np.array([_BUILD_PRIOR] * (n_ph - 1) + [_HEAD_PRIOR]))
+    n_st = len(_STRETCH)
+    n_ph = len(body["dverts"]) + 1 + n_st  # build, head size, then bone lengths
+    ph_range = np.array([_BUILD_RANGE] * len(body["dverts"]) + [_HEAD_RANGE] + [_STRETCH_RANGE] * n_st)
+    ph_prior = np.sqrt(np.array([_BUILD_PRIOR] * len(body["dverts"]) + [_HEAD_PRIOR] + [_STRETCH_PRIOR] * n_st))
 
     def rest_at(ph):
         return _rest(body, ph, sub)
+
+    # the hierarchy by depth: (joints, their parents) per level
+    depth = np.zeros(len(body["parents"]), dtype=int)
+    for j_, p_ in enumerate(body["parents"]):
+        depth[j_] = 0 if p_ < 0 else depth[p_] + 1
+    levels = []
+    for dpt in range(depth.max() + 1):
+        js = np.flatnonzero(depth == dpt)
+        levels.append((js, None if dpt == 0 else np.asarray(body["parents"])[js]))
+    W_sub = np.zeros((len(sub), len(body["parents"])))  # the subset's skin weights, dense
+    np.add.at(W_sub, (np.repeat(np.arange(len(sub)), sub_si.shape[1]), sub_si.ravel()), sub_sw.ravel())
+    nbuild = len(body["dverts"])
+    NW = 3 + 3 * nb + n_ph  # Jacobian columns: camera, each posed bone's turn, then build / head / bone lengths
+    sub_dv, sub_hw, sub_sdv = body["dverts"][:, sub], body["head_w"][sub], body["stretch_dv"][:, sub]
+
+    def rest_basis(verts_sub, joints):
+        """How the subset's rest vertices and all rest joints move per unit of
+        each build / head size / bone length value (all rest-pose shapes)."""
+        Bv = np.zeros((n_ph, len(sub), 3))
+        Bj = np.zeros((n_ph, len(joints), 3))
+        Bv[:nbuild], Bj[:nbuild] = sub_dv, body["djoints"]
+        c = joints[body["head_bone"]]
+        Bv[nbuild] = sub_hw[:, None] * (verts_sub - c)
+        Bj[nbuild, body["head_desc"]] = joints[body["head_desc"]] - c
+        Bv[nbuild + 1:], Bj[nbuild + 1:] = sub_sdv, body["stretch_dj"]
+        return Bv, Bj
     gy_d, gx_d = np.gradient(dist_out)
 
     def skew(a):
@@ -526,7 +617,8 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
         s = np.exp(cam[0])
         verts_sub, joints = rest_at(ph)
         Rw, pw = world(local_sel, joints)
-        moved = np.einsum("vkij,vkj->vki", Rw[sub_si], verts_sub[:, None, :] - joints[sub_si]) + pw[sub_si]
+        Rw_sub = Rw[sub_si]
+        moved = np.einsum("vkij,vkj->vki", Rw_sub, verts_sub[:, None, :] - joints[sub_si]) + pw[sub_si]
         v = (sub_sw[:, :, None] * moved).sum(1)
         p2 = np.column_stack([cam[1] + s * v[:, 0], cam[2] - s * v[:, 2]])
         rv = log_rot(local_sel)
@@ -541,11 +633,30 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
             dv = -skew(a)  # w x a = -a x w
             dX, dZ, dY = dv[:, :, 0, :], dv[:, :, 2, :], dv[:, :, 1, :]
             # image-plane derivatives: (V, 2, 3 + 3 nb)
-            Jp = np.zeros((len(v), 2, 3 + 3 * nb))
+            Jp = np.zeros((len(v), 2, NW))
             Jp[:, 0, 0], Jp[:, 1, 0] = s * v[:, 0], -s * v[:, 2]
             Jp[:, 0, 1], Jp[:, 1, 2] = 1.0, 1.0
-            Jp[:, 0, 3:] = (s * dX).reshape(len(v), -1)
-            Jp[:, 1, 3:] = (-s * dZ).reshape(len(v), -1)
+            Jp[:, 0, 3:3 + 3 * nb] = (s * dX).reshape(len(v), -1)
+            Jp[:, 1, 3:3 + 3 * nb] = (-s * dZ).reshape(len(v), -1)
+            # build, head size, bone lengths: rest shapes carried through the
+            # pose (joints first, down the hierarchy, then the skinned vertices)
+            Bv, Bj = rest_basis(verts_sub, joints)
+            D = np.zeros_like(Bj)
+            for js, ps in levels:  # a whole depth of the hierarchy at once
+                if ps is None:
+                    D[:, js] = Bj[:, js]
+                else:
+                    D[:, js] = D[:, ps] + np.matmul(Rw[ps][None], (Bj[:, js] - Bj[:, ps])[..., None])[..., 0]
+            # sum_k w_k (R_k (Bv - Bj_k) + D_k) = (sum_k w_k R_k) Bv + sum_k w_k (D_k - R_k Bj_k),
+            # both sums as products with the dense weight matrix
+            M = (W_sub @ Rw.reshape(len(Rw), 9)).reshape(-1, 3, 3)
+            E = D - np.einsum("jab,ijb->ija", Rw, Bj)
+            first = M[None, :, :, 0] * Bv[..., 0:1] + M[None, :, :, 1] * Bv[..., 1:2] + M[None, :, :, 2] * Bv[..., 2:3]
+            second = (W_sub @ E.transpose(1, 0, 2).reshape(len(Rw), -1)).reshape(len(sub), n_ph, 3).transpose(1, 0, 2)
+            dvp = first + second
+            Jp[:, 0, 3 + 3 * nb:] = s * dvp[:, :, 0].T
+            Jp[:, 1, 3 + 3 * nb:] = -s * dvp[:, :, 2].T
+            dYf = np.concatenate([dY.reshape(len(v), -1), dvp[:, :, 1].T], axis=1)
 
         def add(r, J=None):
             res.append(np.atleast_1d(r))
@@ -555,21 +666,21 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
         kp2 = (kp_w[..., None] * p2[kp_sub]).sum(1)
         sq = np.sqrt(wts)[:, None]
         add(((kp2 - tgt) * sq / sw_px).ravel(),
-            (np.einsum("kn,knij->kij", kp_w, Jp[kp_sub]) * sq[:, :, None] / sw_px).reshape(-1, 3 + 3 * nb) if jac else None)
+            (np.einsum("kn,knij->kij", kp_w, Jp[kp_sub]) * sq[:, :, None] / sw_px).reshape(-1, NW) if jac else None)
         for sd, t in hand_tgt.items():
             add((p2[hand_sub[sd]].mean(0) - t) / sw_px, Jp[hand_sub[sd]].mean(0) / sw_px if jac else None)
         pr = np.sqrt(0.02 * prior)
         add((pr[:, None] * rv).ravel(), None)
         if jac:
-            Jr = np.zeros((nb, 3, 3 + 3 * nb))
+            Jr = np.zeros((nb, 3, NW))
             for i in range(nb):
                 Jr[i, :, 3 + 3 * i:6 + 3 * i] = pr[i] * Rp[i].T
-            rows[-1] = Jr.reshape(-1, 3 + 3 * nb)
+            rows[-1] = Jr.reshape(-1, NW)
         # a front photo can't show the trunk tilting forward/back or turning:
         # keep both near zero (x and z components of the trunk bones' turns)
         add(np.sqrt(0.5) * rv[pitch][:, [0, 2]].ravel(), None)
         if jac:
-            Ju = np.zeros((2 * len(pitch), 3 + 3 * nb))
+            Ju = np.zeros((2 * len(pitch), NW))
             for n, i in enumerate(pitch):
                 Ju[2 * n, 3 + 3 * i:6 + 3 * i] = np.sqrt(0.5) * Rp[i].T[0]
                 Ju[2 * n + 1, 3 + 3 * i:6 + 3 * i] = np.sqrt(0.5) * Rp[i].T[2]
@@ -578,7 +689,7 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
         # away from the camera only as far as the photo needs -- however they
         # bend within it (a lunge, a step to the side)
         lj = (lkp_w[..., None] * v[lkp_sub]).sum(1)  # hip, knee, ankle, shoulder, elbow, wrist per side
-        dlj = np.einsum("kn,knbj->kbj", lkp_w, dY[lkp_sub]) if jac else None
+        dlj = np.einsum("kn,knc->kc", lkp_w, dYf[lkp_sub]) if jac else None
         segs = [(0, 1, _LEG_STRAIGHT), (1, 2, _LEG_STRAIGHT), (3, 4, _LEG_STRAIGHT), (4, 5, _LEG_STRAIGHT)] if len(leg_i) else []
         # arms too, more loosely; an arm folded across the body is exempt
         # (its elbow comes forward with it)
@@ -588,7 +699,7 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
             length = max(float(np.linalg.norm(lj[b] - lj[a])), 1e-3)
             add(np.sqrt(wgt_) * (lj[b, 1] - lj[a, 1]) / length,
                 np.concatenate([np.zeros(3), np.sqrt(wgt_) * (dlj[b] - dlj[a]).ravel() / length]) if jac else None)
-        add(ph_prior * ph, np.zeros((n_ph, 3 + 3 * nb)) if jac else None)
+        add(ph_prior * ph, np.hstack([np.zeros((n_ph, 3 + 3 * nb)), np.diag(ph_prior)]) if jac else None)
         if stage:
             # one residual per sampled vertex (zero below the photo's bottom
             # edge), so the count never changes between evaluations
@@ -618,14 +729,14 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
             # further off it than a forearm's thickness and a little more
             f1 = np.maximum(av[:, 1] - (ty - 0.01), 0.0)
             f2 = np.maximum((ty - _REST_MAX) - av[:, 1], 0.0)
-            Jy = np.zeros((len(av), 3 + 3 * nb))
+            Jy = np.zeros((len(av), NW))
             if jac:
-                Jy[:, 3:] = dY[fore_sub[sd]].reshape(len(av), -1)
+                Jy[:, 3:] = dYf[fore_sub[sd]]
             add(np.sqrt(200.0 / n) * over * f1, (np.sqrt(200.0 / n) * (over * (f1 > 0))[:, None] * Jy) if jac else None)
             add(np.sqrt(200.0 / n) * over * f2, (-np.sqrt(200.0 / n) * (over * (f2 > 0))[:, None] * Jy) if jac else None)
             # and touching it: the nearest few points no more than 1.5 cm off
             # (always one residual, zero when too little lies over the torso)
-            c, Jc = 0.0, np.zeros(3 + 3 * nb)
+            c, Jc = 0.0, np.zeros(NW)
             if over.sum() >= 8:
                 gap = np.where(over > 0, ty - av[:, 1], np.inf)
                 near = np.argsort(gap)[:8]
@@ -644,14 +755,8 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
         return cam, local_sel, ph
 
     def evaluate_full(cam, local_sel, ph, stage):
-        """Residuals and Jacobian; the build columns by finite differences."""
-        r, J, Rp = evaluate(cam, local_sel, ph, stage)
-        cols = []
-        for i in range(n_ph):
-            e = np.zeros(n_ph)
-            e[i] = 1e-3
-            cols.append((evaluate(cam, local_sel, ph + e, stage, jac=False)[0] - r) / 1e-3)
-        return r, np.hstack([J, np.column_stack(cols)]), Rp
+        """Residuals and their Jacobian (all columns analytic)."""
+        return evaluate(cam, local_sel, ph, stage)
 
     cam, local_sel, ph = cam0, _rotmats(rv0), np.zeros(n_ph)
     for stage, iters in ((0, 40), (1, 60)):
@@ -721,7 +826,8 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
               "inside": round(inside_frac, 3), "forearm_lift_m": [round(lift_med, 3), round(lift_max, 3)],
               "lean_m": {"legs": round(lean_legs, 3), "trunk": round(lean_trunk, 3)}, "px_per_m": round(s, 1), "gender": gender, "cost": round(final_cost, 5),
               "build": {str(k): round(0.5 + float(v), 2) for k, v in zip(_data()["phenotypes"], ph)},
-              "head_scale": round(1.0 + float(ph[-1]), 3),
+              "head_scale": round(1.0 + float(ph[len(_data()["phenotypes"])]), 3),
+              "bones": {k: round(1.0 + float(v), 3) for k, v in zip(_STRETCH, ph[len(_data()["phenotypes"]) + 1:])},
               "matched": bool(kp_med <= _MAX_KP_ERR and inside_frac >= _MIN_INSIDE and lift_med <= _MAX_FOREARM_LIFT[0] and lift_max <= _MAX_FOREARM_LIFT[1]
                              and lean_legs <= _MAX_LEG_LEAN and lean_trunk <= _MAX_TRUNK_LEAN)}
     # every keypoint the body knows (photo px x, y, depth), visible or not:

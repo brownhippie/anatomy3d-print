@@ -87,6 +87,12 @@ KNOBS = [
     Knob(_SR, "_REF_DEPTH_MARGIN", 1.0, 1.2, "clothes", "body depth over the bare reference body"),
     Knob(_SR, "_REF_HEAD_MARGIN", 1.0, 1.12, "clothes", "head depth over the bare reference head"),
     Knob(_SR, "_REF_HAND_SHRINK", 0.2, 0.5, "clothes", "hands on the body shrunk to this share about the wrist"),
+    Knob(_SR, "_CLOTH_LAYER", 0.0, 0.006, "clothes", "one garment layer's step over the one under it (m)"),
+    Knob(_SR, "_CLOTH_STEP_SPAN", 0.006, 0.04, "clothes", "the step eases back over this (m)"),
+    Knob(_SR, "_TIE_THICK", 0.0, 0.005, "clothes", "a tie stands this proud of the shirt (m)"),
+    Knob(_SR, "_BELT_THICK", 0.0, 0.005, "clothes", "a belt stands this proud (m)"),
+    Knob(_BR, "_STRETCH_PRIOR", 0.01, 0.3, "bones", "how hard bone lengths hold to the reference's (cost per unit)"),
+    Knob(_BR, "_STRETCH_RANGE", 0.05, 0.25, "bones", "most a bone may lengthen or shorten (share)"),
     # each part of the face
     Knob(_SR, "_EYE_INSET", 0.0, 0.004, "face parts", "an open eye's ball sits this far behind its lids (m)"),
     Knob(_SR, "_IRIS_DEPTH", 0.0, 0.0012, "face parts", "the iris carved this deep (m)"),

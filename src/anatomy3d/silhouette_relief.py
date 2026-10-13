@@ -874,6 +874,12 @@ _TONGUE_INSET = 0.004  # the tongue this far
 _SCAR_DEPTH = 0.0005  # a scar's groove
 _BEARD_THICK = 0.004  # a beard or moustache stands this proud
 _STUBBLE_DEPTH = 0.0003  # stubble's grain
+# Clothes (clothes.py): where one garment meets another, the outer one
+# stands a step over the inner (layers in clothes.LAYER), metres
+_CLOTH_LAYER = 0.0025  # one layer's step
+_CLOTH_STEP_SPAN = 0.015  # the step eases back to the garment's own surface over this
+_TIE_THICK = 0.002  # a tie stands this proud of the shirt (on top of its layer step)
+_BELT_THICK = 0.002
 # how much of each a kind of hair gets: strands, waves, curls, coils
 _HAIR_KIND_MIX = {"sleek": (0.35, 0, 0, 0), "straight": (1, 0, 0, 0), "wavy": (0.8, 1, 0, 0),
                   "curly": (0.25, 0, 1, 0), "coily": (0, 0, 0, 1)}
@@ -1897,6 +1903,43 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
     return out
 
 
+def _clothes_relief(reading: dict, front: np.ndarray, cells: np.ndarray, y0: int, x0: int, scale: float, pad: int,
+                    px_per_m: float) -> np.ndarray:
+    """Offsets (photo px, toward the camera) stepping each garment over the
+    one under it where they meet (a jacket's edge over the shirt, a tie on
+    it, a belt over trousers, a scarf over everything), easing back to the
+    garment's own surface away from the edge; fading where the surface
+    turns side-on."""
+    from .clothes import GARMENTS, NAMES, layer_map
+
+    gh, gw = cells.shape
+    labels = reading["labels"]
+    r = np.clip(np.rint(y0 + (np.arange(gh) - pad) / scale).astype(int), 0, labels.shape[0] - 1)
+    c = np.clip(np.rint(x0 + (np.arange(gw) - pad) / scale).astype(int), 0, labels.shape[1] - 1)
+    lab_g = labels[r[:, None], c[None, :]]
+    L = layer_map({"labels": lab_g})
+    named = np.isfinite(L) & cells
+    if not named.any():
+        return np.zeros((gh, gw))
+    idx = distance_transform_edt(~named, return_distances=False, return_indices=True)
+    Lf = np.where(named, L, L[idx[0], idx[1]])
+    Lf = np.nan_to_num(Lf, nan=0.0)
+    span = max(_CLOTH_STEP_SPAN * px_per_m * scale, 1.0)
+    w = gaussian_filter(cells.astype(np.float64), span) + 1e-6
+    local = gaussian_filter(np.where(cells, Lf, 0.0), span) / w
+    step = _CLOTH_LAYER * px_per_m * (Lf - local)
+    garment = np.isin(lab_g, [i + 1 for i in range(len(GARMENTS))])
+    for k, t in (("tie", _TIE_THICK), ("belt", _BELT_THICK)):
+        m_ = lab_g == NAMES.index(k) + 1
+        if m_.any():
+            step = step + t * px_per_m * gaussian_filter(m_.astype(np.float64), 1.0)
+    gy, gx = np.gradient(front)
+    facing = 1.0 / np.sqrt(1.0 + (np.hypot(gy, gx) * scale) ** 2)
+    facing = np.clip((facing - _REF_RELIEF_FACING[0]) / (_REF_RELIEF_FACING[1] - _REF_RELIEF_FACING[0]), 0.0, 1.0)
+    near = gaussian_filter(garment.astype(np.float64), 1.0)  # garments and their edges, not bare skin far off
+    return np.where(cells, gaussian_filter(step, 0.8) * facing * np.clip(near * 3, 0, 1), 0.0)
+
+
 def _wear_on_face(front: np.ndarray, grid_mask: np.ndarray, parts_g: np.ndarray, scale: float, px_per_m: float) -> np.ndarray:
     """What's worn on the face, on the front surface (photo px, toward the
     camera): a face mask is cloth stretched from the nose over the mouth to
@@ -2612,6 +2655,12 @@ def build_silhouette_relief_mesh(
         back = mid - half_span
         if parts_g is not None and ref is not None:
             front = _wear_on_face(front, grid_mask, parts_g, scale, float(reference["px_per_m"]))
+        clothes_read = (parts or {}).get("clothes") if parts is not None else None
+        if clothes_read and reference is not None:
+            try:
+                front = front + _clothes_relief(clothes_read, front, grid_mask, y0, x0, scale, pad, float(reference["px_per_m"]))
+            except Exception as exc:  # noqa: BLE001 - clothes keep their shape without steps
+                print(f"Note: clothes steps skipped ({exc}).")
         face_read = (parts or {}).get("face") if parts is not None else None
         if face_read:
             try:
