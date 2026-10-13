@@ -110,8 +110,8 @@ def _back(a: np.ndarray, side: int, nearest: bool = False) -> np.ndarray:
 def detect_head_parts(rgb: np.ndarray, face_mesh: Optional[np.ndarray]) -> Optional[dict]:
     """{"labels": uint8 (H, W), one of the constants above per photo pixel
     (BACKGROUND outside the crop), "box": the crop (x0, y0, x1, y1),
-    "found": which of hat / mask / glasses / sunglasses the face has}.
-    None without a face."""
+    "found": which of hat / mask / glasses / sunglasses the face has,
+    "hair": hair_pattern.read_hair's reading}. None without a face."""
     if face_mesh is None:
         return None
     import mediapipe as mp
@@ -207,4 +207,11 @@ def detect_head_parts(rgb: np.ndarray, face_mesh: Optional[np.ndarray]) -> Optio
 
     out = np.zeros((H, W), dtype=np.uint8)
     out[sy0:sy1, sx0:sx1] = labels[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0]
-    return {"labels": out, "box": (sx0, sy0, sx1, sy1), "found": found}
+    hair = None
+    try:
+        from .hair_pattern import read_hair
+
+        hair = read_hair(rgb, out, (sx0, sy0, sx1, sy1), face_mesh, HAIR, HAT)
+    except Exception:  # noqa: BLE001 - the hair's volume is still built without its pattern
+        hair = None
+    return {"labels": out, "box": (sx0, sy0, sx1, sy1), "found": found, "hair": hair}

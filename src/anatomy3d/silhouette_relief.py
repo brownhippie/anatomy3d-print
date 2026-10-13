@@ -844,6 +844,21 @@ _REF_EAR_SINK = 0.005
 _REF_EAR_PLUG = 0.02
 _REF_EAR_MIN_MM = 1.2
 _REF_EAR_THICK = 0.004
+# The hair's pattern, read from the photo (hair_pattern.py) and pressed into
+# the hair's surfaces (_hair_pattern), all in metres on the person:
+_HAIR_STRAND_W = 0.005  # a sculpted strand (a lock of strands) is this wide
+_HAIR_STRAND_LEN = 0.05  # ... and runs on this long before it fades into the next
+_HAIR_STRAND_DEPTH = 0.0012  # grooves between strands: this deep either way
+_HAIR_WAVE_DEPTH = 0.003  # a wave's crest stands this proud
+_HAIR_WAVE_LEN = 0.12  # a wave's length when the photo didn't measure one
+_HAIR_CURL = 0.012  # a curl is this across ...
+_HAIR_CURL_DEPTH = 0.0025  # ... and stands this proud
+_HAIR_COIL = 0.006  # tight coils: this across ...
+_HAIR_COIL_DEPTH = 0.0015  # ... this proud
+_HAIRLINE_EDGE = 0.004  # the pattern ends over this at the hairline
+# how much of each a kind of hair gets: strands, waves, curls, coils
+_HAIR_KIND_MIX = {"sleek": (0.35, 0, 0, 0), "straight": (1, 0, 0, 0), "wavy": (0.8, 1, 0, 0),
+                  "curly": (0.25, 0, 1, 0), "coily": (0, 0, 0, 1)}
 
 
 def _raster_depth(gx, gy, depth, faces, shape):
@@ -1537,6 +1552,194 @@ def _hair_and_hat(front, back, grid_mask, photo_cells, parts_g, cov, face_mesh, 
     return F, B, cells
 
 
+def _flow_on_grid(reading: dict, grid_shape, y0: int, x0: int, scale: float, pad: int):
+    """The photo's strand direction (cos 2θ, sin 2θ) and coherence at each
+    build-grid cell; None outside the reading's box."""
+    gh, gw = grid_shape
+    bx0, by0, bx1, by1 = reading["box"]
+    rr, cc = np.mgrid[0:gh, 0:gw].astype(np.float32)
+    py = y0 + (rr - pad) / scale - by0
+    px = x0 + (cc - pad) / scale - bx0
+    th, coh = reading["theta"], reading["coherence"]
+    inside = (py >= 0) & (py < th.shape[0] - 1) & (px >= 0) & (px < th.shape[1] - 1)
+    c2 = map_coordinates(np.cos(2 * th), [py, px], order=1, mode="nearest")
+    s2 = map_coordinates(np.sin(2 * th), [py, px], order=1, mode="nearest")
+    co = map_coordinates(coh, [py, px], order=1, mode="nearest")
+    return np.where(inside, c2, 0.0), np.where(inside, s2, 0.0), np.where(inside, co, 0.0), inside
+
+
+def _lic(noise: np.ndarray, c2: np.ndarray, s2: np.ndarray, half_len: int) -> np.ndarray:
+    """Line integral convolution: `noise` averaged along the direction field
+    (cos 2θ, sin 2θ), half_len cells each way, Hann-weighted -- streaks that
+    follow the strands."""
+    gh, gw = noise.shape
+    rr, cc = np.mgrid[0:gh, 0:gw].astype(np.float64)
+    ang0 = 0.5 * np.arctan2(s2, c2)
+    acc = noise.astype(np.float64).copy()
+    wsum = np.ones_like(acc)
+    for sign in (1.0, -1.0):
+        y, x = rr.copy(), cc.copy()
+        ty, tx = np.sin(ang0) * sign, np.cos(ang0) * sign
+        for k in range(1, half_len + 1):
+            cs = map_coordinates(c2, [y, x], order=1, mode="nearest")
+            sn = map_coordinates(s2, [y, x], order=1, mode="nearest")
+            ang = 0.5 * np.arctan2(sn, cs)
+            ny, nx = np.sin(ang), np.cos(ang)
+            flip = ny * ty + nx * tx < 0
+            ty, tx = np.where(flip, -ny, ny), np.where(flip, -nx, nx)
+            y, x = np.clip(y + ty, 0, gh - 1), np.clip(x + tx, 0, gw - 1)
+            w = 0.5 * (1.0 + np.cos(np.pi * k / (half_len + 1)))
+            acc += w * map_coordinates(noise, [y, x], order=1, mode="nearest")
+            wsum += w
+    return acc / wsum
+
+
+def _wave_phase(c2: np.ndarray, s2: np.ndarray, region: np.ndarray, crown) -> np.ndarray:
+    """Distance along the strands from the crown (a potential whose gradient
+    is the strand direction, pointed away from the crown), for wave crests
+    that run across the strands."""
+    gh, gw = region.shape
+    ang = 0.5 * np.arctan2(s2, c2)
+    ty, tx = np.sin(ang), np.cos(ang)
+    rr, cc = np.mgrid[0:gh, 0:gw]
+    away = (rr - crown[0]) * ty + (cc - crown[1]) * tx < 0
+    ty, tx = np.where(away, -ty, ty), np.where(away, -tx, tx)
+    idx = -np.ones(region.shape, dtype=np.int64)
+    n = int(region.sum())
+    idx[region] = np.arange(n)
+    rows, cols, vals, rhs = [], [], [], []
+    eq = 0
+    for dy, dx, t in ((0, 1, tx), (1, 0, ty)):
+        a = region[: gh - dy, : gw - dx] & region[dy:, dx:]
+        i0 = idx[: gh - dy, : gw - dx][a]
+        i1 = idx[dy:, dx:][a]
+        tt = 0.5 * (t[: gh - dy, : gw - dx][a] + t[dy:, dx:][a])
+        m = len(i0)
+        rows += [np.arange(eq, eq + m)] * 2
+        cols += [i1, i0]
+        vals += [np.ones(m), -np.ones(m)]
+        rhs.append(tt)
+        eq += m
+    # pin the crown's nearest cell at 0
+    ci = idx[region][np.argmin((rr[region] - crown[0]) ** 2 + (cc[region] - crown[1]) ** 2)]
+    rows.append(np.array([eq]))
+    cols.append(np.array([ci]))
+    vals.append(np.array([10.0]))
+    rhs.append(np.array([0.0]))
+    A = sparse.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(eq + 1, n))
+    # (a little of the identity: hair in separate pieces, each but the
+    # crown's unpinned, would leave it singular)
+    sol = spsolve((A.T @ A + 1e-6 * sparse.identity(n)).tocsc(), A.T @ np.concatenate(rhs))
+    out = np.zeros(region.shape)
+    out[region] = sol
+    return out
+
+
+def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, face_mesh, y0, x0, scale, pad, px_per_m):
+    """The hair's pattern as offsets (photo px, outward) for its front and
+    back surfaces: strands along the photo's own strand directions, the
+    waves it measured, curls or coils -- as much of each as the reading's
+    kind of hair takes (_HAIR_KIND_MIX). Ends at the hairline; fades where
+    the surface turns side-on (pressed onto a side-facing surface, detail
+    stands out as ridges). The back of the head: strands falling down, or
+    the same curls."""
+    from scipy.ndimage import binary_dilation
+
+    from .head_parts import BODY_SKIN, FACE_SKIN, HAIR
+
+    gh, gw = cells.shape
+    zero = np.zeros((gh, gw))
+    mix = _HAIR_KIND_MIX.get((reading or {}).get("kind"))
+    if mix is None:
+        return zero, zero
+    per_cell = px_per_m * scale  # grid cells per metre
+    hair_f = (parts_g == HAIR) & cells
+    if hair_f.sum() < 30:
+        return zero, zero
+    grown = cells & (((front - back) - np.where(cells, front_pre - back_pre, 0.0)) * scale > 1.0)
+    # the back of the head down to the nape is hair too, however short (its
+    # back surface only grows for hair thicker than _HAIR_THIN)
+    from scipy.ndimage import label as cc_label
+
+    fm = np.asarray(face_mesh)[:, :2]
+    nape_r = (fm[2, 1] - y0) * scale + pad
+    face_c = ((fm[234, 0] + fm[454, 0]) / 2.0 - x0) * scale + pad
+    half_w = 0.8 * abs(fm[454, 0] - fm[234, 0]) * scale
+    rows, cols = np.mgrid[0:gh, 0:gw]
+    head = cells & (rows <= nape_r) & (np.abs(cols - face_c) <= half_w)
+    lab, _ = cc_label(head)
+    keep = np.unique(lab[hair_f & head])
+    head = np.isin(lab, keep[keep > 0])
+    hair_b = (grown & binary_dilation(hair_f | grown, iterations=2)) | head
+    region = hair_f | hair_b
+    if region.sum() < 30:
+        return zero, zero
+    ys, xs = np.nonzero(region)
+    m = int(np.ceil(_HAIR_STRAND_LEN * per_cell)) + 4
+    r0, r1, c0, c1 = max(ys.min() - m, 0), min(ys.max() + m + 1, gh), max(xs.min() - m, 0), min(xs.max() + m + 1, gw)
+    crop = (slice(r0, r1), slice(c0, c1))
+    reg = region[crop]
+    c2, s2, coh, seen = _flow_on_grid(reading, (gh, gw), y0, x0, scale, pad)
+    c2, s2, seen = c2[crop], s2[crop], seen[crop]
+    # unseen (the sides past the photo's hair, the back): strands fall down
+    down = ~(seen & hair_f[crop])
+    c2 = gaussian_filter(np.where(down, -1.0, c2), 1.0)
+    s2 = gaussian_filter(np.where(down, 0.0, s2), 1.0)
+    shape = reg.shape
+    crown = (float(ys.min()) - r0, float((fm[234, 0] + fm[454, 0]) / 2.0 - x0) * scale + pad - c0)
+
+    def unit(a):
+        sd = float(a[reg].std()) if reg.any() else 0.0
+        return (a - float(a[reg].mean())) / sd if sd > 1e-9 else np.zeros_like(a)
+
+    w_s, w_w, w_c, w_k = mix
+    wl = reading.get("wave_px")
+    wl_cells = max(wl * scale if wl else _HAIR_WAVE_LEN * per_cell, 4.0)
+
+    def pattern(fc2, fs2, back_side, seed):
+        rng = np.random.default_rng(seed)
+        out = np.zeros(shape)
+        if w_s:
+            noise = gaussian_filter(rng.standard_normal(shape), max(0.5 * _HAIR_STRAND_W * per_cell, 0.6))
+            half = int(np.clip(0.5 * _HAIR_STRAND_LEN * per_cell, 2, 40))
+            out += w_s * _HAIR_STRAND_DEPTH * unit(_lic(noise, fc2, fs2, half))
+        if w_w:
+            # (down the back the strands fall straight: distance down is the phase)
+            phase = (np.arange(shape[0])[:, None] - crown[0]) * np.ones(shape) if back_side else _wave_phase(fc2, fs2, reg, crown)
+            out += w_w * _HAIR_WAVE_DEPTH * np.where(reg, np.sin(2 * np.pi * phase / wl_cells), 0.0)
+        for w_, size_, depth_ in ((w_c, _HAIR_CURL, _HAIR_CURL_DEPTH), (w_k, _HAIR_COIL, _HAIR_COIL_DEPTH)):
+            if w_:
+                d = max(size_ * per_cell, 1.5)
+                bp = gaussian_filter(rng.standard_normal(shape), d / 4) - gaussian_filter(rng.standard_normal(shape), d / 2)
+                out += w_ * depth_ * unit(gaussian_filter(np.abs(unit(bp)), d / 6))
+        return out * px_per_m  # metres -> photo px
+
+    out_f = pattern(c2, s2, False, 0)
+    out_b = pattern(np.full(shape, -1.0), np.zeros(shape), True, 1)
+    # where it applies: in front, the hair the photo shows, ending at the
+    # hairline; behind, the back of the head down to the nape (the photo's
+    # face covers those cells -- it says nothing about the back)
+    skin = np.isin(parts_g[crop], (FACE_SKIN, BODY_SKIN)) & cells[crop]
+    edge_cells = max(_HAIRLINE_EDGE * per_cell, 1.0)
+    w_f = gaussian_filter(hair_f[crop].astype(np.float64), 1.0) * np.clip(distance_transform_edt(~skin) / edge_cells, 0.0, 1.0)
+    nape = np.clip((nape_r - r0 - np.arange(r1 - r0)[:, None]) / edge_cells + 0.5, 0.0, 1.0)
+    w_b = gaussian_filter(hair_b[crop].astype(np.float64), max(1.0, 0.5 * _HAIR_STRAND_W * per_cell))
+    w_b = w_b * np.maximum(nape, grown[crop])
+
+    def facing(surface):
+        gy, gx = np.gradient(surface)
+        f = 1.0 / np.sqrt(1.0 + (np.hypot(gy, gx) * scale) ** 2)
+        return np.clip((f - _REF_RELIEF_FACING[0]) / (_REF_RELIEF_FACING[1] - _REF_RELIEF_FACING[0]), 0.0, 1.0)
+
+    rel_f = np.where(hair_f[crop], out_f * w_f * facing(front[crop]), 0.0)
+    rel_b = np.where(hair_b[crop] | (w_b > 0.01), out_b * w_b * facing(-back[crop]), 0.0)
+    if not (np.isfinite(rel_f).all() and np.isfinite(rel_b).all()):
+        return zero, zero
+    Rf, Rb = zero.copy(), zero.copy()
+    Rf[crop], Rb[crop] = rel_f, rel_b
+    return Rf, Rb
+
+
 def _wear_on_face(front: np.ndarray, grid_mask: np.ndarray, parts_g: np.ndarray, scale: float, px_per_m: float) -> np.ndarray:
     """What's worn on the face, on the front surface (photo px, toward the
     camera): a face mask is cloth stretched from the nose over the mouth to
@@ -2036,6 +2239,7 @@ def build_silhouette_relief_mesh(
     parts_g = (_parts_on_grid(parts["labels"], grid_mask.shape, y0, x0, scale, pad)
                if parts is not None and parts.get("labels") is not None else None)
     photo_cells = grid_mask
+    hair_rel = None
     if ref is not None:
         rf, rb, cov, ears3d = ref
         # where the reference runs just past the pixel outline, its own round
@@ -2123,8 +2327,15 @@ def build_silhouette_relief_mesh(
         front0 = np.where(grid_mask, r_mid + r_half, 0.0)
         back0 = np.where(grid_mask, r_mid - r_half, 0.0)
         if parts_g is not None and face_mesh is not None:
+            front_pre, back_pre = front0.copy(), back0.copy()
             front0, back0, grid_mask = _hair_and_hat(front0, back0, grid_mask, photo_cells, parts_g, inside | (cov & grid_mask),
                                                      face_mesh, y0, x0, scale, pad, float(reference["px_per_m"]))
+            try:
+                hair_rel = _hair_pattern(front0, back0, front_pre, back_pre, grid_mask, parts_g, parts.get("hair"), face_mesh,
+                                         y0, x0, scale, pad, float(reference["px_per_m"]))
+            except Exception as exc:  # noqa: BLE001 - the hair keeps its volume without the pattern
+                print(f"Note: hair pattern skipped ({exc}).")
+                hair_rel = None
             front0, back0 = _neck_wear(front0, back0, grid_mask, photo_cells, parts_g, inside | (cov & grid_mask), face_mesh,
                                        _neck_geometry(reference), y0, x0, scale, pad, float(reference["px_per_m"]))
             front0, back0 = np.where(grid_mask, front0, 0.0), np.where(grid_mask, back0, 0.0)
@@ -2244,6 +2455,9 @@ def build_silhouette_relief_mesh(
         back = mid - half_span
         if parts_g is not None and ref is not None:
             front = _wear_on_face(front, grid_mask, parts_g, scale, float(reference["px_per_m"]))
+        if hair_rel is not None:
+            front = np.where(grid_mask, front + hair_rel[0], front)
+            back = np.where(grid_mask, back - hair_rel[1], back)
         mid = (front + back) / 2.0
         # Eye sockets push the front back; never let that thin the head
         # below the floor used elsewhere.

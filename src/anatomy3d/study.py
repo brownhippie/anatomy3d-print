@@ -19,6 +19,8 @@ The critics, per photo, all automatic:
   sides, back and top, where the photo can't have put detail -- the fins,
   ridges, bars, cracks and stray lumps the builder has made before, as
   numbers
+- hair flow: the model's sculpted strands, seen from the front over the
+  photo's hair, against the strand directions read from the photo
 """
 import json
 import pickle
@@ -42,9 +44,11 @@ THUMB = (720, 480)
 # objective = score + HELD_W x held mean - BUMP_W x bumps
 HELD_W = 0.3
 BUMP_W = 3.0
+FLOW_W = 0.1
 BUMP_MM = 0.4  # bumps: % of the surface standing off its smoothed copy by more than this
 OBJECTIVE = (f"study score = Lab score + {HELD_W} × held mean − {BUMP_W} × bumps "
-             f"(% of the sides, back and top standing more than {BUMP_MM} mm off a smoothed copy of themselves)")
+             f"(% of the sides, back and top standing more than {BUMP_MM} mm off a smoothed copy of themselves) "
+             f"+ {FLOW_W} × hair flow (the model's strands along the photo's, −100…100)")
 
 
 # ---------------------------------------------------------------- critics
@@ -69,8 +73,73 @@ def bumps(preview: trimesh.Trimesh, floor: float) -> dict:
             "bump_p99_mm": round(float(np.percentile(o, 99)), 2)}
 
 
+def hair_flow(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
+    """How well the model's sculpted strands run with the photo's: the
+    front of the model over the photo's hair, as a height map in the
+    photo's own frame (scaled to the subject, centred, as the Lab aligns
+    it), fine relief only, its ridges' direction against the photo's
+    strand direction; 100 = all along, 0 = no pattern or none matching,
+    -100 = all across."""
+    from scipy.ndimage import gaussian_filter, zoom
+
+    from .hair_pattern import _structure
+    from .head_parts import HAIR
+
+    reading = (inputs.parts or {}).get("hair") or {}
+    if reading.get("kind") is None or "theta" not in reading:
+        return {}
+    bx0, by0, bx1, by1 = reading["box"]
+    hair = inputs.parts["labels"][by0:by1, bx0:bx1] == HAIR
+    mask = inputs.photo_mask
+    ys, xs = np.nonzero(mask)
+    my0, my1, mx0, mx1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    v = preview.vertices
+    top = float(v[:, 1].max())
+    above = v[v[:, 1] > floor]
+    mm = (top - floor) / (my1 - my0)  # model mm per photo px
+    mx_c, px_c = (above[:, 0].min() + above[:, 0].max()) / 2, (mx0 + mx1) / 2
+    hy, hx = np.nonzero(hair)
+    if len(hy) < 100:
+        return {}
+    k = max(1.0, max(np.ptp(hy), np.ptp(hx)) / 360.0)  # photo px per raster px
+    ry0, ry1, rx0, rx1 = by0 + hy.min(), by0 + hy.max() + 1, bx0 + hx.min(), bx0 + hx.max() + 1
+    cen = preview.triangles_center
+    yl, yh = top - (ry1 - my0) * mm, top - (ry0 - my0) * mm
+    xl, xh = mx_c + (rx0 - px_c) * mm, mx_c + (rx1 - px_c) * mm
+    sel = (cen[:, 1] > yl) & (cen[:, 1] < yh) & (cen[:, 0] > xl) & (cen[:, 0] < xh) & (preview.face_normals[:, 2] > 0.2)
+    if sel.sum() < 50:
+        return {}
+    sub = trimesh.Trimesh(v, preview.faces[sel], process=False)
+    hgt, wid = int(np.ceil((ry1 - ry0) / k)), int(np.ceil((rx1 - rx0) / k))
+    pts, _ = trimesh.sample.sample_surface(sub, int(min(4 * hgt * wid, 1_500_000)), seed=0)
+    r = ((top - pts[:, 1]) / mm + my0 - ry0) / k
+    c = ((pts[:, 0] - mx_c) / mm + px_c - rx0) / k
+    ok = (r >= 0) & (r < hgt) & (c >= 0) & (c < wid)
+    z = np.full((hgt, wid), -np.inf)
+    np.maximum.at(z, (r[ok].astype(int), c[ok].astype(int)), pts[ok, 2])
+    have = np.isfinite(z)
+    z = np.where(have, z, np.nanmin(np.where(have, z, np.nan)))
+    z_hp = z - gaussian_filter(z, 4.0)  # the pattern, not the head's shape
+    hair_r = zoom(hair[hy.min():hy.max() + 1, hx.min():hx.max() + 1].astype(np.float32), (hgt / (ry1 - ry0), wid / (rx1 - rx0)), order=0)[:hgt, :wid] > 0.5
+    hair_r = hair_r[:hgt, :wid] & have[: hair_r.shape[0], : hair_r.shape[1]]
+    if hair_r.sum() < 50:
+        return {}
+    th_m, coh_m, _ = _structure(z_hp.astype(np.float32), hair_r, 1.0, 3.0)
+    th_p = reading["theta"][hy.min():hy.max() + 1, hx.min():hx.max() + 1]
+    co_p = reading["coherence"][hy.min():hy.max() + 1, hx.min():hx.max() + 1]
+    f = (hgt / th_p.shape[0], wid / th_p.shape[1])
+    c2 = zoom(np.cos(2 * th_p), f, order=1)[:hgt, :wid]
+    s2 = zoom(np.sin(2 * th_p), f, order=1)[:hgt, :wid]
+    co = zoom(co_p, f, order=1)[:hgt, :wid]
+    hh = hair_r[: c2.shape[0], : c2.shape[1]]
+    th_p2 = 0.5 * np.arctan2(s2, c2)
+    agree = co[hh] * coh_m[: c2.shape[0], : c2.shape[1]][hh] * np.cos(2 * (th_m[: c2.shape[0], : c2.shape[1]][hh] - th_p2[hh]))
+    return {"hair_flow": round(100.0 * float(agree.sum() / (co[hh].sum() + 1e-9)), 1)}
+
+
 def objective(m: dict) -> float:
-    return float(m.get("score", -100.0) + HELD_W * m.get("held_mean", 0.0) - BUMP_W * m.get("bumps", 0.0))
+    return float(m.get("score", -100.0) + HELD_W * m.get("held_mean", 0.0) - BUMP_W * m.get("bumps", 0.0)
+                 + FLOW_W * m.get("hair_flow", 0.0))
 
 
 def evaluate(inputs: "lab.LabInputs", values: dict):
@@ -85,6 +154,10 @@ def evaluate(inputs: "lab.LabInputs", values: dict):
         m, preview, thumb = lab.score(CODE, body, inputs, thumb_size=THUMB)
     lab._sface.pop(id(inputs), None)  # keyed by object: never let a later photo reuse it
     m.update(bumps(preview, _floor(preview)))
+    try:
+        m.update(hair_flow(preview, _floor(preview), inputs))
+    except Exception:  # noqa: BLE001 - a photo without readable hair just doesn't score it
+        pass
     m.pop("params", None)
     m["objective"] = round(objective(m), 2)
     return m, thumb

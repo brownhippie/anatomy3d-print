@@ -46,6 +46,17 @@ KNOBS = [
     Knob(_SR, "_HAIR_LAYER", 0.004, 0.015, "hair", "long hair over shoulders or chest (m)"),
     Knob(_SR, "_HAIR_HANG", 0.006, 0.02, "hair", "long hair beside the neck, half-thickness at least (m)"),
     Knob(_SR, "_REF_HAIR", 0.006, 0.02, "hair", "most the head grows front to back for hair (m)"),
+    # the hair's pattern
+    Knob(_SR, "_HAIR_STRAND_W", 0.003, 0.01, "hair pattern", "a sculpted strand (lock) is this wide (m)"),
+    Knob(_SR, "_HAIR_STRAND_LEN", 0.02, 0.1, "hair pattern", "a strand runs this long before the next (m)"),
+    Knob(_SR, "_HAIR_STRAND_DEPTH", 0.0005, 0.003, "hair pattern", "grooves between strands, this deep either way (m)"),
+    Knob(_SR, "_HAIR_WAVE_DEPTH", 0.001, 0.006, "hair pattern", "a wave's crest stands this proud (m)"),
+    Knob(_SR, "_HAIR_WAVE_LEN", 0.06, 0.2, "hair pattern", "a wave's length when the photo didn't measure one (m)"),
+    Knob(_SR, "_HAIR_CURL", 0.006, 0.025, "hair pattern", "a curl is this across (m)"),
+    Knob(_SR, "_HAIR_CURL_DEPTH", 0.001, 0.005, "hair pattern", "a curl stands this proud (m)"),
+    Knob(_SR, "_HAIR_COIL", 0.003, 0.012, "hair pattern", "a tight coil is this across (m)"),
+    Knob(_SR, "_HAIR_COIL_DEPTH", 0.0005, 0.003, "hair pattern", "a coil stands this proud (m)"),
+    Knob(_SR, "_HAIRLINE_EDGE", 0.002, 0.01, "hair pattern", "the pattern ends over this at the hairline (m)"),
     # what's worn on the head
     Knob(_SR, "_HAT_PEAK", 0.2, 0.45, "headwear", "a cap's peak reaches this far forward (x face width)"),
     Knob(_SR, "_MASK_SPAN", 0.02, 0.06, "headwear", "a face mask spans hollows narrower than this (m)"),
