@@ -1114,8 +1114,12 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
             known = np.setdiff1d(np.arange(len(V)), inner)
             for k in range(3):
                 flat[:, k] = _harmonic_fill(lap_e, known, flat[known, k])
-        Vs, Fs = subdivide_loop(V, F, iterations=2)
-        Ws, _ = subdivide_loop(np.column_stack([EW, np.zeros(len(V))]), F, iterations=2)
+        # (subdivided as the rest is, but only round the ears: well past the
+        # part kept, so the cut's own edge doesn't change it)
+        near_ear = (EW[F][:, :, build3d].max(axis=(1, 2)) > 0.05)
+        used, inv = np.unique(F[near_ear], return_inverse=True)
+        Vs, Fs = subdivide_loop(V[used], inv.reshape(-1, 3), iterations=2)
+        Ws, _ = subdivide_loop(np.column_stack([EW[used], np.zeros(len(used))]), inv.reshape(-1, 3), iterations=2)
         A = np.asarray(reference["head_axes"], dtype=np.float64)
         sgx, sgy = grid_xy(Vs)
         ear_cov = np.zeros(shape, dtype=bool)
@@ -1206,8 +1210,30 @@ def _ear_solid(P: np.ndarray, T: np.ndarray, inward: np.ndarray, plug: float, th
     ia, ib = n0 + j, n0 + (j + 1) % k
     walls = np.vstack([np.column_stack([b, a, ia]), np.column_stack([b, ia, ib])])
     cap = np.column_stack([ib, ia, np.full(k, n0 + k)])
-    solid = trimesh.Trimesh(V, np.vstack([T, walls, cap]), process=True)
-    return solid if solid.is_volume else None
+    return V, np.vstack([T, walls, cap])
+
+
+def _join_solids(V: np.ndarray, F: np.ndarray, parts: list):
+    """Boolean union (manifold3d) of a closed mesh with closed parts; parts
+    that aren't valid solids are left out. The largest resulting piece (a
+    union can leave slivers)."""
+    from manifold3d import Manifold, Mesh
+
+    def solid(v, f):
+        return Manifold(mesh=Mesh(vert_properties=np.asarray(v, dtype=np.float32), tri_verts=np.asarray(f, dtype=np.uint32)))
+
+    out = solid(V, F)
+    if out.is_empty():
+        raise ValueError("the head is not a closed solid")
+    for v, f in parts:
+        m = solid(v, f)
+        if not m.is_empty() and m.volume() > 0:
+            out = out + m
+    pieces = out.decompose()
+    if len(pieces) > 1:
+        out = max(pieces, key=lambda c: c.num_tri())
+    mesh = out.to_mesh()
+    return np.asarray(mesh.vert_properties[:, :3], dtype=np.float64), np.asarray(mesh.tri_verts, dtype=np.int64)
 
 
 def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
@@ -1852,11 +1878,7 @@ def build_silhouette_relief_mesh(
                 solids.append(solid)
         if solids:
             try:
-                joined = trimesh.boolean.union([trimesh.Trimesh(verts_xyz, faces, process=False)] + solids)
-                pieces = joined.split(only_watertight=False)
-                if len(pieces) > 1:  # slivers the union can leave beside an ear
-                    joined = max(pieces, key=lambda c: len(c.faces))
-                verts_xyz, faces = np.asarray(joined.vertices), np.asarray(joined.faces)
+                verts_xyz, faces = _join_solids(verts_xyz, faces, solids)
             except Exception as exc:  # noqa: BLE001 - the head without separate ears is still a model
                 print(f"Note: could not join the ears ({exc}).")
     verts_xyz = verts_xyz * out_scale
