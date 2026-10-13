@@ -810,12 +810,14 @@ _HAIR_THIN = 0.012  # hair thinner than this is the head's own outline (the skul
 _HAIR_FACE_MEET = 0.012  # hair this near the face comes down to the cheek's level, metres
 _HAIR_NECK_BEHIND = 0.008  # hair beside the neck lies this far behind its front, metres
 _HAIR_NAPE_EDGE = 0.004  # the hairline at the nape: hair ends over this, metres
+_HAIR_BACK_FROM_SIDES = 1.0  # round the back, this share of how far the hair reaches past the skull at the sides
 _NECK_COLLAR = 0.009  # a collar (with its fold) stands this far off the neck, metres
 _NECK_LACE = 0.003  # a necklace stands this proud, metres
 _NECK_WEAR_MAX = 0.025  # a scarf or roll neck stands at most this far off the neck, metres
 _NECK_COLLAR_BELOW = 0.02  # ... and reaches this far below the neck's base, metres
 _NECK_COLLAR_RISE = 0.012  # round the back it rides this much higher than at the sides, metres
 _NECK_DEBUG = None
+_HAIR_DEBUG = None  # a dict to fill with _hair_and_hat's working, when looking into it
 _HAIR_FRINGE = 0.012  # a fringe over the forehead, at most, metres
 _HAIR_LAYER = 0.008  # long hair lying over the shoulders or chest, metres
 _HAIR_HANG = 0.012  # long hair hanging beside the neck: at least this half-thick, metres
@@ -1422,9 +1424,39 @@ def _hair_and_hat(front, back, grid_mask, photo_cells, parts_g, cov, face_mesh, 
     r0, r1, c0, c1 = max(ys.min() - m, 0), min(ys.max() + m + 1, gh), max(xs.min() - m, 0), min(xs.max() + m + 1, gw)
     crop = (slice(r0, r1), slice(c0, c1))
     fo, bo = _offset_variable(front[crop], back[crop], skull[crop], tloc[crop], scale)
+    # round the back the hair is as thick as the front photo shows it
+    # reaching past the skull at the sides, at the same height -- the same
+    # hair going round -- not as thin as the nearest outline (mostly the
+    # crown, where hair lies flat: measured on long full hair, 2 mm at the
+    # back against 21 mm at the sides)
+    reach = np.full(gh, np.nan)
+    for r in np.flatnonzero(skull.any(axis=1)):
+        if r > chin_r:
+            continue
+        sk = np.flatnonzero(skull[r])
+        rg = np.flatnonzero(region[r] | skull[r])
+        vals = []
+        for out_c, sk_c, d_ in ((rg.min(), sk.min(), sk.min() - rg.min()), (rg.max(), sk.max(), rg.max() - sk.max())):
+            if d_ > 0 and hairish[r, out_c]:
+                vals.append(d_ / scale)
+            elif hairish[r, sk_c]:
+                vals.append(0.0)
+        if vals:
+            reach[r] = float(np.mean(vals))
+    tback = tloc
+    known_r = np.isfinite(reach)
+    if known_r.sum() >= 3:
+        rr_ = np.arange(gh)
+        reach = np.interp(rr_, rr_[known_r], reach[known_r])
+        reach = gaussian_filter1d(reach, max(0.15 * face_w * scale, 1.0))  # row to row it stepped: stripes round the back
+        side = np.clip(_HAIR_BACK_FROM_SIDES * reach, 0.0, tmax)[:, None]
+        tback = np.where(skull, np.maximum(tloc, side), tloc)
+    _, bo2 = _offset_variable(front[crop], back[crop], skull[crop], tback[crop], scale)
     Fo = np.full((gh, gw), -np.inf)
     Bo = np.full((gh, gw), np.inf)
     Fo[crop], Bo[crop] = fo, bo
+    Bb = np.full((gh, gw), np.inf)
+    Bb[crop] = bo2
     shell = np.isfinite(Fo) & np.isfinite(Bo) & (Fo > Bo)
     # a front photo can't say whether hair piled high sits forward or back;
     # it goes up and back: never more than a fringe in front of the forehead
@@ -1433,6 +1465,9 @@ def _hair_and_hat(front, back, grid_mask, photo_cells, parts_g, cov, face_mesh, 
     if skull[br, fcols].any():
         brow_front = float(front[br, fcols][skull[br, fcols]].max())
         Fo = np.minimum(Fo, brow_front + _HAIR_FRINGE * px_per_m)
+    if _HAIR_DEBUG is not None:
+        _HAIR_DEBUG.update(tloc=tloc.copy(), Fo=Fo.copy(), Bo=Bo.copy(), skull=skull.copy(), region=region.copy(),
+                           hair_here=hair_here.copy(), d_skull=d_skull.copy(), edge=edge.copy())
     F, B = front.copy(), back.copy()
     # how much it's hair rather than the head's own outline: none for a
     # short cut, all of it from twice that, smoothly in between (a hard
@@ -1484,9 +1519,9 @@ def _hair_and_hat(front, back, grid_mask, photo_cells, parts_g, cov, face_mesh, 
     # about the ear lobes even when the sides are short)
     nape = max(base_r, max((r for r in np.flatnonzero(hair_here.any(axis=1)) if r <= chin_r), default=0))
     w = np.clip((nape - rows) / max(_HAIR_NAPE_EDGE * px_per_m * scale, 1.0) + 0.5, 0.0, 1.0)  # a hairline, not a fade
-    on = skull & shell & np.isfinite(Bo)
-    w = w * np.clip((tloc - _HAIR_THIN * px_per_m) / (_HAIR_THIN * px_per_m) + 1.0, 0.0, 1.0)
-    B = np.where(on, np.minimum(B, B + w * (np.where(on, Bo, B) - B)), B)
+    on = skull & np.isfinite(Bb)
+    w = w * np.clip((tback - _HAIR_THIN * px_per_m) / (_HAIR_THIN * px_per_m) + 1.0, 0.0, 1.0)
+    B = np.where(on, np.minimum(B, B + w * (np.where(on, Bb, B) - B)), B)
     # seen over the skull from the front: on it, a fringe thin, edges feathered
     over = hairish & skull
     lay = np.where(over & shell, np.maximum(Fo - F, 0.0), 0.0)

@@ -46,6 +46,7 @@ KNOBS = [
     Knob(_SR, "_HAIR_LAYER", 0.004, 0.015, "hair", "long hair over shoulders or chest (m)"),
     Knob(_SR, "_HAIR_HANG", 0.006, 0.02, "hair", "long hair beside the neck, half-thickness at least (m)"),
     Knob(_SR, "_REF_HAIR", 0.006, 0.02, "hair", "most the head grows front to back for hair (m)"),
+    Knob(_SR, "_HAIR_BACK_FROM_SIDES", 0.5, 1.3, "hair", "round the back: this share of the hair's reach past the skull at the sides"),
     # the hair's pattern
     Knob(_SR, "_HAIR_STRAND_W", 0.003, 0.01, "hair pattern", "a sculpted strand (lock) is this wide (m)"),
     Knob(_SR, "_HAIR_STRAND_LEN", 0.02, 0.1, "hair pattern", "a strand runs this long before the next (m)"),
