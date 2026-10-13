@@ -810,6 +810,12 @@ _HAIR_THIN = 0.012  # hair thinner than this is the head's own outline (the skul
 _HAIR_FACE_MEET = 0.012  # hair this near the face comes down to the cheek's level, metres
 _HAIR_NECK_BEHIND = 0.008  # hair beside the neck lies this far behind its front, metres
 _HAIR_NAPE_EDGE = 0.004  # the hairline at the nape: hair ends over this, metres
+_NECK_COLLAR = 0.009  # a collar (with its fold) stands this far off the neck, metres
+_NECK_LACE = 0.003  # a necklace stands this proud, metres
+_NECK_WEAR_MAX = 0.025  # a scarf or roll neck stands at most this far off the neck, metres
+_NECK_COLLAR_BELOW = 0.02  # ... and reaches this far below the neck's base, metres
+_NECK_COLLAR_RISE = 0.012  # round the back it rides this much higher than at the sides, metres
+_NECK_DEBUG = None
 _HAIR_FRINGE = 0.012  # a fringe over the forehead, at most, metres
 _HAIR_LAYER = 0.008  # long hair lying over the shoulders or chest, metres
 _HAIR_HANG = 0.012  # long hair hanging beside the neck: at least this half-thick, metres
@@ -1569,6 +1575,123 @@ def _wear_on_face(front: np.ndarray, grid_mask: np.ndarray, parts_g: np.ndarray,
     return out
 
 
+def _neck_wear(front, back, grid_mask, photo_cells, parts_g, cov, face_mesh, neck, y0, x0, scale, pad, px_per_m):
+    """The neck and the collar round it, in the build grid (depth in photo
+    px, z toward the camera).
+
+    The neck is the reference body's (`neck`, _neck_geometry): its width,
+    and from under the jaw to its base -- where the body model's neck ends,
+    not the shoulder joints, which can sit well down the chest, nor the
+    outline there, which can already be the shoulders. A collar -- a shirt or polo
+    collar, a crew or V neckline, a roll neck, a scarf -- is a band all the
+    way round it:
+    - at the front, where the photo shows clothes against the neck, it
+      stands off by its thickness with a crisp top edge (a shirt collar's
+      points lying on the chest);
+    - at the sides its top is where the clothes first touch the neck's
+      sides in the photo;
+    - round the back, which the photo can't show, it carries on behind the
+      neck and rides up toward the middle by _NECK_COLLAR_RISE (a collar
+      sits higher on the back of the neck), with the same crisp top edge,
+      fading into the back of the shirt or jacket below the neck's base.
+    It's _NECK_COLLAR thick, or as far out as the photo shows the covering
+    past the neck (a scarf, a roll neck: up to _NECK_WEAR_MAX). With no
+    clothes against the neck there's no collar. A necklace (an accessory
+    on bare neck or chest skin) is a slight raised band."""
+    from scipy.ndimage import binary_dilation
+
+    from .head_parts import ACCESSORY, BODY_SKIN, CLOTHES
+
+    gh, gw = grid_mask.shape
+    fm = np.asarray(face_mesh, dtype=np.float64)[:, :2]
+    to_r = lambda y: (y - y0) * scale + pad  # noqa: E731
+    to_c = lambda x: (x - x0) * scale + pad  # noqa: E731
+    if neck is None:
+        return front, back
+    chin_r = int(round(to_r(fm[152, 1])))
+    base_r = int(round(to_r(neck["base_y"])))
+    below_r = int(round(to_r(neck["base_y"] + _NECK_COLLAR_BELOW * px_per_m)))
+    c_face = int(round(to_c((fm[234, 0] + fm[454, 0]) / 2.0)))
+    if not 0 < chin_r < below_r < gh or not 0 <= c_face < gw:
+        return front, back
+    rows = np.arange(gh)[:, None]
+    cols = np.arange(gw)[None, :]
+    F, B = front.copy(), back.copy()
+    # a necklace: an accessory lying on bare skin below the chin
+    lace = (parts_g == ACCESSORY) & photo_cells & (rows > chin_r) & binary_dilation(parts_g == BODY_SKIN, iterations=2)
+    if lace.any():
+        F = F + gaussian_filter(lace.astype(np.float32), 0.8) * _NECK_LACE * px_per_m
+    # the neck: the body model's own, across
+    cn = to_c(neck["cx"])
+    half = max(neck["half"] * scale, 2.0)
+    nl, nr = cn - half, cn + half
+    # clothes against the neck: in its columns (and a little out, a collar
+    # stands off it), from just above the chin line down past its base
+    t_c = _NECK_COLLAR * px_per_m
+    out_c = t_c * scale + 2
+    zone = (np.abs(cols - cn) <= half + out_c) & (rows >= chin_r - half) & (rows <= below_r)
+    wear = (parts_g == CLOTHES) & photo_cells & zone
+    if wear.sum() < 4:
+        return F, B
+    # its top at the sides: the first row the clothes touch each side
+    tops = []
+    for side in (-1, 1):
+        edge = (np.abs(cols - (cn + side * half)) <= out_c) & zone
+        rr = np.flatnonzero((wear & edge).any(axis=1))
+        if len(rr):
+            tops.append(rr.min())
+    if not tops:
+        return F, B
+    top_side = float(np.median(tops))
+    if _NECK_DEBUG is not None:
+        _NECK_DEBUG.update(chin_r=chin_r, base_r=base_r, below_r=below_r, top_side=top_side, half=half, cn=cn, tops=tops)
+    # how thick: a collar, or as far past the neck as the photo shows it
+    reach = 0.0
+    for r in range(int(top_side), min(base_r, gh - 1) + 1):
+        w = np.flatnonzero(wear[r])
+        if len(w):
+            reach = max(reach, (max(nl - w.min(), w.max() - nr, 0) - 1) / scale)
+    t = float(np.clip(reach, t_c, _NECK_WEAR_MAX * px_per_m))
+    # fade into the torso's clothes below the neck's base
+    fade = np.clip((below_r - rows) / max(below_r - base_r, 1.0), 0.0, 1.0)
+    # the front: the photo's collar, a crisp top edge where its label starts
+    front_c = wear & grid_mask & (np.abs(cols - cn) <= half + out_c)
+    F = np.where(front_c, F + t * fade, F)
+    # round the back: from the sides' top, riding up toward the middle
+    rise = _NECK_COLLAR_RISE * px_per_m * scale
+    dx = np.clip((cols - cn) / (half + out_c), -1.0, 1.0)
+    top_back = top_side - rise * (1.0 - dx * dx)
+    band = (np.abs(cols - cn) <= half + out_c) & grid_mask
+    k = np.clip(rows - top_back + 0.5, 0.0, 1.0) * fade * band  # crisp top (half a cell, no steps)
+    B = B - t * k
+    # its sides: the neck's edge columns stand out by the same thickness
+    # front and back (already in the outline where the photo shows it)
+    B = np.minimum(B, F - 1.0 / scale)
+    # along the band (not across its top edge) the labels' raggedness
+    # smoothed out
+    ring = binary_dilation(front_c | (k > 0), iterations=1) & grid_mask
+    if ring.any():
+        F = np.where(ring, _masked_blur(F, ring, 0.8), F)
+        B = np.where(ring, _masked_blur(B, ring, 0.8), B)
+        B = np.minimum(B, F - 1.0 / scale)
+    return F, B
+
+
+def _neck_geometry(reference: dict) -> Optional[dict]:
+    """The reference body's neck in the photo (px): where it ends at the
+    front ("base_y"), its middle across ("cx") and half its width ("half")."""
+    names = [str(n) for n in reference.get("part_names", [])]
+    if "neck" not in names or reference.get("part_w") is None:
+        return None
+    V = np.asarray(reference["vertices"])
+    neck = np.asarray(reference["part_w"])[:, names.index("neck")] > 0.5
+    if neck.sum() < 10:
+        return None
+    x = V[neck, 0]
+    return {"base_y": float(np.percentile(V[neck, 1], 90)), "cx": float(np.median(x)),
+            "half": float((np.percentile(x, 95) - np.percentile(x, 5)) / 2.0)}
+
+
 def _parts_on_grid(labels: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
     """head_parts labels (photo px) at each build-grid cell (nearest)."""
     gh, gw = grid_shape
@@ -2002,6 +2125,8 @@ def build_silhouette_relief_mesh(
         if parts_g is not None and face_mesh is not None:
             front0, back0, grid_mask = _hair_and_hat(front0, back0, grid_mask, photo_cells, parts_g, inside | (cov & grid_mask),
                                                      face_mesh, y0, x0, scale, pad, float(reference["px_per_m"]))
+            front0, back0 = _neck_wear(front0, back0, grid_mask, photo_cells, parts_g, inside | (cov & grid_mask), face_mesh,
+                                       _neck_geometry(reference), y0, x0, scale, pad, float(reference["px_per_m"]))
             front0, back0 = np.where(grid_mask, front0, 0.0), np.where(grid_mask, back0, 0.0)
     mid0 = np.where(grid_mask, (front0 + back0) / 2.0, 0.0)
     if edge == "hard":
