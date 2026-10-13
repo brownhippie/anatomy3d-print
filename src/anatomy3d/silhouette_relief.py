@@ -804,6 +804,25 @@ _KNEE_REACH = 0.9
 _REF_BARE_PARTS = ("hand.L", "hand.R")
 _REF_RELIEF_MAX = 0.015  # photo-depth detail on top of the reference, metres
 _REF_BACK_SMOOTH = 0.02  # clothing over the back: smoothing radius, metres
+# A shirt or jacket over a man's chest spans the hollow between the
+# pectorals and the crease under them: the torso's front is lifted onto a
+# ball this size (metres) rolled over it. (Bare, the body model's chest read
+# as breasts under a suit.)
+_REF_DRAPE = 0.08
+_REF_HANG = 0.15  # ... and hangs from it: falling back at most this much per unit down
+# Ears the photo shows are built in 3D (see _ear_solid): the ear itself
+# (weight >= _REF_EAR_ROOT; the head is sampled with smooth skin across its
+# root) and a skirt of skin round it (>= _REF_EAR_BASE) sunk up to
+# _REF_EAR_SINK (metres) under the head's surface, with a plug
+# _REF_EAR_PLUG into the head, never thinner than _REF_EAR_MIN_MM on the
+# print (a real ear is about _REF_EAR_THICK thick)
+_REF_EAR_HAIR = 0.015  # an ear whose base grew out further than this (metres) is under hair: not built
+_REF_EAR_ROOT = 0.95
+_REF_EAR_BASE = 0.8
+_REF_EAR_SINK = 0.005
+_REF_EAR_PLUG = 0.02
+_REF_EAR_MIN_MM = 1.2
+_REF_EAR_THICK = 0.004
 
 
 def _raster_depth(gx, gy, depth, faces, shape):
@@ -877,6 +896,62 @@ def _harmonic_fill(lap, known, values):
     return x
 
 
+def _drape_chest(V: np.ndarray, F: np.ndarray, torso_w: np.ndarray, px_per_m: float, joints: dict) -> np.ndarray:
+    """Cloth over a man's chest (photo px, depth toward the back): the front
+    of the chest lifted toward the camera onto a ball of _REF_DRAPE rolled
+    over it, and hanging from the chest down instead of tucking in under it.
+    Only the chest between the arms, collarbones to lower ribs: past it the
+    arms, armpits and neck keep their own shape."""
+    from scipy.ndimage import grey_closing
+
+    t = torso_w > 0.5
+    tf = F[t[F].all(axis=1)]
+    need = ("left_shoulder", "right_shoulder", "left_hip", "right_hip")
+    if len(tf) < 50 or not all(k in joints for k in need):
+        return V
+    cell = 0.01 * px_per_m  # 1 cm cells
+    ox, oy = V[t, 0].min() - 2 * cell, V[t, 1].min() - 2 * cell
+    gx, gy = (V[:, 0] - ox) / cell, (V[:, 1] - oy) / cell
+    shape = (int(np.ceil(gy[t].max())) + 3, int(np.ceil(gx[t].max())) + 3)
+    near, _ = _raster_depth(gx, gy, V[:, 2], tf, shape)
+    have = np.isfinite(near)
+    if have.sum() < 20:
+        return V
+    rise = np.where(have, -near, 0.0)  # toward the camera
+    n = int(round(_REF_DRAPE * 100))
+    yy, xx = np.mgrid[-n:n + 1, -n:n + 1]
+    ball = (yy**2 + xx**2) <= n * n
+    R = _REF_DRAPE * px_per_m
+    cap = np.where(ball, np.sqrt(np.maximum(R * R - (yy**2 + xx**2) * cell * cell, 0.0)) - R, 0.0)
+    floor = float(rise[have].min()) - 4.0 * R
+    cloth = grey_closing(np.where(have, rise, floor), footprint=ball, structure=cap)
+    # hanging: going down, falls back toward the body by at most _REF_HANG per cell
+    for r in range(1, shape[0]):
+        cloth[r] = np.where(have[r] & have[r - 1], np.maximum(cloth[r], cloth[r - 1] - _REF_HANG * cell), cloth[r])
+    # the chest only
+    J = {k: np.asarray(joints[k], dtype=np.float64) for k in need}
+    sh = (J["left_shoulder"] + J["right_shoulder"]) / 2.0
+    hp = (J["left_hip"] + J["right_hip"]) / 2.0
+    sw = float(np.linalg.norm(J["left_shoulder"][:2] - J["right_shoulder"][:2]))
+    tl = float(hp[1] - sh[1])
+    if sw < 4 * cell or tl < 4 * cell:
+        return V
+    cy, cx = np.mgrid[0:shape[0], 0:shape[1]]
+    px, py = cx * cell + ox, cy * cell + oy
+
+    def band(v, a, b, soft):
+        return np.clip((v - a) / soft + 0.5, 0.0, 1.0) * np.clip((b - v) / soft + 0.5, 0.0, 1.0)
+
+    zone = band(px, sh[0] - 0.42 * sw, sh[0] + 0.42 * sw, 0.15 * sw) * band(py, sh[1] + 0.05 * tl, sh[1] + 0.6 * tl, 0.15 * tl)
+    lift = np.where(have, np.maximum(cloth - rise, 0.0) * zone, 0.0)
+    lift = _masked_blur(lift, have, 1.0)
+    at = map_coordinates(lift, [gy, gx], order=1, mode="constant", cval=0.0)
+    facing = np.clip((-_vertex_normals(V, F)[:, 2] - 0.2) / 0.3, 0.0, 1.0)  # front-facing (depth points back)
+    V = V.copy()
+    V[:, 2] -= at * facing * np.clip((torso_w - 0.5) / 0.3, 0.0, 1.0)
+    return V
+
+
 def _person_extent(mask: np.ndarray, hip_y: Optional[float], knee_y: Optional[float], bust_mode: bool):
     """How much of a person to build: never legs the photo doesn't show. A
     photo that ends between the hips and the knees is cut back to the hip
@@ -926,6 +1001,12 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
                 bare |= part_w[:, names.index(name)] > 0.5
         head = part_w[:, names.index("head")] if "head" in names else np.zeros(len(V))
         depth_share = 1.0 - (1.0 - _REF_CLOTH_DEPTH) * (1.0 - head)
+        # the ears don't measure the outline (they're placed to it after),
+        # they ride along with the skin they sit on
+        ear_w = reference.get("ear_w")
+        ear_w = np.zeros((len(V), 0)) if ear_w is None else np.asarray(ear_w, dtype=np.float64)
+        on_ear = ear_w.max(axis=1) > 0.05 if ear_w.shape[1] else np.zeros(len(V), dtype=bool)
+        ear_grew = np.zeros(ear_w.shape[1])
         lap = _mesh_laplacian(F, len(V))
         # distance to the photo's outline (photo px, + inside), measured at the
         # photo's own resolution and smoothed: the grid's pixel steps, read
@@ -942,7 +1023,7 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
             r = np.clip(np.rint(gy).astype(int), 0, shape[0] - 1)
             c = np.clip(np.rint(gx).astype(int), 0, shape[1] - 1)
             inb = (gy >= 0) & (gy < shape[0]) & (gx >= 0) & (gx < shape[1])
-            on_rim = inb & rim[r, c] & (np.abs(_vertex_normals(V, F)[:, 2]) < 0.35) & ~bare
+            on_rim = inb & rim[r, c] & (np.abs(_vertex_normals(V, F)[:, 2]) < 0.35) & ~bare & ~on_ear
             if signed_px is not None:
                 gap = map_coordinates(signed_px, [V[:, 1], V[:, 0]], order=1, mode="nearest")
             else:
@@ -958,6 +1039,12 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
             # outline's ears and hair say nothing about the skull's length)
             grow_z = np.minimum(np.maximum(total, 0.0), head * hair + (1.0 - head) * hi)
             step[:, 2] = nrm0[:, 2] * grow_z * depth_share
+            for i in range(ear_w.shape[1]):
+                w = ear_w[:, i]
+                base = (w > 0.02) & (w < 0.5)
+                if base.any():
+                    ear_grew[i] = float(np.linalg.norm(step[base].mean(axis=0)))
+                    step = step + w[:, None] * (step[base].mean(axis=0) - step)
             V = V0 + step
 
     # Depth margin, in 3D: every point's front-to-back offset from its own
@@ -970,6 +1057,14 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
         m = hw * _REF_HEAD_MARGIN + (1.0 - hw) * _REF_DEPTH_MARGIN
         core = np.asarray(core, dtype=np.float64)
         V[:, 2] = core + m * (V[:, 2] - core)
+    report = reference.get("report") or {}
+    if part_w is not None and report.get("gender") == "male" and "torso" in names:
+        V = _drape_chest(V, F, part_w[:, names.index("torso")], float(reference["px_per_m"]), reference.get("joints_px") or {})
+    # the ears as the photo shows them: where they start and end, how far out
+    if reference.get("ears") and reference.get("ear_w") is not None and reference.get("head_axes") is not None:
+        from .body_reference import place_ears
+
+        V = place_ears(V, np.asarray(reference["ear_w"], dtype=np.float64), reference["head_axes"], reference["ears"])
 
     # Its hands are open with the fingers spread -- rarely how a photo shows
     # them -- and stood out as shelves and fins: shrink them into the wrist
@@ -986,6 +1081,61 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
     # its triangles don't show as flat facets
     from trimesh.remesh import subdivide_loop
 
+    # A real ear stands off the head, cupped in front and open behind it:
+    # one front and one back surface per point can't hold that (they filled
+    # it in solid, a rounded lump on the side of the head). Where the photo
+    # shows the ears, each is kept as a 3D piece -- the ear and the skin at
+    # its base -- joined to the finished head (_ear_solid); the head itself
+    # is sampled with smooth skin spanning the ear's base.
+    # Not seen in the photo, an ear is still built -- the body model's own,
+    # proportioned to its head -- unless its base had to grow out to the
+    # outline (hair over it: the ear stays under the hair).
+    ears3d = None
+    EW = reference.get("ear_w")
+    build3d = []
+    if EW is not None and reference.get("head_axes") is not None and part_w is not None:
+        EW = np.asarray(EW, dtype=np.float64)
+        seen = reference.get("ears") or {}
+        build3d = [side in seen or (not seen and ear_grew[i] <= _REF_EAR_HAIR * float(reference["px_per_m"]))
+                   for i, side in enumerate("LR")]
+    if any(build3d):
+        lap_e = _mesh_laplacian(F, len(V))
+        flat = V.copy()
+        for i in range(EW.shape[1]):
+            if not build3d[i]:
+                continue
+            pf = (EW[F, i] >= _REF_EAR_ROOT).all(axis=1)
+            if pf.sum() < 20:
+                continue
+            e = np.sort(np.vstack([F[pf][:, [0, 1]], F[pf][:, [1, 2]], F[pf][:, [2, 0]]]), axis=1)
+            uq, cnt = np.unique(e, axis=0, return_counts=True)
+            inner = np.setdiff1d(np.unique(F[pf]), np.unique(uq[cnt == 1]))
+            known = np.setdiff1d(np.arange(len(V)), inner)
+            for k in range(3):
+                flat[:, k] = _harmonic_fill(lap_e, known, flat[known, k])
+        Vs, Fs = subdivide_loop(V, F, iterations=2)
+        Ws, _ = subdivide_loop(np.column_stack([EW, np.zeros(len(V))]), F, iterations=2)
+        A = np.asarray(reference["head_axes"], dtype=np.float64)
+        sgx, sgy = grid_xy(Vs)
+        ear_cov = np.zeros(shape, dtype=bool)
+        patches = []
+        for i in range(EW.shape[1]):
+            if not build3d[i]:
+                continue
+            pf = (Ws[Fs, i] >= _REF_EAR_BASE).all(axis=1)
+            if pf.sum() < 20:
+                continue
+            en, _ = _raster_depth(sgx, sgy, Vs[:, 2], Fs[pf], shape)
+            ear_cov |= np.isfinite(en)
+            used, inv = np.unique(Fs[pf], return_inverse=True)
+            out = A[:, 0] * (1.0 if i == 0 else -1.0)  # subject's left ear first
+            skirt = np.clip((_REF_EAR_ROOT - Ws[used, i]) / (_REF_EAR_ROOT - _REF_EAR_BASE), 0.0, 1.0)
+            P = Vs[used] - out * (skirt * _REF_EAR_SINK * float(reference["px_per_m"]))[:, None]
+            patches.append({"vertices": P, "faces": inv.reshape(-1, 3), "inward": -out})
+        if patches:
+            ears3d = {"patches": patches, "cov": ear_cov, "plug": _REF_EAR_PLUG * float(reference["px_per_m"]),
+                      "thick": _REF_EAR_THICK * float(reference["px_per_m"])}
+            V = flat
     V, F = subdivide_loop(V, F, iterations=2)
     gx, gy = grid_xy(V)
     near, far = _raster_depth(gx, gy, V[:, 2], F, shape)
@@ -1021,7 +1171,42 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
         zone *= np.clip(distance_transform_edt(cov) / (0.12 * face_w), 0.0, 1.0)
         broad = _masked_blur(front, cov, 0.12 * face_w)
         front = zone * broad + (1.0 - zone) * front
-    return front, back, cov
+    return front, back, cov, ears3d
+
+
+def _ear_solid(P: np.ndarray, T: np.ndarray, inward: np.ndarray, plug: float, thicken: float):
+    """A closed solid from an ear's surface patch (the ear and the skin at its
+    base, outward-facing): thickened along its normals, its rim carried
+    `plug` along `inward` into the head and capped. None if the patch isn't
+    a single disc."""
+    if thicken > 0:
+        P = P + trimesh.Trimesh(P, T, process=False).vertex_normals * thicken
+    edges = np.vstack([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]])
+    have = set(map(tuple, edges.tolist()))
+    rim = [(a, b) for a, b in edges.tolist() if (b, a) not in have]
+    nxt = dict(rim)
+    if not rim or len(nxt) != len(rim):
+        return None
+    loop = [rim[0][0]]
+    while len(loop) <= len(rim):
+        n = nxt.get(loop[-1])
+        if n is None:
+            return None
+        if n == loop[0]:
+            break
+        loop.append(n)
+    if len(loop) != len(rim):
+        return None  # more than one rim: not a disc
+    k, n0 = len(loop), len(P)
+    ring = P[loop] + inward * plug
+    V = np.vstack([P, ring, ring.mean(axis=0)])
+    j = np.arange(k)
+    a, b = np.asarray(loop), np.asarray(loop)[(j + 1) % k]
+    ia, ib = n0 + j, n0 + (j + 1) % k
+    walls = np.vstack([np.column_stack([b, a, ia]), np.column_stack([b, ia, ib])])
+    cap = np.column_stack([ib, ia, np.full(k, n0 + k)])
+    solid = trimesh.Trimesh(V, np.vstack([T, walls, cap]), process=True)
+    return solid if solid.is_volume else None
 
 
 def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
@@ -1358,7 +1543,7 @@ def build_silhouette_relief_mesh(
            if reference is not None else None)
     photo_cells = grid_mask
     if ref is not None:
-        rf, rb, cov = ref
+        rf, rb, cov, ears3d = ref
         # where the reference runs just past the pixel outline, its own round
         # edge closes the solid; cutting it at the pixel steps left a wall
         # stepping row by row along the whole outline
@@ -1373,6 +1558,9 @@ def build_silhouette_relief_mesh(
         slack = max(2.0, _REF_EDGE_SLACK * float(reference["px_per_m"]) * scale)
         ring = cov & (distance_transform_edt(~grid_mask) <= slack)
         wide_gap = binary_opening(grid_mask & ~cov, iterations=2)
+        if ears3d is not None:
+            # the photo's ears are the 3D ears' (no outline-based slab there)
+            wide_gap &= ~binary_dilation(ears3d["cov"], iterations=3)
         # below the ankles the outline takes in the floor shadow around the
         # feet: there the body's own feet decide (no slabs of shadow)
         Jx = reference["joints_px"]
@@ -1384,6 +1572,7 @@ def build_silhouette_relief_mesh(
         # keep the outline-based body's depth position; the reference's shape
         shift = float(np.median(((front0 + back0) / 2.0 - (rf + rb) / 2.0)[inside]))
         rf, rb = rf + shift, rb + shift
+        ref_shift = shift
         if extent == "torso":
             # the back hangs straight down from the small of the back: the
             # seat below it isn't part of a torso
@@ -1646,6 +1835,29 @@ def build_silhouette_relief_mesh(
 
     height = verts_xyz[:, 1].max() - verts_xyz[:, 1].min()
     out_scale = target_height_mm / height if height > 1e-6 else 1.0
+    if ref is not None and ref[3] is not None:
+        # the 3D ears, joined to the head (photo px -> this frame)
+        ears3d = ref[3]
+        thicken = max(0.0, 0.5 * (_REF_EAR_MIN_MM / out_scale - ears3d["thick"]))
+        solids = []
+        for patch in ears3d["patches"]:
+            P = patch["vertices"]
+            Q = np.column_stack([(P[:, 0] - x0) + pad / scale - (gw / scale) / 2.0,
+                                 (gh / scale) / 2.0 - ((P[:, 1] - y0) + pad / scale),
+                                 -P[:, 2] + ref_shift])
+            inward = np.asarray(patch["inward"], dtype=np.float64) * np.array([1.0, -1.0, -1.0])
+            solid = _ear_solid(Q, patch["faces"], inward, ears3d["plug"], thicken)
+            if solid is not None:
+                solids.append(solid)
+        if solids:
+            try:
+                joined = trimesh.boolean.union([trimesh.Trimesh(verts_xyz, faces, process=False)] + solids)
+                pieces = joined.split(only_watertight=False)
+                if len(pieces) > 1:  # slivers the union can leave beside an ear
+                    joined = max(pieces, key=lambda c: len(c.faces))
+                verts_xyz, faces = np.asarray(joined.vertices), np.asarray(joined.faces)
+            except Exception as exc:  # noqa: BLE001 - the head without separate ears is still a model
+                print(f"Note: could not join the ears ({exc}).")
     verts_xyz = verts_xyz * out_scale
 
     return BodyMesh(vertices=verts_xyz, faces=faces)

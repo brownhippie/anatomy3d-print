@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.ndimage import distance_transform_edt, map_coordinates, median_filter
 
 _DATA = Path(__file__).parent / "data" / "body_reference.npz"
 
@@ -52,6 +52,16 @@ _ARM_PLANE = 0.5  # same for an upper arm or a forearm that isn't folded
 # ankles within this of their hips, the neck within this of the pelvis (m)
 _MAX_LEG_LEAN = 0.20
 _MAX_TRUNK_LEAN = 0.15
+# Ears, read off the photo's outline beside the head. Their ruler is the
+# face's own: brow line to nose base, about one ear's length on most people.
+_BROW = {"R": 105, "L": 334}  # face mesh: top of each eyebrow (subject's right, left)
+_FACE_EDGE = {"R": 234, "L": 454}  # face mesh: the face's side, where the ear starts
+_EAR_DROP = 0.06  # the lobe's end: the outline stepping in by this much (x brow-to-nose-base)
+_EAR_KINK = 0.05  # the ear's top: the outline turning out by this much (else the brow line)
+_EAR_STANDS = (0.08, 0.6)  # how far out of the head's line an ear can stand
+_EAR_LENGTH = (0.75, 1.3)  # how long an ear can be
+_EAR_TURN = (-0.35, 0.8)  # radians an ear may swing in toward / out from the head
+_EAR_SCALE = (0.8, 1.5)
 _MAX_FOREARM_LIFT = (0.10, 0.18)  # metres folded forearms/hands stand off the torso's front: median, most
 _REST_MAX = 0.10  # fit: a folded forearm's surface stays within this of the torso's front
 
@@ -82,7 +92,8 @@ def _body(gender: str) -> dict:
             "faces": d["faces"].astype(np.int64), "skin_idx": d["skin_idx"].astype(np.int64), "skin_w": skin_w,
             "kp_names": [str(k) for k in d["kp_names"]], "kp_idx": d["kp_idx"].astype(np.int64),
             "kp_w": d["kp_w"].astype(np.float64), "part_w": part_w, "part_names": [str(p) for p in d["part_names"]],
-            "dverts": d[f"{gender}_dvertices"].astype(np.float64), "djoints": d[f"{gender}_djoints"].astype(np.float64)}
+            "dverts": d[f"{gender}_dvertices"].astype(np.float64), "djoints": d[f"{gender}_djoints"].astype(np.float64),
+            "ear_w": d["ear_w"].astype(np.float64)}
 
 
 def _rest(body: dict, ph: np.ndarray, idx: Optional[np.ndarray] = None):
@@ -162,6 +173,152 @@ def _photo_targets(pose: dict, face_mesh: Optional[np.ndarray]):
                 xy.append(pose[n])
                 w.append(wt)
     return names, np.asarray(xy, dtype=np.float64), np.asarray(w)
+
+
+def measure_ears(photo_mask: np.ndarray, face_mesh: Optional[np.ndarray], px_per_m: float):
+    """Each ear as the photo's outline shows it: where it starts (the outline
+    turning out of the hair or temple, or the brow line when it doesn't
+    show), where the lobe ends (the outline stepping in to the jaw), and how
+    far it stands out of the head's own line at its widest. Keyed by the
+    subject's side ("L" is on the photo's right); a side whose ear the
+    outline doesn't show (hair over it, the head turned) is left out. With
+    one ear seen, the other gets its size; with none, the body model's own
+    ear stays. Returns (ears, report)."""
+    if face_mesh is None:
+        return {}, {"source": "none"}
+    f = np.asarray(face_mesh, dtype=np.float64)[:, :2]
+    H, W = photo_mask.shape
+    brow_mid = (f[_BROW["R"], 1] + f[_BROW["L"], 1]) / 2.0
+    ruler = float(f[2, 1] - brow_mid)  # brow line to nose base (subnasale)
+    if ruler < 6:
+        return {}, {"source": "none"}
+    k = max(2, int(round(0.05 * ruler)))
+    xc = int(round((f[_FACE_EDGE["R"], 0] + f[_FACE_EDGE["L"], 0]) / 2.0))  # the head's middle
+    seen = {}
+    for side, out in (("R", -1), ("L", 1)):
+        brow = float(f[_BROW[side], 1])
+        base = float(f[2, 1]) + (brow - brow_mid)  # nose base, tilted with the brows
+        x0 = float(f[_FACE_EDGE[side], 0])
+        rows = np.arange(max(int(brow - 0.6 * ruler), k), min(int(base + 0.8 * ruler), H - k))
+        if len(rows) < 4 * k or not 0 <= xc < W:
+            continue
+        # how far out of the face's side the outline reaches, row by row
+        # (walking out from the head's middle; negative where it's inside)
+        e = np.full(len(rows), np.nan)
+        for i, y in enumerate(rows):
+            line = photo_mask[y, xc:] if out > 0 else photo_mask[y, : xc + 1][::-1]
+            if line[0]:
+                gap = np.flatnonzero(~line)
+                e[i] = (gap[0] if len(gap) else len(line)) - out * (x0 - xc)
+        if np.isnan(e).any():
+            continue
+        e = median_filter(e, size=3, mode="nearest")
+        ix = lambda y: int(np.clip(round(y - rows[0]), k, len(rows) - k - 1))  # noqa: E731
+        # the lobe: the sharpest step in near the nose base
+        lo, hi = ix(base - 0.35 * ruler), ix(base + 0.6 * ruler)
+        drop = e[lo:hi] - e[lo + k:hi + k]
+        if not len(drop) or drop.max() < _EAR_DROP * ruler:
+            continue
+        b = lo + int(np.argmax(drop))
+        b += int(np.argmax(e[b:b + k] - e[b + 1:b + k + 1]))  # the row it steps in on
+        # the top: the outline turning out near the brow line
+        lo, hi = ix(brow - 0.5 * ruler), ix(brow + 0.35 * ruler)
+        kink = e[lo + k:hi + k] - 2 * e[lo:hi] + e[lo - k:hi - k]
+        t = lo + int(np.argmax(kink)) if len(kink) and kink.max() >= _EAR_KINK * ruler else ix(brow)
+        if not _EAR_LENGTH[0] * ruler <= b - t <= _EAR_LENGTH[1] * ruler:
+            continue
+        # how far it stands out of the head's line: the outline against the
+        # straight line from where it starts to the jaw below the lobe
+        j = min(b + k, len(rows) - 1)
+        line = e[t] + (e[j] - e[t]) * (np.arange(t, b + 1) - t) / max(j - t, 1)
+        stands = e[t:b + 1] - line
+        if not _EAR_STANDS[0] * ruler <= stands.max() <= _EAR_STANDS[1] * ruler:
+            continue
+        # where it reaches furthest out (below its top edge: a cap's brim or
+        # hair there isn't the ear)
+        o0 = t + int(round(0.15 * (b - t)))
+        o = o0 + int(np.argmax(e[o0:b + 1]))
+        seen[side] = {"top": float(rows[t]), "bottom": float(rows[b]), "outer": [x0 + out * float(e[o]), float(rows[o])],
+                      "stands_px": float(stands.max()), "top_from": "outline" if t != ix(brow) else "brow line"}
+    ears = dict(seen)
+    if len(seen) == 1:
+        # one ear seen: the other is its size, level with its own brow
+        (a, m), = seen.items()
+        other = "L" if a == "R" else "R"
+        dy = float(f[_BROW[other], 1] - f[_BROW[a], 1])
+        ears[other] = {"top": m["top"] + dy, "bottom": m["bottom"] + dy, "outer": None}
+    report = {"source": {2: "both", 1: "left" if "L" in seen else "right", 0: "none"}[len(seen)]}
+    if seen:
+        length = float(np.mean([m["bottom"] - m["top"] for m in seen.values()]))
+        report.update({"length_cm": round(100 * length / px_per_m, 1),
+                       "stands_cm": {sd: round(100 * m["stands_px"] / px_per_m, 1) for sd, m in seen.items()},
+                       "length_to_brow_nose": round(length / ruler, 2)})
+        if len(seen) == 2:
+            span = abs(seen["L"]["outer"][0] - seen["R"]["outer"][0])
+            report["length_to_ear_span"] = round(length / span, 2)
+    return ears, report
+
+
+def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: dict, info: Optional[dict] = None) -> np.ndarray:
+    """Each ear of the posed body (photo px) sized, moved up or down and
+    swung out from the head about its front edge until it starts, ends and
+    reaches as far out as the photo's (measure_ears). Turned in the head's
+    own frame; the skin around the ear follows partway."""
+    V = np.asarray(V, dtype=np.float64)
+    A = np.asarray(head_axes, dtype=np.float64)  # columns: the head's left, back, up (photo px frame)
+    out = V.copy()
+    for i, side in enumerate("LR"):
+        t = ears.get(side)
+        w = ear_w[:, i]
+        core = w > 0.95  # the ear itself; below that, skin around its base
+        if not t or core.sum() < 10:
+            continue
+        u = 1.0 if side == "L" else -1.0  # outward, in the head's frame
+        loc = V @ A
+        lc = loc[core]
+        hinge = np.array([u * (u * lc[:, 0]).min(), lc[:, 1].min(), (lc[:, 2].min() + lc[:, 2].max()) / 2.0])
+        rel = loc - hinge
+        # outward on the photo: only measurable when the head faces it
+        u_img = float(np.sign(u * A[0, 0]))
+        fit_turn = t.get("outer") is not None and abs(A[0, 0]) > 0.5
+
+        def moved(p):
+            kk, dz, phi = np.exp(p[0]), p[1], p[2]
+            r = kk * rel
+            a = r[:, 0] * np.cos(phi) + u * r[:, 1] * np.sin(phi)
+            bk = -u * r[:, 0] * np.sin(phi) + r[:, 1] * np.cos(phi)
+            new = (np.column_stack([a, bk, r[:, 2] + dz]) + hinge) @ A.T
+            return V + w[:, None] * (new - V)
+
+        def resid(p):
+            q = moved(p)[core]
+            r = [q[:, 1].min() - t["top"], q[:, 1].max() - t["bottom"]]
+            if fit_turn:
+                r.append(u_img * (q[:, 0] * u_img).max() - t["outer"][0])
+            return np.array(r)
+
+        height = float(np.ptp(lc[:, 2]))
+        lo = np.array([np.log(_EAR_SCALE[0]), -0.5 * height, _EAR_TURN[0]])
+        hi = np.array([np.log(_EAR_SCALE[1]), 0.5 * height, _EAR_TURN[1]])
+        p = np.zeros(3)
+        free = [0, 1, 2] if fit_turn else [0, 1]
+        for _ in range(12):
+            r = resid(p)
+            J = np.zeros((len(r), 3))
+            for j in free:
+                e = np.zeros(3)
+                e[j] = 1e-3 * (1.0 if j != 1 else height)
+                J[:, j] = (resid(p + e) - r) / e[j]
+            Jf = J[:, free]
+            dp = -np.linalg.lstsq(Jf.T @ Jf + 1e-6 * np.eye(len(free)), Jf.T @ r, rcond=None)[0]
+            p[free] = np.clip(p[free] + dp, lo[free], hi[free])
+            if np.abs(dp).max() < 1e-4:
+                break
+        if info is not None:
+            info[side] = {"scale": round(float(np.exp(p[0])), 3), "shift_px": round(float(p[1]), 1),
+                          "turn_deg": round(float(np.degrees(p[2])), 1), "miss_px": np.round(resid(p), 1).tolist()}
+        out = out + (moved(p) - V)
+    return out
 
 
 def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], photo_mask: np.ndarray,
@@ -507,5 +664,9 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
     core_depth = s * (body["skin_w"][:, :, None] * pw[body["skin_idx"]]).sum(1)[:, 1]
     allkp = (body["kp_w"][..., None] * px[body["kp_idx"]]).sum(1)
     joints_px = {n: [round(float(a), 1) for a in allkp[i]] for i, n in enumerate(body["kp_names"])}
+    # the head's own axes in the photo's frame (x right, y down, depth back),
+    # for turning the ears; the ears as the photo shows them
+    head_axes = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]) @ Rw[body["head_bone"]]
+    ears, report["ears"] = measure_ears(photo_mask, face_mesh, s)
     return {"matched": report["matched"], "report": report, "vertices": px, "joints_px": joints_px, "core_depth": core_depth, "faces": body["faces"], "part_w": body["part_w"],
-            "part_names": np.array(body["part_names"]), "px_per_m": s}
+            "part_names": np.array(body["part_names"]), "px_per_m": s, "ear_w": body["ear_w"], "head_axes": head_axes, "ears": ears}

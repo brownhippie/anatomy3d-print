@@ -2,7 +2,9 @@
 src/anatomy3d/data/body_reference.npz: an adult male and an adult female
 (average build) from the Anny body model, in its rest A-pose, with the
 skeleton, skinning weights and COCO keypoint weights needed to pose and fit
-it without torch.
+it without torch. The male gets MakeHuman's own flatter-chest targets (less
+pectoral, no breast point); each ear's vertices come weighted 0..1 from
+MakeHuman's ear-move target, so the builder can size and turn the ears.
 
 Needs `pip install anny` (NAVER, Apache-2.0; brings torch) -- only to run
 this tool, not the app. The body mesh and rig are MakeHuman/MPFB2 assets
@@ -20,6 +22,10 @@ import anny
 OUT = Path(__file__).resolve().parents[1] / "src" / "anatomy3d" / "data" / "body_reference.npz"
 AGE = 0.7  # between Anny's "young" (0.667) and "old" (1.0) anchors: an adult
 PHENOTYPES = ["weight", "muscle", "height", "proportions"]
+# MakeHuman local targets (CC0): a man's chest, flatter than the average
+# male's (whose pectorals read as breasts under a jacket)
+MALE_CHEST = {"torso-muscle-pectoral-incr": -1.0, "breast-point-incr": -1.0}
+EAR_MOVE = {"L": "l-ear-trans-up", "R": "r-ear-trans-up"}  # moves each ear whole, its rim falling off to the skull
 PARTS = ["head", "neck", "torso", "upperarm.L", "upperarm.R", "forearm.L", "forearm.R", "hand.L", "hand.R", "legs"]
 
 
@@ -40,7 +46,7 @@ def part_of_bone(label):
 
 
 def main():
-    m = anny.Anny(skinning_method="lbs")
+    m = anny.Anny(skinning_method="lbs", local_changes=list(MALE_CHEST) + list(EAR_MOVE.values()))
     labels = list(m.bone_labels)
     parents = np.array([-1 if p is None else int(p) for p in m.bone_parents], dtype=np.int16)
     assert all(p < j for j, p in enumerate(parents)), "bones must be listed parents first"
@@ -62,23 +68,30 @@ def main():
         "kp_idx": kp_idx.astype(np.uint16),
         "kp_w": kp_w.astype(np.float32),
     }
-    def rest(gender, **kw):
+    def rest(gender, local=None, **kw):
         with torch.no_grad():
-            out = m(phenotype_kwargs={"gender": gender, "age": AGE, **kw})
+            out = m(phenotype_kwargs={"gender": gender, "age": AGE, **kw}, local_changes_kwargs=local or {})
         # rest_vertices: the same frame as the bones (the posed output is root-relative)
         return out["rest_vertices"][0].cpu().numpy(), out["rest_bone_poses"][0, :, :3, 3].cpu().numpy()
 
     data["phenotypes"] = np.array(PHENOTYPES)
-    for name, gender in (("male", 0.0), ("female", 1.0)):
-        v, j = rest(gender)
+    v0 = rest(0.0)[0]
+    ear_w = []
+    for side in "LR":
+        moved = np.linalg.norm(rest(0.0, {EAR_MOVE[side]: 1.0})[0] - v0, axis=1)
+        ear_w.append(moved / moved.max())
+    data["ear_w"] = np.stack(ear_w, axis=1).astype(np.float16)  # [subject's left, right]
+    for name, gender, local in (("male", 0.0, MALE_CHEST), ("female", 1.0, {})):
+        rest_g = lambda **kw: rest(gender, local, **kw)  # noqa: E731
+        v, j = rest_g()
         data[f"{name}_vertices"] = v.astype(np.float32)
         data[f"{name}_joints"] = j.astype(np.float32)
         # build (weight, muscle, height, proportions) as linear changes per
         # unit around the average (0.5), measured over 0.3..0.7
         dv, dj = [], []
         for ph in PHENOTYPES:
-            v_hi, j_hi = rest(gender, **{ph: 0.7})
-            v_lo, j_lo = rest(gender, **{ph: 0.3})
+            v_hi, j_hi = rest_g(**{ph: 0.7})
+            v_lo, j_lo = rest_g(**{ph: 0.3})
             dv.append((v_hi - v_lo) / 0.4)
             dj.append((j_hi - j_lo) / 0.4)
         data[f"{name}_dvertices"] = np.stack(dv).astype(np.float16)
