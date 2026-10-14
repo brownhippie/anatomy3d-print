@@ -293,9 +293,14 @@ def work_one(sid: str, generation_lock: threading.Lock) -> None:
         shutil.rmtree(t / "cand", ignore_errors=True)
     with _lock:
         now = _read(d / "state.json", {})
+        if now.get("edited") != st.get("edited"):
+            # changed by an action while this photo built (a move undone, the
+            # study finished): the change stands, this build is dropped
+            return
         if now.get("status") != "running":  # paused meanwhile: keep the pause, and the work done
             st["status"] = now.get("status", st["status"])
         st["applied"] = now.get("applied", st.get("applied"))
+        st["min_score"] = now.get("min_score", st.get("min_score"))  # a bar set meanwhile stands
         _write(d / "state.json", st)
         if line is not None:
             with open(d / "log.jsonl", "a") as f:
@@ -492,6 +497,7 @@ def control(sid: str, action: str):
             if st.get("kind") != "tune" or not st.get("kept"):
                 raise HTTPException(409, "No kept move to undo.")
             last = st["kept"].pop()
+            st["edited"] = time.time()
             st["x"][last["key"]] = last["from"]
             st["cand"] = None
             st["rebase"] = [r for r in st.get("rebase", []) if r != "best"] + ["best"]
@@ -511,6 +517,7 @@ def control(sid: str, action: str):
         elif action == "finish":
             # stop here with what it has (the autopilot judges it as finished)
             st["status"], st["finished"], st["cand"] = "done", time.time(), None
+            st["edited"] = time.time()
         elif st.get("status") != "done":
             if action == "resume":
                 for other in STUDY_ROOT.iterdir():
