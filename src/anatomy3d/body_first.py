@@ -139,6 +139,14 @@ def _cover_unseen(V, F, part_w, names, inputs, ppm, still=None):
             # photo's own shape), then a cloth's thickness out along the normal
             hidden = cover * np.clip(sr._mesh_smooth(lap, (~seen).astype(np.float64), 4), 0.0, 1.0)
             out = out + hidden[:, None] * (Vs - V) + (cover * _CLOTH_THICK * ppm)[:, None] * nrm
+            # the gap between cloth and body, from every side, filled: round
+            # the torso the cloth spans its hollows; down the back it hangs
+            # from the shoulder blades (seen from the front, the photo's own
+            # shape stays)
+            if "torso" in names:
+                torso = (dom == names.index("torso")) & (cover > 0.5)
+                fill = _cloth_fill(out, torso, (inputs.reference or {}).get("joints_px") or {})
+                out = out + (cover * (1.0 - 0.7 * seen))[:, None] * (fill - out)
     if labels is not None and "head" in names:
         from .head_parts import HAIR, HAT
 
@@ -301,6 +309,86 @@ def plan_four_sides(V, F, part_w, names, inputs, ref):
     hair = parts.get("hair") or {}
     plan["hair_kind"] = hair.get("kind")
     return V, plan
+
+
+_CLOTH_HANG = 0.12  # down the back cloth comes in at most this much per unit it falls (a jacket hangs nearly straight)
+
+
+def _cloth_fill(V, on, joints: dict):
+    """The cloth over the torso's vertices `on`, never inside the body: at
+    each height it wraps the outside of the torso's cross-section (a tape
+    round it -- the spine's groove, the small of the back, the hollows by the
+    armpits bridged), and below the shoulder blades its back hangs nearly
+    straight down rather than following the body in."""
+    from scipy.spatial import ConvexHull, QhullError
+
+    out = V.copy()
+    idx = np.flatnonzero(on)
+    if len(idx) < 50:
+        return out
+    if "left_shoulder" in joints and "right_shoulder" in joints:
+        sw = float(np.linalg.norm(np.subtract(joints["left_shoulder"][:2], joints["right_shoulder"][:2])))
+        sh_y = (joints["left_shoulder"][1] + joints["right_shoulder"][1]) / 2.0
+    else:
+        sw, sh_y = float(np.ptp(V[idx, 0])), float(V[idx, 1].min())
+    h = max(0.03 * sw, 1.0)
+    rows = np.floor((V[idx, 1] - V[idx, 1].min()) / h).astype(int)
+    # round each section: out to its convex outline in (x, depth)
+    for b in np.unique(rows):
+        sel = idx[rows == b]
+        if len(sel) < 8:
+            continue
+        P = out[sel][:, [0, 2]]
+        try:
+            hull = ConvexHull(P)
+        except QhullError:
+            continue
+        c = P.mean(axis=0)
+        H = P[hull.vertices]
+        E0, E1 = H, np.roll(H, -1, axis=0)
+        for k, v in zip(sel, P):
+            d = v - c
+            if np.hypot(*d) < 1e-6:
+                continue
+            # where the ray from the centre through the point leaves the hull
+            e = E1 - E0
+            den = d[0] * e[:, 1] - d[1] * e[:, 0]
+            ok = np.abs(den) > 1e-12
+            w = E0 - c
+            t = np.where(ok, (w[:, 0] * e[:, 1] - w[:, 1] * e[:, 0]) / np.where(ok, den, 1.0), np.inf)
+            u = np.where(ok, (w[:, 0] * d[1] - w[:, 1] * d[0]) / np.where(ok, den, 1.0), -1.0)
+            hit = ok & (t > 0) & (u >= -1e-9) & (u <= 1 + 1e-9)
+            if hit.any():
+                tt = float(t[hit].min())
+                if tt > 1.0:
+                    out[k, 0], out[k, 2] = c[0] + tt * d[0], c[1] + tt * d[1]
+    # down the back: from the shoulder blades it hangs (depth runs toward the back)
+    blade = sh_y + 0.25 * sw  # (about where the shoulder blades are fullest)
+    xb = np.floor((out[idx, 0] - out[idx, 0].min()) / h).astype(int)
+    yb = np.floor((out[idx, 1] - blade) / h).astype(int)
+    back = out[idx, 2] >= np.median(out[idx, 2])  # the back half of each section
+    for col in np.unique(xb):
+        m_ = back & (xb == col)
+        if m_.sum() < 3:
+            continue
+        ys = yb[m_]
+        prof = {}
+        for yy, zz in zip(ys, out[idx[m_], 2]):
+            prof[yy] = max(prof.get(yy, -np.inf), zz)
+        hang, best, last = {}, -np.inf, None
+        for yy in sorted(prof):
+            if yy < 0:
+                hang[yy] = prof[yy]
+                continue
+            if last is not None:
+                best -= _CLOTH_HANG * h * (yy - last)
+            best = max(best, prof[yy])
+            hang[yy] = best
+            last = yy
+        for k, yy in zip(idx[m_], ys):
+            if yy >= 0:
+                out[k, 2] = max(out[k, 2], hang[yy])
+    return out
 
 
 def _raster_front(V, F, shape):
