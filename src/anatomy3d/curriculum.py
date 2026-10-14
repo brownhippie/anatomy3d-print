@@ -354,6 +354,10 @@ def _body_regions() -> list:
              "heel and big toe matched, the foot sized (when the feet show)"),
         Item("body.posture", "Body", "Posture: lean, turn, crossed arms", True, True, [SR + "_REF_HAND_SHRINK"], True,
              "the fit's own posture limits; the joint miss and the outline score it"),
+        Item("body.crossed_solids", "Body", "Crossed forearms and hands as solids of their own, resting on the body", True, True,
+             [SR + "_LIMB_SOLIDS", SR + "_HAND_THICK", SR + "_LIMB_DETAIL"], True,
+             "the body's own forearm (its volume kept) over the torso's own front; the photo's hand on what's under it; "
+             "photo detail and the overlaps score it"),
         Item("body.head_size", "Body", "Head size against the body", True, True, [SR + "_REF_HEAD_MARGIN"], True,
              "fitted (head scale); head width and depth score it"),
     ]

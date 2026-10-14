@@ -797,6 +797,14 @@ _REF_HEAD_MARGIN = 1.05
 _REF_SIDE_SMOOTH = 30  # extra smoothing passes on surfaces facing sideways
 _REF_EDGE_SLACK = 0.015  # the body's own edge may pass the photo outline by this much, metres
 _REF_HAND_SHRINK = 0.3  # hands shrunk to this share about the wrist
+# a forearm (and its hand) lying across the body is a solid of its own,
+# joined on top: the body's own front runs on under it (one front and one
+# back per point had merged arm and chest into a single slab)
+_LIMB_SOLIDS = 1  # 1: on, 0: merged into the body as before (a study can try both)
+_LIMB_DETAIL = 1.0  # share of the photo's detail (sleeve folds) carried onto a crossed forearm
+_LIMB_CLOTH_DETAIL = 1.0
+_HAND_THICK = 0.035  # a hand lying on the body stands this thick (a loose fist; flat hand ~0.03), metres
+_HAND_SINK = 0.002  # ... sunk this far into what it rests on, so the two join
 _REF_HAIR = 0.012  # most the head grows front to back (hair), metres
 # How much body to build (see _person_extent): a photo reaching this share
 # of the way from the hip joints to the knees counts as showing the legs.
@@ -1233,9 +1241,61 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
             ears3d = {"patches": patches, "cov": ear_cov, "plug": _REF_EAR_PLUG * float(reference["px_per_m"]),
                       "thick": _REF_EAR_THICK * float(reference["px_per_m"])}
             V = flat
-    V, F = subdivide_loop(V, F, iterations=2)
+    # forearms lying across the torso, in front of it
+    cross = np.zeros(len(F), dtype=bool)
+    if _LIMB_SOLIDS and part_w is not None and "torso" in names:
+        dom = np.asarray(part_w).argmax(1)
+        g0x, g0y = grid_xy(V)
+        torso_f = (dom[F] == names.index("torso")).all(axis=1)
+        tn, _ = _raster_depth(g0x, g0y, V[:, 2], F[torso_f], shape)
+        for s_ in "LR":
+            # (the forearm only: hands are the photo's -- a hand tucked out
+            # of sight stays in the body; as part of the solid it poked out
+            # behind the other elbow)
+            ids = [names.index(n) for n in (f"forearm.{s_}",) if n in names]
+            af = np.isin(dom[F], ids).all(axis=1)
+            if af.sum() < 20:
+                continue
+            an, _ = _raster_depth(g0x, g0y, V[:, 2], F[af], shape)
+            acov = np.isfinite(an)
+            over = acov & np.isfinite(tn)
+            # (depth runs toward the back: smaller is nearer the camera)
+            if acov.any() and over.sum() >= _ARM_IN_FRONT_FRAC * acov.sum() and float(np.mean(an[over] < tn[over])) > 0.8:
+                cross |= af
+    V_all, F_all = V, F
+
+    def _sub(faces):
+        used, inv = np.unique(faces, return_inverse=True)  # only its own vertices (unused ones came out NaN)
+        return subdivide_loop(V_all[used], inv.reshape(-1, 3), iterations=2)
+
+    V, F = _sub(F_all[~cross])
     gx, gy = grid_xy(V)
     near, far = _raster_depth(gx, gy, V[:, 2], F, shape)
+    limbs3d = None
+    if cross.any():
+        Va, Fa = _sub(F_all[cross])
+        ax_, ay_ = grid_xy(Va)
+        an, af_ = _raster_depth(ax_, ay_, Va[:, 2], Fa, shape)
+        # (inside the photo's outline: the body's elbow reaching past it stood out as fins)
+        acov = np.isfinite(an) & np.isfinite(af_) & (d_out <= 1.5)
+        body_cov = np.isfinite(near) & np.isfinite(far)
+        # past the torso the arm is the body's surface, as before (its elbow
+        # stays one smooth piece with the upper arm); over the torso the
+        # forearm is a solid of its own, running a little past where it
+        # crosses so it carries on into the arm's own surface
+        # (only over the torso itself: by the upper arm the two are combined
+        # as before -- switching from one to the other stepped the elbow)
+        over_t = acov & np.isfinite(tn)
+        rest = acov & ~over_t
+        near = np.where(rest, np.fmin(near, an), near)
+        far = np.where(rest, np.fmax(far, af_), far)
+        body_cov = np.isfinite(near) & np.isfinite(far)
+        on_body = over_t & body_cov
+        cells = acov & binary_dilation(on_body, iterations=4)
+        # (its back smoothed as the body's is)
+        sig_l = _REF_BACK_SMOOTH * float(reference["px_per_m"]) * scale
+        back_l = _masked_blur(np.where(acov, -af_, 0.0), acov, sig_l)
+        limbs3d = {"front": np.where(cells, -an, 0.0), "back": np.where(cells, back_l, 0.0), "cells": cells, "over": on_body}
     cov = np.isfinite(near) & np.isfinite(far)
     if not cov.any():
         return None
@@ -1268,7 +1328,77 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
         zone *= np.clip(distance_transform_edt(cov) / (0.12 * face_w), 0.0, 1.0)
         broad = _masked_blur(front, cov, 0.12 * face_w)
         front = zone * broad + (1.0 - zone) * front
-    return front, back, cov, ears3d
+    return front, back, cov, ears3d, limbs3d
+
+
+def _hands_on_body(parts: Optional[dict], pose: Optional[dict], grid_mask: np.ndarray, y0: int, x0: int, scale: float,
+                   pad: int) -> Optional[np.ndarray]:
+    """Grid cells of a hand lying over the body: skin (the clothes reading's)
+    round the photo's own hand points, well inside the outline (a hand at
+    the side is the outline's own)."""
+    cl = (parts or {}).get("clothes")
+    if not cl or not pose or "left_shoulder" not in pose or "right_shoulder" not in pose:
+        return None
+    from .clothes import NAMES
+
+    gh, gw = grid_mask.shape
+    lab_ = cl["labels"]
+    r = np.clip(np.rint(y0 + (np.arange(gh) - pad) / scale).astype(int), 0, lab_.shape[0] - 1)
+    c = np.clip(np.rint(x0 + (np.arange(gw) - pad) / scale).astype(int), 0, lab_.shape[1] - 1)
+    skin = (lab_[r[:, None], c[None, :]] == NAMES.index("skin") + 1) & grid_mask
+    sw = float(np.linalg.norm(np.subtract(pose["left_shoulder"], pose["right_shoulder"]))) * scale
+    rows, cols = np.mgrid[0:gh, 0:gw]
+    out = np.zeros((gh, gw), dtype=bool)
+    for sd in ("left", "right"):
+        tips = [pose[f"{sd}_{k}"] for k in ("index", "pinky", "thumb") if f"{sd}_{k}" in pose]
+        if not tips:
+            continue
+        hx, hy = np.mean(np.asarray(tips, dtype=np.float64)[:, :2], axis=0)
+        hc, hr = (hx - x0) * scale + pad, (hy - y0) * scale + pad
+        out |= skin & ((cols - hc) ** 2 + (rows - hr) ** 2 < (0.14 * sw) ** 2)
+    deep = distance_transform_edt(grid_mask) > 0.06 * sw
+    out &= deep
+    from scipy.ndimage import binary_opening
+
+    out = binary_opening(out, iterations=1)
+    return out if out.sum() >= 12 else None
+
+
+def _layer_solid(front: np.ndarray, back: np.ndarray, cells: np.ndarray, zs: np.ndarray, dz: float, scale: float,
+                 smooth: bool):
+    """A closed solid between `front` and `back` over `cells` (the build's
+    own grid and depth steps), its edge rounded: (vertices as (depth, row,
+    col) in the build's units, faces), or None."""
+    if cells.sum() < 6:
+        return None
+    rr, cc = np.nonzero(cells)
+    m = 4
+    r0, r1 = max(rr.min() - m, 0), min(rr.max() + m + 1, cells.shape[0])
+    c0, c1 = max(cc.min() - m, 0), min(cc.max() + m + 1, cells.shape[1])
+    cl = cells[r0:r1, c0:c1]
+    mid = ((front + back) / 2.0)[r0:r1, c0:c1]
+    half = np.maximum((front - back) / 2.0, 0.5 / scale)[r0:r1, c0:c1]
+    G = np.where(cl, half ** 2, 0.0)
+    d_out, (iy, ix) = distance_transform_edt(~cl, return_indices=True)
+    slope = float(np.median(G[cl])) if cl.any() else 1.0
+    G = np.where(cl, G, -d_out * max(slope, 1e-6))
+    mid = np.where(cl, mid, mid[iy, ix])
+    field = np.empty((len(zs), cl.shape[0], cl.shape[1]), dtype=np.float32)
+    for i, z in enumerate(zs):
+        field[i] = (z - mid) ** 2 - G
+    if field.min() >= 0 or field.max() <= 0:
+        return None
+    verts, faces, _, _ = marching_cubes(field, level=0.0, spacing=(dz, 1.0 / scale, 1.0 / scale))
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    parts_ = mesh.split(only_watertight=False)
+    if len(parts_) > 1:
+        mesh = max(parts_, key=lambda p: p.vertices.shape[0])
+    if smooth:
+        smooth_grid_terracing(mesh)
+    v = np.asarray(mesh.vertices).copy()
+    v[:, 1] += r0 / scale
+    v[:, 2] += c0 / scale
+    return v, np.asarray(mesh.faces)
 
 
 def _ear_solid(P: np.ndarray, T: np.ndarray, inward: np.ndarray, plug: float, thicken: float):
@@ -2547,8 +2677,9 @@ def build_silhouette_relief_mesh(
                if parts is not None and parts.get("labels") is not None else None)
     photo_cells = grid_mask
     hair_rel = None
+    limbs3d = None
     if ref is not None:
-        rf, rb, cov, ears3d = ref
+        rf, rb, cov, ears3d, limbs3d = ref
         # where the reference runs just past the pixel outline, its own round
         # edge closes the solid; cutting it at the pixel steps left a wall
         # stepping row by row along the whole outline
@@ -2572,12 +2703,15 @@ def build_silhouette_relief_mesh(
         ankle_row = (max(Jx["left_ankle"][1], Jx["right_ankle"][1]) - y0) * scale + pad
         wide_gap[np.arange(gh) > ankle_row] = False
         grid_mask = ring | wide_gap
+
         grid_mask[:pad], grid_mask[-pad:], grid_mask[:, :pad], grid_mask[:, -pad:] = False, False, False, False
         inside = grid_mask & cov
         # keep the outline-based body's depth position; the reference's shape
         shift = float(np.median(((front0 + back0) / 2.0 - (rf + rb) / 2.0)[inside]))
         rf, rb = rf + shift, rb + shift
         ref_shift = shift
+        if limbs3d is not None:
+            limbs3d["front"], limbs3d["back"] = limbs3d["front"] + shift, limbs3d["back"] + shift
         if extent == "torso":
             # the back hangs straight down from the small of the back: the
             # seat below it isn't part of a torso
@@ -2646,6 +2780,14 @@ def build_silhouette_relief_mesh(
             front0, back0 = _neck_wear(front0, back0, grid_mask, photo_cells, parts_g, inside | (cov & grid_mask), face_mesh,
                                        _neck_geometry(reference), y0, x0, scale, pad, float(reference["px_per_m"]))
             front0, back0 = np.where(grid_mask, front0, 0.0), np.where(grid_mask, back0, 0.0)
+    # where a forearm or hand lies over the body: the body's own surface runs
+    # on under it (the photo's depth and clothes there are the arm's)
+    hands_on = _hands_on_body(parts, pose, grid_mask, y0, x0, scale, pad) if (limbs3d is not None and parts) else None
+    limb_soft = None
+    limb_detail = 0.0
+    if limbs3d is not None:
+        under = limbs3d["over"] | (hands_on if hands_on is not None else False)
+        limb_soft = np.clip(gaussian_filter(under.astype(np.float64), 1.5) * 1.5, 0.0, 1.0)
     mid0 = np.where(grid_mask, (front0 + back0) / 2.0, 0.0)
     if edge == "hard":
         # Original edge: a soft floor so thickness never reaches 0, with the
@@ -2734,6 +2876,9 @@ def build_silhouette_relief_mesh(
                 sy_, sx_ = np.gradient(front0)
                 facing = 1.0 / np.sqrt(1.0 + (np.hypot(sy_, sx_) * scale) ** 2)
                 relief = relief * np.clip((facing - _REF_RELIEF_FACING[0]) / (_REF_RELIEF_FACING[1] - _REF_RELIEF_FACING[0]), 0.0, 1.0)
+                if limb_soft is not None:
+                    limb_detail = relief * limb_soft  # (the arm's own folds: onto the forearm's solid)
+                    relief = relief * (1.0 - limb_soft)
             front = np.maximum(front0 + relief, mid0 + min_half_thickness * 0.3)
             back = back0
             # Synthetic extension rows keep the plain symmetric guess
@@ -2765,7 +2910,10 @@ def build_silhouette_relief_mesh(
         clothes_read = (parts or {}).get("clothes") if parts is not None else None
         if clothes_read and reference is not None:
             try:
-                front = front + _clothes_relief(clothes_read, front, grid_mask, y0, x0, scale, pad, float(reference["px_per_m"]))
+                cr = _clothes_relief(clothes_read, front, grid_mask, y0, x0, scale, pad, float(reference["px_per_m"]))
+                if limb_soft is not None:
+                    limb_detail = limb_detail + _LIMB_CLOTH_DETAIL * cr * limb_soft
+                front = front + (cr if limb_soft is None else cr * (1.0 - limb_soft))
             except Exception as exc:  # noqa: BLE001 - clothes keep their shape without steps
                 print(f"Note: clothes steps skipped ({exc}).")
         if reference is not None:
@@ -2820,7 +2968,50 @@ def build_silhouette_relief_mesh(
         # below the floor used elsewhere.
         half_span = np.where(grid_mask, np.maximum((front - back) / 2.0, min_half_thickness * 0.3), half_span)
 
+    layers = []  # (front, back, cells) of solids joined on top: crossed forearms, hands on the body
+    if limbs3d is not None and limbs3d["cells"].any():
+        # resting on the body: its underside meets the body's front (a gap
+        # left it a separate piece, and the join keeps only the body); where
+        # it runs on past the torso it sits just inside the arm's own surface
+        # (two equal surfaces joined as ragged fringes)
+        ppm_l = float(reference["px_per_m"])
+        body_front = mid + half_span
+        over_s = np.clip(gaussian_filter(limbs3d["over"].astype(np.float64), 1.0) * 2.0, 0.0, 1.0)
+        lm = (limbs3d["front"] + limbs3d["back"]) / 2.0
+        lh = (limbs3d["front"] - limbs3d["back"]) / 2.0 * (0.9 + 0.1 * over_s)
+        # (the sleeve's folds; not where a hand lies on it -- that detail is
+        # the hand's outline, and on the forearm it came out a torn patch)
+        no_hand = 1.0 - (np.clip(gaussian_filter(hands_on.astype(np.float64), 2.0) * 2.0, 0.0, 1.0) if hands_on is not None else 0.0)
+        # (clipped and softened: by the hand and watch the photo's depth jumps,
+        # and on the forearm's round surface that came out a torn patch)
+        cap_l = 0.5 * _REF_RELIEF_MAX * ppm_l
+        det_l = gaussian_filter(np.clip(np.where(limbs3d["cells"], limb_detail, 0.0), -cap_l, cap_l), 1.0)
+        lf_ = lm + lh + _LIMB_DETAIL * over_s * no_hand * det_l
+        lb_ = np.where(limbs3d["over"], np.minimum(lm - lh, body_front - _HAND_SINK * ppm_l), lm - lh)
+        layers.append((lf_, lb_, limbs3d["cells"]))
+    if hands_on is not None and hands_on.any():
+        base = np.where(grid_mask, mid + half_span, 0.0)
+        if limbs3d is not None:
+            base = np.where(limbs3d["cells"], np.maximum(base, limbs3d["front"]), base)
+        ppm_ = float(reference["px_per_m"])
+        d_h = distance_transform_edt(hands_on)
+        from scipy.ndimage import label as _cc
+
+        lab_h, n_h = _cc(hands_on)
+        dome = np.zeros_like(d_h)
+        for i in range(1, n_h + 1):
+            m_ = lab_h == i
+            dome[m_] = np.sqrt(np.clip(d_h[m_] / max(float(d_h[m_].max()), 1e-6), 0.0, 1.0))
+        dome = _masked_blur(dome, hands_on, 1.5)  # (a thin, ragged patch of fingers came out torn)
+        base_s = _masked_blur(base, hands_on, 2.0)
+        # the photo's own detail on it (the fingers' folds), as on the forearms
+        detail_h = np.where(hands_on, limb_detail, 0.0) if limbs3d is not None else 0.0
+        detail_h = gaussian_filter(np.clip(detail_h, -0.3 * _HAND_THICK * ppm_, 0.3 * _HAND_THICK * ppm_), 1.0)
+        layers.append((base_s + _HAND_THICK * ppm_ * dome + _LIMB_DETAIL * detail_h, base_s - _HAND_SINK * ppm_, hands_on))
     true_max = float((np.abs(mid) + half_span).max())
+    for lf, lb, lc in layers:
+        if lc.any():
+            true_max = max(true_max, float(np.abs(lf[lc]).max()), float(np.abs(lb[lc]).max()))
     if true_max <= 0:
         raise ValueError("Mask too thin/small to extrude a volume from.")
     # A few percent beyond the true max so the solid never exactly
@@ -2923,6 +3114,18 @@ def build_silhouette_relief_mesh(
 
     height = verts_xyz[:, 1].max() - verts_xyz[:, 1].min()
     out_scale = target_height_mm / height if height > 1e-6 else 1.0
+    solids_extra = []
+    for lf, lb, lc in layers:
+        piece = _layer_solid(lf, lb, lc, zs, dz, scale, smooth)
+        if piece is not None:
+            pv, pf_ = piece
+            pxyz = np.stack([pv[:, 2] - (gw / scale) / 2.0, (gh / scale) / 2.0 - pv[:, 1], pv[:, 0] - z_max], axis=1)
+            solids_extra.append((pxyz, pf_))
+    if solids_extra:
+        try:
+            verts_xyz, faces = _join_solids(verts_xyz, faces, solids_extra)
+        except Exception as exc:  # noqa: BLE001 - the body without separate limbs is still a model
+            print(f"Note: could not join the crossed arms and hands ({exc}).")
     if ref is not None and ref[3] is not None:
         # the 3D ears, joined to the head (photo px -> this frame)
         ears3d = ref[3]

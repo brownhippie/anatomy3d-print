@@ -506,7 +506,11 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
     keep = preview.vertices[preview.faces][:, :, 1].min(axis=1) > floor + 0.5
     adj, ang = preview.face_adjacency, preview.face_adjacency_angles
     both = keep[adj[:, 0]] & keep[adj[:, 1]]
-    m["spike_pct"] = round(100.0 * float((np.degrees(ang[both]) > 60).mean()), 2) if both.any() else 0.0
+    # outward folds only: an inward crease (an arm or a hand sitting on the
+    # body, a collar's edge) is a real shape and prints; a sharp outward
+    # edge is a spike
+    sharp = (np.degrees(ang) > 60) & preview.face_adjacency_convex
+    m["spike_pct"] = round(100.0 * float(sharp[both].mean()), 2) if both.any() else 0.0
 
     sil, zf, px = _front_heightmap(preview, floor)
     m["shape_iou"] = round(_aligned_iou(sil, inputs.photo_mask), 1)
