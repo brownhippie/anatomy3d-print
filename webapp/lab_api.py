@@ -328,7 +328,7 @@ def _item(run_id: str, r: dict, ratings: dict) -> dict:
         "rating": ratings.get(code),
     }
     if r["status"] == "ok":
-        item.update({k: r.get(k) for k in ("score", "shape_iou", "spike_pct", "watertight", "min_wall_mm", "face_found", "face_err_pct", "seconds", "params", "held_mean", "photo_detail")})
+        item.update({k: r.get(k) for k in ("score", "shape_iou", "spike_pct", "watertight", "min_wall_mm", "face_found", "face_err_pct", "seconds", "params", "held_mean", "photo_detail", "checks_n", "checks_failed")})
         item["thumb_url"] = f"/api/lab/runs/{run_id}/thumb/{code}.png"
         item["model_url"] = f"/api/lab/runs/{run_id}/model/{code}.obj" if r.get("model") else None
     else:
