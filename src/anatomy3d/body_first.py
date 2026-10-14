@@ -11,8 +11,11 @@ an ear against the head) is one column. Here the posed body *is* the model:
 2. the 3D body: the Anny body (body_reference) shaped to the photo -- build,
    head size, bone lengths kept to human proportions -- and posed onto its
    points; already fitted when the inputs are prepared;
-3. its depth checked against the photo's: each part's front against the
-   depth estimate (report["depth_order"]);
+3. all four sides understood before anything is built on them
+   (plan_four_sides): the front against the photo's outline and depth, each
+   section's depth from the side against the human figure's (corrected
+   toward it, within limits), the posture from the side, what the clothes
+   and hair will cover round the back;
 4. the clothes on it: the body grown along its normals out to the photo's
    outline (the room clothes and hair take), each garment stepping over the
    one under it where they meet;
@@ -106,6 +109,149 @@ def _cover_unseen(V, F, part_w, names, inputs, ppm):
     return out
 
 
+# human depth against width (ANSUR II, minimal clothing; the body here has the
+# clothes' room on it): head length / breadth, chest and waist depth through
+# the centre line / shoulder-joint breadth
+_ANSUR = {"head": 1.2914, "chest": 0.611, "waist": 0.572}
+_CLOTHED_DEPTH = 1.06  # the clothes' room on top of a bare body's depth
+_PLAN_TOLERANCE = 0.08  # a section's depth within this share of the human figure's is left as it is
+_PLAN_MAX_FIX = 0.15  # ... and moved at most this share toward it
+
+
+def _views(V, F, res: float):
+    """Depth maps of the body seen from the front, back, left and right
+    (orthographic, photo px; nearer is larger), and each view's outline."""
+    from .silhouette_relief import _raster_depth
+
+    x, y, d = V[:, 0], V[:, 1], -V[:, 2]  # d: toward the camera
+    out = {}
+    for name, (u, w) in {"front": (x, d), "back": (-x, -d), "left": (d, -x), "right": (-d, x)}.items():
+        u0, v0 = u.min(), y.min()
+        gu, gv = (u - u0) / res, (y - v0) / res
+        shape = (int(np.ceil(gv.max())) + 2, int(np.ceil(gu.max())) + 2)
+        near, _ = _raster_depth(gu, gv, -w, F, shape)
+        out[name] = {"height": np.where(np.isfinite(near), -near, np.nan), "outline": np.isfinite(near)}
+    return out
+
+
+def plan_four_sides(V, F, part_w, names, inputs, ref):
+    """The posed body seen from all four sides before anything is built on
+    it: the front against the photo (outline, which parts sit nearer), each
+    section's depth from the side against the human figure's (corrected
+    toward it, within limits), the posture from the side, and which parts
+    the clothes and the hair will cover round the back. Returns the body
+    (depths corrected) and the plan."""
+    from scipy.stats import spearmanr
+
+    mask = np.asarray(inputs.photo_mask, dtype=bool)
+    shape = mask.shape
+    J = {k: np.asarray(v, dtype=np.float64) for k, v in (ref.get("joints_px") or {}).items()}
+    dom = part_w.argmax(1)
+    plan = {"sections": {}, "fixed": {}}
+
+    # front, against the photo
+    near, _ = _raster_front(V, F, shape)
+    cov = np.isfinite(near)
+    plan["front_outline_iou"] = round(float((cov & mask).sum() / max((cov | mask).sum(), 1)), 3)
+    if inputs.depth is not None and (cov & mask).sum() > 1000:
+        d = np.asarray(inputs.depth, dtype=np.float64)
+        rr, cc = np.mgrid[0:shape[0]:4, 0:shape[1]:4]
+        sel = (cov & mask)[rr, cc]
+        dd = map_coordinates(gaussian_filter(d, 0.01 * max(d.shape)), [rr[sel] * d.shape[0] / shape[0], cc[sel] * d.shape[1] / shape[1]], order=1)
+        rho = spearmanr(dd, -near[rr[sel], cc[sel]]).correlation
+        plan["front_depth_order"] = round(float(rho), 3) if np.isfinite(rho) else None
+
+    # the sides: each section's depth against the human figure's
+    if "left_shoulder" in J and "right_shoulder" in J:
+        sw = float(np.linalg.norm(J["left_shoulder"][:2] - J["right_shoulder"][:2]))
+        sh_y = (J["left_shoulder"][1] + J["right_shoulder"][1]) / 2.0
+        cx = (J["left_shoulder"][0] + J["right_shoulder"][0]) / 2.0
+        hip_y = (J["left_hip"][1] + J["right_hip"][1]) / 2.0 if "left_hip" in J and "right_hip" in J else sh_y + 1.6 * sw
+        bottom = float(np.flatnonzero(mask.any(axis=1))[-1])
+        sections = {"chest": sh_y + 0.25 * (hip_y - sh_y), "waist": sh_y + 0.7 * (hip_y - sh_y)}
+        # through the torso's own surface (arms left out): front and back
+        # where the centre line meets it
+        torso_f = (dom[F] == names.index("torso")).all(axis=1) if "torso" in names else None
+        if torso_f is not None and torso_f.any():
+            tn, tf = _raster_front(V, F[torso_f], shape)
+            for sec, row in sections.items():
+                r_ = int(round(row))
+                if r_ >= bottom - 2 or r_ < 0:
+                    continue  # below where the photo is cut
+                cols = np.arange(int(cx - 0.04 * sw), int(cx + 0.04 * sw) + 1)
+                cols = cols[(cols >= 0) & (cols < shape[1])]
+                ok = np.isfinite(tn[r_, cols]) & np.isfinite(tf[r_, cols])
+                if ok.sum() < 2:
+                    continue
+                ratio = float(np.median((tf[r_, cols] - tn[r_, cols])[ok])) / sw
+                plan["sections"][sec] = {"depth_over_shoulders": round(ratio, 3), "human": round(_ANSUR[sec] * _CLOTHED_DEPTH, 3)}
+        # posture from the side: the head's centre ahead of the shoulders',
+        # and the torso's lean (shoulders over hips), as shares of shoulder width
+        head = dom == names.index("head") if "head" in names else np.zeros(len(V), bool)
+        sh_z = (J["left_shoulder"][2] + J["right_shoulder"][2]) / 2.0 if len(J["left_shoulder"]) > 2 else None
+        if head.any() and sh_z is not None:
+            plan["head_forward"] = round(float((sh_z - V[head, 2].mean()) / sw), 3)
+        if sh_z is not None and "left_hip" in J and len(J["left_hip"]) > 2:
+            hip_z = (J["left_hip"][2] + J["right_hip"][2]) / 2.0
+            plan["torso_lean"] = round(float((hip_z - sh_z) / sw), 3)
+    if "head" in names and inputs.face_mesh is not None:
+        fm = np.asarray(inputs.face_mesh)
+        ear_w = ref.get("ear_w")
+        no_ear = np.ones(len(V), bool) if ear_w is None else np.asarray(ear_w).max(axis=1) < 0.05
+        head_f = ((dom[F] == names.index("head")) & no_ear[F]).all(axis=1)
+        if head_f.sum() > 50:
+            hn, hf = _raster_front(V, F[head_f], shape)
+            r_ = int(round((fm[33, 1] + fm[263, 1]) / 2.0))  # the eyes' row (glabella level)
+            if 0 <= r_ < shape[0]:
+                row_ok = np.isfinite(hn[r_]) & np.isfinite(hf[r_])
+                if row_ok.sum() > 4:
+                    breadth = float(np.ptp(np.flatnonzero(row_ok)))
+                    length = float(np.max((hf[r_] - hn[r_])[row_ok]))
+                    plan["sections"]["head"] = {"length_over_breadth": round(length / max(breadth, 1e-6), 3), "human": _ANSUR["head"]}
+
+    # correct each section's depth toward the human figure, about its own
+    # core (front and back move apart or together; the outline, which the
+    # photo confirms, stays)
+    core = ref.get("core_depth")
+    if core is not None:
+        core = np.asarray(core, dtype=np.float64)
+        if len(core) != len(V):
+            core = None
+    for sec, info in plan["sections"].items():
+        have = info.get("depth_over_shoulders", info.get("length_over_breadth"))
+        want = info["human"]
+        off = have / want - 1.0
+        if abs(off) <= _PLAN_TOLERANCE or core is None:
+            continue
+        if sec == "head" and ((inputs.parts or {}).get("hair") or {}).get("kind") in ("straight", "wavy", "curly", "corded"):
+            continue  # (the head's length there is hair as much as skull: left to the hair)
+        f = float(np.clip(want / have, 1.0 - _PLAN_MAX_FIX, 1.0 + _PLAN_MAX_FIX))
+        if sec == "head":
+            w = part_w[:, names.index("head")]
+        else:
+            row = sections[sec]
+            w = part_w[:, names.index("torso")] * np.exp(-((V[:, 1] - row) / (0.25 * sw)) ** 2)
+        V = V.copy()
+        V[:, 2] = core + (1.0 + w * (f - 1.0)) * (V[:, 2] - core)
+        plan["fixed"][sec] = round(f, 3)
+
+    # each side's outline after the corrections (width and height, photo px),
+    # kept with the plan
+    views = _views(V, F, max(1.0, np.ptp(V[:, 1]) / 300.0))
+    plan["views"] = {k: [int(v["outline"].any(axis=0).sum()), int(v["outline"].any(axis=1).sum())] for k, v in views.items()}
+    plan["_views"] = views  # (the depth maps themselves, for a look: plan_sheet)
+
+    # the back: what clothes and hair will cover there, from the front
+    parts = inputs.parts or {}
+    cl = parts.get("clothes")
+    if cl:
+        plan["clothed_all_round"] = sorted({k for k in cl.get("found", {}) if k in ("suit", "jacket", "coat", "shirt", "tshirt", "sweater",
+                                                                               "hoodie", "dress", "kimono")})
+    hair = parts.get("hair") or {}
+    plan["hair_kind"] = hair.get("kind")
+    return V, plan
+
+
 def _raster_front(V, F, shape):
     """Nearest depth (toward the back) at each photo pixel, +inf off the body."""
     from .silhouette_relief import _raster_depth
@@ -173,6 +319,9 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         Vs = np.column_stack([sr._mesh_smooth(lap, V[:, k], _MITTEN_SMOOTH) for k in range(3)])
         V = V + np.clip(hand * 1.5, 0.0, 1.0)[:, None] * (Vs - V)
 
+    # the four sides, understood before anything is built on them
+    V, plan = plan_four_sides(V, F, part_w, names, inputs, body_ref)
+
     # clothes and hair round the sides the photo doesn't show: a part the
     # photo shows mostly under clothes is clothed all round -- cloth lies
     # smooth over muscle and bone (no shoulder blades or spine through a
@@ -189,7 +338,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     near, far = _raster_front(V, F, shape)
     cov = np.isfinite(near) & mask
     front = np.where(cov, -near, 0.0)  # toward the camera
-    report = {}
+    report = {"plan": plan}
 
     # 5. the photo's detail, toward the camera, on what the camera sees
     offset = np.zeros(shape)
@@ -281,3 +430,28 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     out = BodyMesh(vertices=xyz, faces=np.asarray(mesh.faces))
     out.report = report  # type: ignore[attr-defined]
     return out
+
+
+def plan_sheet(plan: dict, size: int = 320):
+    """The four sides of a plan side by side, shaded (a PIL image)."""
+    from PIL import Image
+
+    tiles = []
+    for name in ("front", "left", "back", "right"):
+        h = plan["_views"][name]["height"]
+        fin = np.isfinite(h)
+        z = np.where(fin, h, np.nanmin(h) if fin.any() else 0.0)
+        gy, gx = np.gradient(z)
+        n = np.dstack([-gx, -gy, np.ones_like(z)])
+        n /= np.linalg.norm(n, axis=2, keepdims=True)
+        light = np.array([-0.4, -0.5, 0.75]) / np.linalg.norm([-0.4, -0.5, 0.75])
+        v = np.where(fin, np.clip(n @ light, 0, 1) * 200 + 40, 22).astype(np.uint8)
+        im = Image.fromarray(v)
+        im.thumbnail((size, size))
+        tile = Image.new("L", (size, size), 22)
+        tile.paste(im, ((size - im.width) // 2, (size - im.height) // 2))
+        tiles.append(tile)
+    sheet = Image.new("L", (size * 4, size), 22)
+    for i, t in enumerate(tiles):
+        sheet.paste(t, (i * size, 0))
+    return sheet
