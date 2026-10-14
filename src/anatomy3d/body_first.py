@@ -10,25 +10,27 @@ an ear against the head) is one column. Here the posed body *is* the model:
    (lab.prepare_inputs);
 2. the 3D body: the Anny body (body_reference) shaped to the photo -- build,
    head size, bone lengths kept to human proportions -- and posed onto its
-   points (fitted when the inputs are prepared), then grown along smoothed
-   normals out to the photo's outline (the room clothes and hair take; the
-   face held to its own points), hands closed to mittens;
+   points (fitted when the inputs are prepared);
 3. cut where the photo is cut (a bust) -- the first thing done with the 3D
-   body, so all that follows works on the torso the figure will be;
-4. all four sides understood before anything is built on them
+   body, so nothing after it spends time on legs, or trousers, that won't
+   be there;
+4. fitted out to the photo's outline along smoothed normals (the room
+   clothes and hair take; the face held to its own points; what
+   reaches below the cut trimmed off at the end), hands closed to mittens;
+5. all four sides understood before anything is built on them
    (plan_four_sides): the front against the photo's outline and depth, each
    section's depth from the side against the human figure's (corrected
    toward it, within limits), the posture from the side, what the clothes
    and hair will cover round the back;
-5. the clothes and hair on it: a part the photo shows mostly under clothes
+6. the clothes and hair on it: a part the photo shows mostly under clothes
    clothed all round (smooth as cloth lies, with a cloth's thickness), hair
    over the back of the head, each garment stepping over the one under it
    where they meet;
-6. the photo's detail on the surface the camera sees: face shaping, the
+7. the photo's detail on the surface the camera sees: face shaping, the
    face's parts, clothes' steps and fine depth detail, pushed toward the
    camera on the vertices that are frontmost (an arm across the chest gets
    the sleeve's folds, the chest under it nothing);
-7. out, scaled to the figure's height.
+8. out, scaled to the figure's height.
 
 Hands come out as mittens (the body's are open with the fingers spread);
 the hair is the body grown to the outline over the head (thick hair and
@@ -104,7 +106,7 @@ def _cut_below(V, F, row: float, per_vertex: dict):
     return P[:, :3], T, out
 
 
-def _cover_unseen(V, F, part_w, names, inputs, ppm):
+def _cover_unseen(V, F, part_w, names, inputs, ppm, still=None):
     from . import silhouette_relief as sr
     from .clothes import GARMENTS, NAMES
 
@@ -153,6 +155,8 @@ def _cover_unseen(V, F, part_w, names, inputs, ppm):
             # a hairline, not a fade: on or off, eased over a couple of vertices
             h = np.clip(sr._mesh_smooth(lap, (h > 0.5).astype(np.float64), 2), 0.0, 1.0)
             out = out + (h * _HAIR_LAYER * ppm)[:, None] * nrm
+    if still is not None:
+        out[still] = V[still]  # (the cut's cap keeps its place)
     return out
 
 
@@ -324,6 +328,19 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     names = [str(n) for n in ref["part_names"]]
     body_ref = dict(ref, part_w=part_w, core_depth=pv["core"], ear_w=pv["ear_w"])
 
+    # the first thing done with the 3D body: cut where the photo is cut (a
+    # bust), so everything after -- fitting it out to the outline, the
+    # plan, clothes, hair, detail -- works only on the torso the figure will
+    # be: no time on legs (or trousers) that won't be there
+    rows = np.flatnonzero(mask.any(axis=1))
+    cut_off = bust if bust is not None else bool(rows[-1] >= shape[0] - 3)
+    cut_row = float(rows[-1]) if cut_off else None
+    if cut_off:
+        V, F, kept = _cut_below(V, F, cut_row, {"part_w": part_w, "core": body_ref.get("core_depth"), "ear_w": body_ref.get("ear_w")})
+        part_w = kept["part_w"]
+        part_w = part_w / np.maximum(part_w.sum(axis=1, keepdims=True), 1e-9)
+        body_ref = dict(body_ref, part_w=part_w, core_depth=kept["core"], ear_w=kept["ear_w"])
+
     # 4. clothes' (and hair's) room: grown out to the photo's outline
     d_in, d_out = distance_transform_edt(mask), distance_transform_edt(~mask)
     # (grown along the normals of a smoothed copy: along its own, in tight
@@ -343,19 +360,28 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         inside_face = points_in_poly(V[:, :2], hull)
         facing0 = -sr._vertex_normals(Vsm, F)[:, 2] > 0.2
         face_keep = inside_face & facing0 & (part_w[:, names.index("head")] > 0.5)
+    # the cut's flat cap: its inside stays put (moved, its long thin
+    # triangles folded into each other), its edge fits out with the sides
+    # (held, it pulled the sides above it in; so it fits out with them and
+    # its inside is put back after)
+    cap_in = np.zeros(len(V), dtype=bool)
+    if cut_row is not None:
+        cap_in = (V[:, 1] >= cut_row - 0.5) & (sr._vertex_normals(V, F)[:, 1] > 0.9)
+    V_cap = V[cap_in].copy()
     V, names, _ = sr._grow_to_outline(V, F, body_ref, part_w, mask, lambda P: (P[:, 0], P[:, 1]), shape, d_in, d_out, 1.0, mask,
                                       normals=sr._vertex_normals(Vsm, F), keep=face_keep)
-    core = pv["core"]
+    V[cap_in] = V_cap
+    core = body_ref.get("core_depth")
     if core is not None:
         hw = part_w[:, names.index("head")] if "head" in names else 0.0
         m_ = hw * sr._REF_HEAD_MARGIN + (1.0 - hw) * sr._REF_DEPTH_MARGIN
         V[:, 2] = core + m_ * (V[:, 2] - core)
     if (ref.get("report") or {}).get("gender") == "male" and "torso" in names:
         V = sr._drape_chest(V, F, part_w[:, names.index("torso")], ppm, ref.get("joints_px") or {})
-    if ref.get("ears") and pv["ear_w"] is not None and ref.get("head_axes") is not None:
+    if ref.get("ears") and body_ref.get("ear_w") is not None and ref.get("head_axes") is not None:
         from .body_reference import place_ears
 
-        V = place_ears(V, np.asarray(pv["ear_w"], dtype=np.float64), ref["head_axes"], ref["ears"], faces=F, px_per_m=ppm)
+        V = place_ears(V, np.asarray(body_ref["ear_w"], dtype=np.float64), ref["head_axes"], ref["ears"], faces=F, px_per_m=ppm)
     # mitten hands
     hand = np.zeros(len(V))
     for n in ("hand.L", "hand.R"):
@@ -366,18 +392,6 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         Vs = np.column_stack([sr._mesh_smooth(lap, V[:, k], _MITTEN_SMOOTH) for k in range(3)])
         V = V + np.clip(hand * 1.5, 0.0, 1.0)[:, None] * (Vs - V)
 
-    # the first thing done with the 3D body: cut where the photo is cut (a
-    # bust), so the plan, the clothes and the detail all work on the torso
-    # the figure will be -- not on legs that won't be there
-    rows = np.flatnonzero(mask.any(axis=1))
-    cut_off = bust if bust is not None else bool(rows[-1] >= shape[0] - 3)
-    cut_row = float(rows[-1]) if cut_off else None
-    if cut_off:
-        V, F, kept = _cut_below(V, F, cut_row, {"part_w": part_w, "core": body_ref.get("core_depth"), "ear_w": body_ref.get("ear_w")})
-        part_w = kept["part_w"]
-        part_w = part_w / np.maximum(part_w.sum(axis=1, keepdims=True), 1e-9)
-        body_ref = dict(body_ref, part_w=part_w, core_depth=kept["core"], ear_w=kept["ear_w"])
-
     # the four sides, understood before anything is built on them
     V, plan = plan_four_sides(V, F, part_w, names, inputs, body_ref)
     plan["cut_at_row"] = cut_row
@@ -386,7 +400,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # photo shows mostly under clothes is clothed all round -- cloth lies
     # smooth over muscle and bone (no shoulder blades or spine through a
     # jacket) -- and a head with hair has it over the back of the skull too
-    V = _cover_unseen(V, F, part_w, names, inputs, ppm)
+    V = _cover_unseen(V, F, part_w, names, inputs, ppm, still=cap_in)
 
     # finer surface for the detail
     from trimesh.remesh import subdivide_loop
@@ -466,7 +480,9 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # out, to the figure's frame (the bottom stays flat on the cut: clothes
     # and smoothing rounded it a little)
     if cut_row is not None:
-        V[:, 1] = np.minimum(V[:, 1], cut_row)
+        # (trimmed clean, still a closed solid: pinning what went below onto
+        # the cut folded triangles over each other -- thin walls, cracks)
+        V, F, _ = _cut_below(V, F, cut_row, {})
     mesh = trimesh.Trimesh(V, F, process=False)
     pieces = mesh.split(only_watertight=False)
     if len(pieces) > 1:
