@@ -495,6 +495,8 @@ def _raster_front(V, F, shape):
 _HAND_REACH = 0.55  # the photo's hand: its skin within this many shoulder widths of the wrist (a hand's length)
 _HAND_MIN_AREA = 0.01  # ... at least this share of the shoulder width squared (less: hidden or gloved)
 _HAND_SPAN = 0.03  # a hand over the body lies across bumps and gaps narrower than this (m)
+_HAND_THICK_RATIO = 0.35  # a palm is this thick for its breadth (hand thickness / breadth at the knuckles)
+_HAND_THICK_MIN = 0.015  # ... and never thinner than this (m)
 _HAND_MIN_W = 0.008  # a hand's solid has nothing narrower than this (m)
 _HAND_STUB = 0.15  # the body's own hand goes into the wrist, drawn to this share of its size
 
@@ -586,9 +588,10 @@ def _skin_hands(V, F, part_w, names, inputs):
 
 
 def _hand_solids(V, F, regions, ppm):
-    """The hands over the body, each a closed solid: the photo's hand for its
-    outline, _HAND_THICK thick with a rounded edge, lying on what is under it
-    (sunk a little into it, so they join). [(vertices, faces)] in photo px."""
+    """The hands the photo shows, each a closed solid: the photo's hand for its
+    outline, its thickness from its own widths, lying on what is under it
+    (sunk a little into it, so they join) or beside the body at its wrist's
+    depth. [(vertices, faces)] in photo px."""
     from . import silhouette_relief as sr
 
     out = []
@@ -606,7 +609,8 @@ def _hand_solids(V, F, regions, ppm):
     top = gaussian_filter(maximum_filter(rest, size=k), k / 2.0)  # across the top of what it lies on
     from scipy.ndimage import binary_fill_holes, binary_opening
 
-    t = sr._HAND_THICK * ppm
+    from skimage.morphology import medial_axis
+
     r = max(int(round(_HAND_MIN_W / 2.0 * ppm)), 1)
     disk = np.hypot(*np.mgrid[-r:r + 1, -r:r + 1]) <= r
     for H, wz in regions:
@@ -615,15 +619,28 @@ def _hand_solids(V, F, regions, ppm):
         H = binary_opening(binary_fill_holes(H), structure=disk)
         if H.sum() < 20:
             continue
-        # over the body: on it, its back down to the body itself (lying on
-        # the top of the arms, gaps under it left tunnels through the joined
-        # model); beside it, as thick each side of its own wrist's depth
-        front = top + t
+        # its volume from its own measurements: round across wherever it is
+        # narrow (a finger is as thick as it is wide), and the palm as thick
+        # as _HAND_THICK_RATIO of its breadth -- each point as thick as the
+        # hand is wide there
+        skel, D = medial_axis(H, return_distance=True)
+        _, (sy, sx) = distance_transform_edt(~skel, return_indices=True)
+        R = D[sy, sx]  # (the hand's half-width at the nearest point of its middle)
+        breadth = 2.0 * float(D.max())
+        cap = max(_HAND_THICK_RATIO * breadth, _HAND_THICK_MIN * ppm) / 2.0
+        Rc = np.minimum(R, cap)
+        half = gaussian_filter(np.where(H, np.sqrt(np.clip(D * (2.0 * Rc - D), 0.0, None)), 0.0), 1.0)
+        half = np.minimum(half, Rc)
+        # over the body: lying on it (its middle a half-width above what it
+        # lies on, its back down to the body itself -- lying on the top of
+        # the arms with gaps under it left tunnels through the joined
+        # model); beside it, round about its own wrist's depth
+        front = top + Rc + half
         back = rest - sr._HAND_SINK * ppm
         if wz is not None:
             over = gaussian_filter(have.astype(np.float64), 2.0)
-            front = over * front + (1.0 - over) * (-wz + t / 2.0)
-            back = over * back + (1.0 - over) * (-wz - t / 2.0)
+            front = over * front + (1.0 - over) * (-wz + half)
+            back = over * back + (1.0 - over) * (-wz - half)
         h0 = float(back[H].min()) - 3.0
         zs = np.arange(0.0, float(front[H].max()) - h0 + 3.0, 1.0)
         piece = sr._layer_solid(front - h0, back - h0, H, zs, 1.0, 1.0, True)
