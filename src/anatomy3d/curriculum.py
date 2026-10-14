@@ -155,7 +155,8 @@ def _clothes() -> list:
             out.append(Item("clothes.sleeves", "Clothes", name, True, True, _STEP, True,
                             "the cuff stepping over the wrist; the overlaps score checks it"))
         else:
-            knobs_ = _STEP + ([SR + "_TIE_THICK"] if key == "tie" else []) + ([SR + "_BELT_THICK"] if key == "belt" else [])
+            knobs_ = (_STEP + ([SR + "_TIE_THICK"] if key == "tie" else []) + ([SR + "_BELT_THICK"] if key == "belt" else [])
+                      + ([SR + "_WATCH_THICK", SR + "_BRACELET_THICK"] if key == "watch" else []))
             extra = [SR + "_REF_DRAPE", SR + "_REF_HANG"] if key in ("shirt", "jacket", "suit") else []
             scored = key in _SCORED
             out.append(Item(f"clothes.{key}", "Clothes", name, True, True, knobs_ + extra, scored,

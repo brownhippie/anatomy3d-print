@@ -354,8 +354,11 @@ def build(code: str, inputs: LabInputs):
             depth_strength=0.5 if o["depth"] == "off" else float(o["depth"]),
             animal_frac=inputs.animal_frac,
             bust_mode=o["legs"] == "bust",
-            face_mesh=None if o["face"] == "off" else inputs.face_mesh,
-            face_strength={"off": None, "half": 0.45, "full": 1.0}[o["face"]],
+            # "off" takes away the face's own sculpting only: the face points
+            # still place the clothes' steps, the hair's pattern, the ears and
+            # the bones (passing no face at all dropped every one of them)
+            face_mesh=inputs.face_mesh,
+            face_strength={"off": 0.0, "half": 0.45, "full": 1.0}[o["face"]],
             profile=o["profile"],
             edge=o["edge"],
             layer_rescue=o["rescue"],

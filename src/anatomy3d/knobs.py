@@ -94,6 +94,8 @@ KNOBS = [
     Knob(_SR, "_CLOTH_STEP_SPAN", 0.006, 0.04, "clothes", "the step eases back over this (m)"),
     Knob(_SR, "_TIE_THICK", 0.0, 0.005, "clothes", "a tie stands this proud of the shirt (m)"),
     Knob(_SR, "_BELT_THICK", 0.0, 0.005, "clothes", "a belt stands this proud (m)"),
+    Knob(_SR, "_WATCH_THICK", 0.002, 0.012, "clothes", "a watch stands this proud of the wrist (m)"),
+    Knob(_SR, "_BRACELET_THICK", 0.001, 0.006, "clothes", "a bracelet stands this proud of the wrist (m)"),
     Knob(_SR, "_CLAVICLE", 0.0, 0.006, "bones", "the collarbones' ridge under bare skin (m)"),
     Knob(_SR, "_STERNAL_NOTCH", 0.0, 0.006, "bones", "the hollow between the collarbones (m)"),
     Knob(_SR, "_PATELLA", 0.0, 0.008, "bones", "a bare kneecap (m)"),

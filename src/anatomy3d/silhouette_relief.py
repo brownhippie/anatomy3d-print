@@ -883,6 +883,8 @@ _CLOTH_LAYER = 0.0025  # one layer's step
 _CLOTH_STEP_SPAN = 0.015  # the step eases back to the garment's own surface over this
 _TIE_THICK = 0.002  # a tie stands this proud of the shirt (on top of its layer step)
 _BELT_THICK = 0.002
+_WATCH_THICK = 0.006  # a watch's case and strap stand this proud of the wrist (a real case is ~10 mm deep)
+_BRACELET_THICK = 0.003
 # Bones that show under bare skin (_bony_landmarks), metres on the person:
 _CLAVICLE = 0.003  # the collarbones' ridge
 _STERNAL_NOTCH = 0.003  # the hollow between them at the neck's base
@@ -1964,7 +1966,7 @@ def _clothes_relief(reading: dict, front: np.ndarray, cells: np.ndarray, y0: int
     local = gaussian_filter(np.where(cells, Lf, 0.0), span) / w
     step = _CLOTH_LAYER * px_per_m * (Lf - local)
     garment = np.isin(lab_g, [i + 1 for i in range(len(GARMENTS))])
-    for k, t in (("tie", _TIE_THICK), ("belt", _BELT_THICK)):
+    for k, t in (("tie", _TIE_THICK), ("belt", _BELT_THICK), ("watch", _WATCH_THICK), ("bracelet", _BRACELET_THICK)):
         m_ = lab_g == NAMES.index(k) + 1
         if m_.any():
             step = step + t * px_per_m * gaussian_filter(m_.astype(np.float64), 1.0)
@@ -2774,7 +2776,7 @@ def build_silhouette_relief_mesh(
             except Exception as exc:  # noqa: BLE001 - the body keeps its shape without them
                 print(f"Note: bony landmarks skipped ({exc}).")
         face_read = (parts or {}).get("face") if parts is not None else None
-        if face_read:
+        if face_read and (face_strength is None or face_strength > 0):
             try:
                 ppm = float(reference["px_per_m"]) if reference is not None else (
                     float(np.linalg.norm(face_mesh[10, :2] - face_mesh[152, :2])) / 0.18)
