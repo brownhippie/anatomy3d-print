@@ -32,7 +32,7 @@ class Knob:
         return f"{self.module}.{self.name}"
 
 
-_SR, _BR = "silhouette_relief", "body_reference"
+_SR, _BR, _BF = "silhouette_relief", "body_reference", "body_first"
 KNOBS = [
     # hair
     Knob(_SR, "_HAIR_SHELL_MAX", 0.03, 0.07, "hair", "thickest hair lying round the skull (m)"),
@@ -127,6 +127,17 @@ KNOBS = [
     Knob(_SR, "_SCAR_DEPTH", 0.0, 0.0015, "face parts", "a scar's groove (m)"),
     Knob(_SR, "_BEARD_THICK", 0.001, 0.01, "face parts", "a beard or moustache stands this proud (m)"),
     Knob(_SR, "_STUBBLE_DEPTH", 0.0, 0.0008, "face parts", "stubble's grain (m)"),
+    # body first: the tailoring of the clothes, their detail, the hands
+    Knob(_BF, "_FIT_FRONT", 0.2, 0.6, "tailoring", "a garment's front stands off the layer under it by this share of its room at the sides"),
+    Knob(_BF, "_FIT_SHOW", 1.0, 2.5, "tailoring", "cloth's thickness shown up this much on a figure"),
+    Knob(_BF, "_POP_SPAN", 0.03, 0.08, "tailoring", "a piece stands over the lowest layer within this far, as a whole (m)"),
+    Knob(_BF, "_POP_BEVEL", 0.0005, 0.003, "tailoring", "a piece's edge softened over this (m)"),
+    Knob(_BF, "_BUST_DRAPE", 0.12, 0.3, "tailoring", "a bust under a jacket: the cloth spans it as a ball this size (m)"),
+    Knob(_BF, "_CLOTH_HANG", 0.05, 0.2, "tailoring", "down the back cloth comes in at most this much per unit it falls"),
+    Knob(_BF, "_POP_FINE", 1.0, 2.2, "body first", "the clothes' folds, seams and creases deepened this much"),
+    Knob(_BF, "_DETAIL_MAX", 0.004, 0.012, "body first", "the photo's depth detail stands at most about this far (m)"),
+    Knob(_BF, "_HAIR_LAYER", 0.003, 0.008, "body first", "short hair's layer over the scalp (m)"),
+    Knob(_BF, "_HAND_THICK_RATIO", 0.28, 0.42, "body first", "a palm is this thick for its breadth"),
     # face
     Knob(_SR, "_FACE_RELIEF_FADE_FRAC", 0.1, 0.3, "face", "face detail fades out over this share of the face"),
     Knob(_SR, "_FACE_RELIEF_SMOOTH_FRAC", 0.01, 0.03, "face", "face detail smoothing"),

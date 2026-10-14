@@ -35,6 +35,8 @@ import trimesh
 from . import knobs, lab
 
 CODE = lab.CODE_PRODUCTION
+CODE_BODY_FIRST = "B-" + "0" * len(lab.FAMILIES["B"]["dims"])  # learned on wherever a body can be posed
+CHECK_W = 2.0  # each of body-first's reality checks that fails
 START_STEP = 0.25  # of a knob's range
 MIN_STEP = 1 / 32
 MIN_GAIN = 0.15  # a move is kept when the mean score rises by more than this
@@ -63,7 +65,8 @@ OBJECTIVE = (f"study score = Lab score + {HELD_W} × held mean − {BUMP_W} × b
              f"− {FIT_W} × the posed body's joint miss (% of shoulder width) "
              f"− {EAR_W} × the ears' reach off the photo's (% of face width) − {NAPE_W} × the nape's bumps (%) "
              f"− {STAND_W} if it wouldn't stand on its base − {OVERHANG_W} × overhang (%) "
-             f"− {SEAM_W} × (cracks at hair's seams + grooves under a skirt, %) − {SYM_W} × left/right balance off the photo's")
+             f"− {SEAM_W} × (cracks at hair's seams + grooves under a skirt, %) − {SYM_W} × left/right balance off the photo's "
+             f"− {CHECK_W} × each failed reality check (body-first builds: every step checked against the photo, the human body and a printable solid)")
 
 
 # ---------------------------------------------------------------- critics
@@ -480,7 +483,8 @@ def objective(m: dict) -> float:
                  - FIT_W * 100.0 * (m.get("fit_kp") or 0.0)
                  - EAR_W * m.get("ear_err", 0.0) - NAPE_W * m.get("nape_bumps", 0.0)
                  - STAND_W * (1.0 - m.get("stands", 1.0)) - OVERHANG_W * m.get("overhang_pct", 0.0)
-                 - SEAM_W * (m.get("hair_seams", 0.0) + m.get("skirt_gap", 0.0)) - SYM_W * m.get("symmetry_diff", 0.0))
+                 - SEAM_W * (m.get("hair_seams", 0.0) + m.get("skirt_gap", 0.0)) - SYM_W * m.get("symmetry_diff", 0.0)
+                 - CHECK_W * m.get("checks_failed_n", 0))
 
 
 def evaluate(inputs: "lab.LabInputs", values: dict):
@@ -491,8 +495,12 @@ def evaluate(inputs: "lab.LabInputs", values: dict):
         if inputs.pose and inputs.animal_frac <= 0.15:
             fitted = fit_body_reference(inputs.pose, inputs.face_mesh, inputs.photo_mask, gender=inputs.body, parts=inputs.parts)
             inputs.reference = fitted if fitted is not None and fitted["matched"] else None
-        body = lab.build(CODE, inputs)
-        m, preview, thumb = lab.score(CODE, body, inputs, thumb_size=THUMB)
+        code = CODE_BODY_FIRST if inputs.reference is not None else CODE
+        body = lab.build(code, inputs)
+        m, preview, thumb = lab.score(code, body, inputs, thumb_size=THUMB)
+        rep = getattr(body, "report", None) or {}
+        if "checks_failed" in rep:
+            m["checks_failed_n"] = len(rep["checks_failed"])
     lab._sface.pop(id(inputs), None)  # keyed by object: never let a later photo reuse it
     if inputs.reference is not None:
         m["fit_kp"] = inputs.reference["report"].get("kp_median")  # the posed body's miss of the photo's joints
@@ -661,7 +669,7 @@ def finish_candidate(st: dict) -> dict:
             "metrics": {pid: {k: r.get(k) for k in ("score", "held_mean", "bumps", "shape_iou", "face_err_pct", "spike_pct", "hair_flow",
                                                     "face_err_eyes", "face_err_brows", "face_err_nose", "face_err_mouth", "face_err_jaw",
                                                     "mouth_open_diff", "eyes_open_diff", "layering", "fit_kp", "ear_err", "nape_bumps", "stands",
-                                                    "overhang_pct", "hair_seams", "skirt_gap", "symmetry_diff", "error")}
+                                                    "overhang_pct", "hair_seams", "skirt_gap", "symmetry_diff", "checks_failed_n", "clothes_pct", "error")}
                         for pid, r in c["results"].items()}}
     if c.get("role"):
         # the same values built again with new code
@@ -723,6 +731,7 @@ METRIC_HOME = {
     "bumps": ["hair", "clothes"], "shape_iou": ["clothes"], "fit_kp": ["bones"], "held_mean": ["clothes", "bones"],
     "spike_pct": ["clothes", "hair"], "min_wall_mm": ["clothes"], "overhang_pct": ["clothes"], "stands": ["bones"],
     "hair_seams": ["hair"], "skirt_gap": ["clothes"], "symmetry_diff": ["bones", "clothes"],
+    "checks_failed_n": ["tailoring", "body first"], "clothes_pct": ["tailoring", "clothes"],
 }
 CROSS_Z = 2.0  # a move shifting a score by this many of its usual shifts counts
 

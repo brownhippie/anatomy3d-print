@@ -79,6 +79,7 @@ TEMPLATES = [
 ]
 
 
+VERIFY_CLOTHES_PCT = 50.0  # a build is verified when it shows at least this share of the photo's garment-over-garment boundaries the right way round
 CODE_PRODUCTION = "O-" + "0" * len(FAMILIES["O"]["dims"])  # option 0 everywhere: what Generate builds
 
 
@@ -570,6 +571,19 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
     if m["photo_detail"] is not None:
         s += PHOTO_DETAIL_W * m["photo_detail"]
     m["score"] = round(s, 1)
+    # verified: a closed solid, walls a print holds, and the clothes the
+    # photo shows recognised on it -- where the photo has one garment over
+    # another (a jacket over the shirt, a tie on it, a collar round the
+    # neck) the model has the outer one in front
+    try:
+        from .study import layering
+
+        lay = layering(preview, floor, inputs)
+        m["clothes_pct"] = lay.get("layering")
+    except Exception:  # noqa: BLE001 - no clothes boundaries to judge on
+        m["clothes_pct"] = None
+    m["verified"] = bool(m["watertight"] and m["min_wall_mm"] >= 0.8
+                         and (m["clothes_pct"] is None or m["clothes_pct"] >= VERIFY_CLOTHES_PCT))
     try:
         params = _parameters(m, inputs, preview, floor, sil, got, head)
         m["params"] = {k: v for k, v in params.items()}

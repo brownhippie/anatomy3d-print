@@ -328,7 +328,7 @@ def _item(run_id: str, r: dict, ratings: dict) -> dict:
         "rating": ratings.get(code),
     }
     if r["status"] == "ok":
-        item.update({k: r.get(k) for k in ("score", "shape_iou", "spike_pct", "watertight", "min_wall_mm", "face_found", "face_err_pct", "seconds", "params", "held_mean", "photo_detail", "checks_n", "checks_failed")})
+        item.update({k: r.get(k) for k in ("score", "shape_iou", "spike_pct", "watertight", "min_wall_mm", "face_found", "face_err_pct", "seconds", "params", "held_mean", "photo_detail", "checks_n", "checks_failed", "clothes_pct", "verified")})
         item["thumb_url"] = f"/api/lab/runs/{run_id}/thumb/{code}.png"
         item["model_url"] = f"/api/lab/runs/{run_id}/model/{code}.obj" if r.get("model") else None
     else:
@@ -359,6 +359,9 @@ def get_run(run_id: str, sort: str = "score", family: str = "all", offset: int =
         rows = [r for r in rows if r["status"] != "ok"]
     elif only == "ok":
         rows = [r for r in rows if r["status"] == "ok"]
+    elif only == "verified":
+        # sealed, printable, and the photo's clothes recognised on it (lab.score)
+        rows = [r for r in rows if r["status"] == "ok" and r.get("verified")]
     if sort == "score":
         rows.sort(key=lambda r: (r["status"] != "ok", -(r.get("score") or -1e9)))
     elif sort == "held":
