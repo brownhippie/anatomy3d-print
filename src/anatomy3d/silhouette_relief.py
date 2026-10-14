@@ -1056,6 +1056,91 @@ def _person_extent(mask: np.ndarray, hip_y: Optional[float], knee_y: Optional[fl
     return out, "torso"
 
 
+def _grow_to_outline(V: np.ndarray, F: np.ndarray, reference: dict, part_w: np.ndarray, grid_mask: np.ndarray,
+                     grid_xy, shape, d_in: np.ndarray, d_out: np.ndarray, scale: float, photo_mask: Optional[np.ndarray],
+                     normals: Optional[np.ndarray] = None, keep: Optional[np.ndarray] = None):
+    """The posed body grown along its normals to the photo's outline (the
+    clothes' and hair's room round it): (vertices, part names, how far each
+    ear's base moved)."""
+    from scipy.ndimage import binary_closing, binary_dilation, binary_erosion
+
+    # Each rim vertex (on the body's outline as the camera sees it)
+    # measures its own gap to the photo's outline; the gaps spread
+    # smoothly over the whole surface, hands stay bare, and the body
+    # grows along its normals. Repeated so the grown rim is re-measured.
+    names = [str(n) for n in reference["part_names"]]
+    lo, hi = (v * float(reference["px_per_m"]) for v in _REF_CLOTH_RANGE)
+    hair = _REF_HAIR * float(reference["px_per_m"])
+    V0, nrm0 = V.copy(), (_vertex_normals(V, F) if normals is None else normals)
+    bare = np.zeros(len(V), dtype=bool)
+    for name in _REF_BARE_PARTS:
+        if name in names:
+            bare |= part_w[:, names.index(name)] > 0.5
+    if keep is not None:
+        bare |= keep  # (held where it is: the face, in the body-first build)
+    head = part_w[:, names.index("head")] if "head" in names else np.zeros(len(V))
+    depth_share = 1.0 - (1.0 - _REF_CLOTH_DEPTH) * (1.0 - head)
+    # the ears don't measure the outline (they're placed to it after),
+    # they ride along with the skin they sit on
+    ear_w = reference.get("ear_w")
+    ear_w = np.zeros((len(V), 0)) if ear_w is None else np.asarray(ear_w, dtype=np.float64)
+    on_ear = ear_w.max(axis=1) > 0.05 if ear_w.shape[1] else np.zeros(len(V), dtype=bool)
+    ear_grew = np.zeros(ear_w.shape[1])
+    # the skull doesn't grow into hair or a hat: those get their own
+    # volume (_hair_volume); its rim under them doesn't measure the outline
+    under_hair = np.zeros(len(V), dtype=bool)
+    parts = reference.get("parts")
+    if parts is not None and parts.get("labels") is not None:
+        from .head_parts import HAIR as _HAIR, HAT as _HAT
+
+        lab = parts["labels"]
+        ry = np.clip(np.rint(V[:, 1]).astype(int), 0, lab.shape[0] - 1)
+        rx = np.clip(np.rint(V[:, 0]).astype(int), 0, lab.shape[1] - 1)
+        under_hair = (head > 0.5) & np.isin(lab[ry, rx], (_HAIR, _HAT))
+    lap = _mesh_laplacian(F, len(V))
+    # distance to the photo's outline (photo px, + inside), measured at the
+    # photo's own resolution and smoothed: the grid's pixel steps, read
+    # straight into each vertex's growth, made ridges along every side
+    signed_px = None
+    if photo_mask is not None:
+        signed_px = gaussian_filter((distance_transform_edt(photo_mask) - distance_transform_edt(~photo_mask)).astype(np.float32), 1.5)
+    total = np.zeros(len(V))
+    for _ in range(3):
+        gx, gy = grid_xy(V)
+        near, _ = _raster_depth(gx, gy, V[:, 2], F, shape)
+        cov = binary_closing(np.isfinite(near), iterations=1)
+        rim = binary_dilation(cov & ~binary_erosion(cov), iterations=1)
+        r = np.clip(np.rint(gy).astype(int), 0, shape[0] - 1)
+        c = np.clip(np.rint(gx).astype(int), 0, shape[1] - 1)
+        inb = (gy >= 0) & (gy < shape[0]) & (gx >= 0) & (gx < shape[1])
+        if signed_px is not None:
+            gap = map_coordinates(signed_px, [V[:, 1], V[:, 0]], order=1, mode="nearest")
+        else:
+            gap = np.where(grid_mask[r, c], d_in[r, c], -d_out[r, c]) / scale
+        # (through thin hair it still grows: a short cut is the head's own outline)
+        thick_hair = under_hair & (gap > _HAIR_THIN * float(reference["px_per_m"]))
+        on_rim = inb & rim[r, c] & (np.abs(_vertex_normals(V, F)[:, 2]) < 0.35) & ~bare & ~on_ear & ~thick_hair
+        known = np.flatnonzero(on_rim | bare)
+        want = np.where(bare[known], 0.0, np.clip(total[known] + gap[known], lo, hi))
+        total = _harmonic_fill(lap, known, want)
+        # smooth it over the surface: what's left of the outline's pixel
+        # steps in the measured gaps showed as ridges along every side
+        total = _mesh_smooth(lap, total, 12)
+        step = nrm0 * total[:, None]
+        # depth: never shrinks; on the head it grows by hair at most (the
+        # outline's ears and hair say nothing about the skull's length)
+        grow_z = np.minimum(np.maximum(total, 0.0), head * hair + (1.0 - head) * hi)
+        step[:, 2] = nrm0[:, 2] * grow_z * depth_share
+        for i in range(ear_w.shape[1]):
+            w = ear_w[:, i]
+            base = (w > 0.02) & (w < 0.5)
+            if base.any():
+                ear_grew[i] = float(np.linalg.norm(step[base].mean(axis=0)))
+                step = step + w[:, None] * (step[base].mean(axis=0) - step)
+        V = V0 + step
+    return V, names, ear_grew
+
+
 def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int, scale: float, pad: int,
                         face_mesh: Optional[np.ndarray], photo_mask: Optional[np.ndarray] = None):
     """Front and back (photo px, z toward camera) of the posed reference body
@@ -1073,78 +1158,7 @@ def _reference_surfaces(reference: dict, grid_mask: np.ndarray, y0: int, x0: int
 
     part_w = reference.get("part_w")
     if part_w is not None:
-        # Each rim vertex (on the body's outline as the camera sees it)
-        # measures its own gap to the photo's outline; the gaps spread
-        # smoothly over the whole surface, hands stay bare, and the body
-        # grows along its normals. Repeated so the grown rim is re-measured.
-        names = [str(n) for n in reference["part_names"]]
-        lo, hi = (v * float(reference["px_per_m"]) for v in _REF_CLOTH_RANGE)
-        hair = _REF_HAIR * float(reference["px_per_m"])
-        V0, nrm0 = V.copy(), _vertex_normals(V, F)
-        bare = np.zeros(len(V), dtype=bool)
-        for name in _REF_BARE_PARTS:
-            if name in names:
-                bare |= part_w[:, names.index(name)] > 0.5
-        head = part_w[:, names.index("head")] if "head" in names else np.zeros(len(V))
-        depth_share = 1.0 - (1.0 - _REF_CLOTH_DEPTH) * (1.0 - head)
-        # the ears don't measure the outline (they're placed to it after),
-        # they ride along with the skin they sit on
-        ear_w = reference.get("ear_w")
-        ear_w = np.zeros((len(V), 0)) if ear_w is None else np.asarray(ear_w, dtype=np.float64)
-        on_ear = ear_w.max(axis=1) > 0.05 if ear_w.shape[1] else np.zeros(len(V), dtype=bool)
-        ear_grew = np.zeros(ear_w.shape[1])
-        # the skull doesn't grow into hair or a hat: those get their own
-        # volume (_hair_volume); its rim under them doesn't measure the outline
-        under_hair = np.zeros(len(V), dtype=bool)
-        parts = reference.get("parts")
-        if parts is not None and parts.get("labels") is not None:
-            from .head_parts import HAIR as _HAIR, HAT as _HAT
-
-            lab = parts["labels"]
-            ry = np.clip(np.rint(V[:, 1]).astype(int), 0, lab.shape[0] - 1)
-            rx = np.clip(np.rint(V[:, 0]).astype(int), 0, lab.shape[1] - 1)
-            under_hair = (head > 0.5) & np.isin(lab[ry, rx], (_HAIR, _HAT))
-        lap = _mesh_laplacian(F, len(V))
-        # distance to the photo's outline (photo px, + inside), measured at the
-        # photo's own resolution and smoothed: the grid's pixel steps, read
-        # straight into each vertex's growth, made ridges along every side
-        signed_px = None
-        if photo_mask is not None:
-            signed_px = gaussian_filter((distance_transform_edt(photo_mask) - distance_transform_edt(~photo_mask)).astype(np.float32), 1.5)
-        total = np.zeros(len(V))
-        for _ in range(3):
-            gx, gy = grid_xy(V)
-            near, _ = _raster_depth(gx, gy, V[:, 2], F, shape)
-            cov = binary_closing(np.isfinite(near), iterations=1)
-            rim = binary_dilation(cov & ~binary_erosion(cov), iterations=1)
-            r = np.clip(np.rint(gy).astype(int), 0, shape[0] - 1)
-            c = np.clip(np.rint(gx).astype(int), 0, shape[1] - 1)
-            inb = (gy >= 0) & (gy < shape[0]) & (gx >= 0) & (gx < shape[1])
-            if signed_px is not None:
-                gap = map_coordinates(signed_px, [V[:, 1], V[:, 0]], order=1, mode="nearest")
-            else:
-                gap = np.where(grid_mask[r, c], d_in[r, c], -d_out[r, c]) / scale
-            # (through thin hair it still grows: a short cut is the head's own outline)
-            thick_hair = under_hair & (gap > _HAIR_THIN * float(reference["px_per_m"]))
-            on_rim = inb & rim[r, c] & (np.abs(_vertex_normals(V, F)[:, 2]) < 0.35) & ~bare & ~on_ear & ~thick_hair
-            known = np.flatnonzero(on_rim | bare)
-            want = np.where(bare[known], 0.0, np.clip(total[known] + gap[known], lo, hi))
-            total = _harmonic_fill(lap, known, want)
-            # smooth it over the surface: what's left of the outline's pixel
-            # steps in the measured gaps showed as ridges along every side
-            total = _mesh_smooth(lap, total, 12)
-            step = nrm0 * total[:, None]
-            # depth: never shrinks; on the head it grows by hair at most (the
-            # outline's ears and hair say nothing about the skull's length)
-            grow_z = np.minimum(np.maximum(total, 0.0), head * hair + (1.0 - head) * hi)
-            step[:, 2] = nrm0[:, 2] * grow_z * depth_share
-            for i in range(ear_w.shape[1]):
-                w = ear_w[:, i]
-                base = (w > 0.02) & (w < 0.5)
-                if base.any():
-                    ear_grew[i] = float(np.linalg.norm(step[base].mean(axis=0)))
-                    step = step + w[:, None] * (step[base].mean(axis=0) - step)
-            V = V0 + step
+        V, names, ear_grew = _grow_to_outline(V, F, reference, part_w, grid_mask, grid_xy, shape, d_in, d_out, scale, photo_mask)
 
     # Depth margin, in 3D: every point's front-to-back offset from its own
     # bones grows (torso about the spine, each arm about its bones, the head

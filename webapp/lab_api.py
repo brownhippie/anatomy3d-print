@@ -158,7 +158,7 @@ def _work_one(run_id: str) -> bool:
                     inputs = _inputs(run_id, d)
                     with _state_lock:
                         meta = _read_json(d / "meta.json", {})
-                        fams = ["O"] if inputs.capsule is None else ["C", "O"]
+                        fams = (["O"] if inputs.capsule is None else ["C", "O"]) + (["B"] if inputs.reference is not None else [])
                         meta.update(families=fams, families_checked=True, capsule_unavailable=inputs.capsule_unavailable)
                         if inputs.bust_hint and not meta.get("reordered_for_bust"):
                             _write_json(d / "order.json", lab.run_order(fams, bust=True))
@@ -273,10 +273,10 @@ async def create_run(image: UploadFile = File(...)):
             if m and m.get("status") == "running":
                 m["status"] = "paused"
                 _write_json(other / "meta.json", m)
-        _write_json(d / "order.json", lab.run_order(["C", "O"], bust=False))
+        _write_json(d / "order.json", lab.run_order(["C", "O", "B"], bust=False))
         _write_json(d / "meta.json", {
             "run_id": run_id, "photo_name": image.filename or "photo", "photo_file": f"photo{suffix}",
-            "created": now, "started": now, "status": "running", "families": ["C", "O"],
+            "created": now, "started": now, "status": "running", "families": ["C", "O", "B"],
         })
     return {"run_id": run_id}
 
@@ -346,7 +346,7 @@ def get_run(run_id: str, sort: str = "score", family: str = "all", offset: int =
         floor = None  # the failures themselves, unscored
     rows = [r for r in all_rows if floor is None or (r["status"] == "ok" and (r.get("score") or -1e9) >= floor)
             or r["code"] in ratings]
-    if family in ("C", "O"):
+    if family in ("C", "O", "B"):
         rows = [r for r in rows if r["code"].startswith(family + "-")]
     if only == "rated":
         rows = [r for r in rows if r["code"] in ratings]

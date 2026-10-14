@@ -51,6 +51,14 @@ FAMILIES = {
             ("smooth", "Surface smoothing", [("on", "on"), ("off", "off (old)")]),
         ],
     },
+    "B": {
+        "name": "Body first (3D body, clothes on it, posed, detail on its surface)",
+        "dims": [
+            ("depth", "Photo depth detail", [("0.5", "0.5"), ("off", "off"), ("1.0", "1.0")]),
+            ("face", "Face shaping", [("half", "half (0.45)"), ("off", "off"), ("full", "full (1.0)")]),
+            ("clothes", "Clothes' steps", [("on", "on"), ("off", "off")]),
+        ],
+    },
 }
 
 FINISHES = [("clay", "Sand clay"), ("ivory", "Ivory resin"), ("grey", "Studio grey"), ("photo", "Photo colour")]
@@ -157,6 +165,11 @@ def run_order(families: "list[str]", bust: bool, seed: int = 0) -> "list[str]":
     for name, fam, over in TEMPLATES:
         if fam in families:
             add(_template_code(fam, over))
+    # a small family (body first) whole, early: it's compared against the rest
+    for fam in families:
+        if family_size(fam) <= 64:
+            for idx in itertools.product(*[range(len(d[2])) for d in FAMILIES[fam]["dims"]]):
+                add(encode(fam, idx))
     for k in (1, 2):
         for fam in families:
             dims = FAMILIES[fam]["dims"]
@@ -319,6 +332,16 @@ def build(code: str, inputs: LabInputs):
 
     fam, _ = decode(code)
     o = options(code)
+    if fam == "B":
+        if inputs.reference is None:
+            raise RuntimeError("Body-first can't use this photo: no body could be posed on it.")
+        from .body_first import build_body_first
+
+        body = build_body_first(inputs, target_height_mm=HEIGHT_MM,
+                                depth_strength=None if o["depth"] == "off" else float(o["depth"]),
+                                face_strength={"off": 0.0, "half": 0.45, "full": 1.0}[o["face"]],
+                                clothes_steps=o["clothes"] == "on")
+        return add_base_disk(body, HEIGHT_MM)
     if fam == "C":
         if inputs.capsule is None:
             raise RuntimeError(f"Capsule builder can't use this photo: {inputs.capsule_unavailable}")
