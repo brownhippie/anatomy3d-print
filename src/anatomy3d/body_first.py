@@ -44,8 +44,6 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinat
 
 from .mesh_types import BodyMesh
 
-_MITTEN_SMOOTH = 40  # hand smoothing passes: open fingers -> a mitten
-_FIST = 0.5  # the open hand drawn in to this share of its size about its centre
 _DETAIL_FACING = (0.25, 0.7)  # detail fades in between these shares of facing the camera
 _SUBDIVIDE = 2
 _GROW_NORMAL_SMOOTH = 30  # smoothing passes for the directions the body grows along
@@ -494,6 +492,150 @@ def _raster_front(V, F, shape):
     return near, far
 
 
+_HAND_REACH = 0.55  # the photo's hand: its skin within this many shoulder widths of the wrist (a hand's length)
+_HAND_MIN_AREA = 0.01  # ... at least this share of the shoulder width squared (less: hidden or gloved)
+_HAND_SPAN = 0.03  # a hand over the body lies across bumps and gaps narrower than this (m)
+_HAND_MIN_W = 0.008  # a hand's solid has nothing narrower than this (m)
+_HAND_STUB = 0.15  # the body's own hand goes into the wrist, drawn to this share of its size
+
+
+def _skin_hands(V, F, part_w, names, inputs):
+    """The skin the photo shows comes first: each hand it shows is taken
+    from the photo -- its skin past the wrist, split from the face and neck
+    and the other hand where they touch (each skin pixel goes to whichever
+    is nearer along the skin) -- and becomes a solid of its own once what it
+    lies on is built (_hand_solids). The body's own hands (open, fingers
+    spread) go into the wrists, out of sight. Returns the mesh, the hands'
+    photo regions and what was found per hand."""
+    from skimage.graph import MCP_Geometric
+
+    from .clothes import NAMES
+
+    info, regions = {}, []
+    held = np.zeros(len(V), dtype=bool)
+    wrist_z = {}
+    for n in ("hand.L", "hand.R"):
+        if n in names:
+            w_ = part_w[:, names.index(n)]
+            ring = (w_ > 0.4) & (w_ < 0.6)
+            if ring.sum() >= 3:
+                rc = V[ring].mean(axis=0)
+                wrist_z[n] = float(rc[2])
+                pull = np.clip((w_ - 0.5) / 0.2, 0.0, 1.0)
+                V = V + pull[:, None] * ((rc + _HAND_STUB * (V - rc)) - V)
+                held |= pull > 0.5  # (grown out to the outline, its folds stood out)
+    P = inputs.pose or {}
+    cl = (inputs.parts or {}).get("clothes")
+    if not cl or "skin" not in NAMES or "left_shoulder" not in P or "right_shoulder" not in P:
+        return V, regions, info, held
+    shape = inputs.photo_mask.shape
+    sw = float(np.linalg.norm(np.subtract(P["left_shoulder"][:2], P["right_shoulder"][:2])))
+    skin = (cl["labels"] == NAMES.index("skin") + 1) & inputs.photo_mask
+    if not skin.any():
+        return V, regions, info, held
+    ys, xs = np.nonzero(skin)
+
+    def on_skin(pts):
+        out = []
+        for x, y in pts:
+            d = np.hypot(xs - x, ys - y)
+            i = int(np.argmin(d))
+            if d[i] < 0.08 * sw:
+                out.append((int(ys[i]), int(xs[i])))
+        return out
+
+    seeds = {}
+    fm = inputs.face_mesh
+    if fm is not None:
+        fp = np.asarray(fm)[:468, :2]
+        chin = fp[152] if len(fp) > 152 else fp[np.argmax(fp[:, 1])]
+        seeds["face"] = on_skin([*fp[::10], chin + (0.0, 0.1 * sw), chin + (0.0, 0.2 * sw)])
+    for side in ("left", "right"):
+        k = [P[f"{side}_{t}"][:2] for t in ("index", "pinky", "thumb") if f"{side}_{t}" in P]
+        if k and f"{side}_wrist" in P:
+            tip = np.mean(np.asarray(k, dtype=np.float64), axis=0)
+            wr = np.asarray(P[f"{side}_wrist"][:2], dtype=np.float64)
+            seeds[side] = on_skin([*k, tip, (tip + wr) / 2.0])
+    seeds = {k: v for k, v in seeds.items() if v}
+    if not any(k in seeds for k in ("left", "right")):
+        return V, regions, info, held
+    cost = np.where(skin, 1.0, np.inf)
+    dist = {}
+    for k, v in seeds.items():
+        dist[k], _ = MCP_Geometric(cost).find_costs(v)
+    order = list(dist)
+    owner = np.argmin(np.stack([dist[k] for k in order]), axis=0)
+    for side, n in (("left", "hand.L"), ("right", "hand.R")):
+        if side not in dist or n not in names:
+            continue
+        wr = np.asarray(P[f"{side}_wrist"][:2], dtype=np.float64)
+        tip = np.mean([P[f"{side}_{t}"][:2] for t in ("index", "pinky", "thumb") if f"{side}_{t}" in P], axis=0)
+        H = skin & (owner == order.index(side)) & np.isfinite(dist[side])
+        hy, hx = np.nonzero(H)
+        d = np.column_stack([hx, hy]).astype(np.float64) - wr
+        hl2 = float(np.dot(tip - wr, tip - wr))
+        ok = (d @ (tip - wr) >= -0.1 * hl2) & (np.hypot(d[:, 0], d[:, 1]) <= _HAND_REACH * sw)
+        H = np.zeros(shape, dtype=bool)
+        H[hy[ok], hx[ok]] = True
+        if H.sum() < _HAND_MIN_AREA * sw * sw:
+            info[side] = "too little of the hand shows"
+            continue
+        regions.append((H, wrist_z.get(n)))
+        info[side] = {"px": int(H.sum())}
+    return V, regions, info, held
+
+
+def _hand_solids(V, F, regions, ppm):
+    """The hands over the body, each a closed solid: the photo's hand for its
+    outline, _HAND_THICK thick with a rounded edge, lying on what is under it
+    (sunk a little into it, so they join). [(vertices, faces)] in photo px."""
+    from . import silhouette_relief as sr
+
+    out = []
+    if not regions:
+        return out
+    near, _ = _raster_front(V, F, regions[0][0].shape)
+    have = np.isfinite(near)
+    if not have.any():
+        return out
+    _, (iy, ix) = distance_transform_edt(~have, return_indices=True)
+    rest = -near[iy, ix]  # (heights toward the camera)
+    from scipy.ndimage import maximum_filter
+
+    k = max(int(round(_HAND_SPAN * ppm)), 3)
+    top = gaussian_filter(maximum_filter(rest, size=k), k / 2.0)  # across the top of what it lies on
+    from scipy.ndimage import binary_fill_holes, binary_opening
+
+    t = sr._HAND_THICK * ppm
+    r = max(int(round(_HAND_MIN_W / 2.0 * ppm)), 1)
+    disk = np.hypot(*np.mgrid[-r:r + 1, -r:r + 1]) <= r
+    for H, wz in regions:
+        # (no slivers narrower than _HAND_MIN_W -- between fingers, round
+        # what the hand holds -- and no holes: thin walls, tunnels)
+        H = binary_opening(binary_fill_holes(H), structure=disk)
+        if H.sum() < 20:
+            continue
+        # over the body: on it, its back down to the body itself (lying on
+        # the top of the arms, gaps under it left tunnels through the joined
+        # model); beside it, as thick each side of its own wrist's depth
+        front = top + t
+        back = rest - sr._HAND_SINK * ppm
+        if wz is not None:
+            over = gaussian_filter(have.astype(np.float64), 2.0)
+            front = over * front + (1.0 - over) * (-wz + t / 2.0)
+            back = over * back + (1.0 - over) * (-wz - t / 2.0)
+        h0 = float(back[H].min()) - 3.0
+        zs = np.arange(0.0, float(front[H].max()) - h0 + 3.0, 1.0)
+        piece = sr._layer_solid(front - h0, back - h0, H, zs, 1.0, 1.0, True)
+        if piece is not None:
+            pv, pf = piece
+            pv = np.column_stack([pv[:, 2], pv[:, 1], -(pv[:, 0] + h0)])
+            if trimesh.Trimesh(pv, pf, process=False).volume < 0:
+                pf = pf[:, ::-1]
+            out.append((pv, pf))
+    return out
+
+
 def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Optional[float] = 0.5,
                      face_strength: Optional[float] = None, clothes_steps: bool = True, bust: Optional[bool] = None) -> BodyMesh:
     from . import silhouette_relief as sr
@@ -528,6 +670,11 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # wrists are, the arm whose wrist shows lies over the other
     V, arms = _fold_arms(V, F, part_w, names, inputs, ref)
 
+    # the skin the photo shows comes first: the hands, made mittens, are set
+    # where the photo's own hands are, as big as they are there; everything
+    # after (the outline, the plan, the clothes) fits round them
+    V, hand_regions, arms["hands"], hand_held = _skin_hands(V, F, part_w, names, inputs)
+
     # 4. clothes' (and hair's) room: grown out to the photo's outline
     d_in, d_out = distance_transform_edt(mask), distance_transform_edt(~mask)
     # (grown along the normals of a smoothed copy: along its own, in tight
@@ -556,7 +703,8 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         cap_in = (V[:, 1] >= cut_row - 0.5) & (sr._vertex_normals(V, F)[:, 1] > 0.9)
     V_cap = V[cap_in].copy()
     V, names, _ = sr._grow_to_outline(V, F, body_ref, part_w, mask, lambda P: (P[:, 0], P[:, 1]), shape, d_in, d_out, 1.0, mask,
-                                      normals=sr._vertex_normals(Vsm, F), keep=face_keep)
+                                      normals=sr._vertex_normals(Vsm, F),
+                                      keep=hand_held if face_keep is None else (face_keep | hand_held))
     V[cap_in] = V_cap
     core = body_ref.get("core_depth")
     if core is not None:
@@ -576,27 +724,6 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         from .body_reference import place_ears
 
         V = place_ears(V, np.asarray(body_ref["ear_w"], dtype=np.float64), ref["head_axes"], ref["ears"], faces=F, px_per_m=ppm)
-    # mitten hands
-    hand = np.zeros(len(V))
-    for n in ("hand.L", "hand.R"):
-        if n in names:
-            hand = np.maximum(hand, part_w[:, names.index(n)])
-    if hand.max() > 0.5:
-        # (the body's hands are open, fingers spread, ~18 cm across: drawn in
-        # toward their own centre to a closed hand's size, then smoothed --
-        # smoothing alone left the fingers standing out once the hands were
-        # out in view)
-        for n in ("hand.L", "hand.R"):
-            if n in names:
-                w_ = part_w[:, names.index(n)]
-                on = w_ > 0.5
-                if on.sum() > 10:
-                    c_ = V[on].mean(axis=0)
-                    V = V + np.clip(w_ * 1.5, 0.0, 1.0)[:, None] * ((c_ + _FIST * (V - c_)) - V)
-        lap = sr._mesh_laplacian(F, len(V))
-        Vs = np.column_stack([sr._mesh_smooth(lap, V[:, k], _MITTEN_SMOOTH) for k in range(3)])
-        V = V + np.clip(hand * 1.5, 0.0, 1.0)[:, None] * (Vs - V)
-
     # the four sides, understood before anything is built on them
     V, plan = plan_four_sides(V, F, part_w, names, inputs, body_ref)
     plan["cut_at_row"] = cut_row
@@ -694,6 +821,12 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
 
     # out, to the figure's frame (the bottom stays flat on the cut: clothes
     # and smoothing rounded it a little)
+    # the hands over the body, solids of their own on what they lie on
+    if hand_regions:
+        try:
+            V, F = sr._join_solids(V, F, _hand_solids(V, F, hand_regions, ppm))
+        except Exception as exc:  # noqa: BLE001 - the body without separate hands is still a model
+            print(f"Note: hands not joined ({exc}).")
     if cut_row is not None:
         # (trimmed clean, still a closed solid: pinning what went below onto
         # the cut folded triangles over each other -- thin walls, cracks)

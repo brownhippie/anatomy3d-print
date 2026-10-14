@@ -91,6 +91,11 @@ def add_base_disk(body: BodyMesh, target_height_mm: float) -> BodyMesh:
     except Exception as exc:  # noqa: BLE001 - a failed bonus feature shouldn't fail the run
         print(f"Note: could not add the base disk ({exc}); the figure will print/render without one.")
         return body
+    pieces = combined.split(only_watertight=False)
+    if len(pieces) > 1:
+        # (the union can leave a zero-volume sliver at the seam: an open
+        # piece of its own, it made the whole read as not sealed)
+        combined = max(pieces, key=lambda m: len(m.faces))
 
     colors = None
     if body.colors is not None:
