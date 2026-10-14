@@ -45,6 +45,7 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinat
 from .mesh_types import BodyMesh
 
 _MITTEN_SMOOTH = 40  # hand smoothing passes: open fingers -> a mitten
+_FIST = 0.5  # the open hand drawn in to this share of its size about its centre
 _DETAIL_FACING = (0.25, 0.7)  # detail fades in between these shares of facing the camera
 _SUBDIVIDE = 2
 _GROW_NORMAL_SMOOTH = 30  # smoothing passes for the directions the body grows along
@@ -104,6 +105,97 @@ def _cut_below(V, F, row: float, per_vertex: dict):
         out[k] = P[:, i] if flat else P[:, i:i + w]
         i += w
     return P[:, :3], T, out
+
+
+_ARM_REACH_MAX = 0.3  # a forearm lengthened at most this share to reach the photo's wrist
+_ARM_REST_GAP = 0.004  # the top forearm's underside clears the one under it by this, metres
+_ARM_LIFT_MAX = 0.07  # ... lifted at most this (about a forearm's thickness), metres
+
+
+def top_arm(inputs) -> Optional[str]:
+    """Which forearm lies on top when the arms are folded: the one whose wrist
+    the photo shows (skin, a cuff, a watch round it); the other's wrist is
+    under the top sleeve, all jacket. None when it can't tell."""
+    from .clothes import NAMES
+
+    P, cl = inputs.pose or {}, (inputs.parts or {}).get("clothes")
+    if not cl or not all(k in P for k in ("left_wrist", "right_wrist", "left_shoulder", "right_shoulder")):
+        return None
+    lab = cl["labels"]
+    sw = float(np.linalg.norm(np.subtract(P["left_shoulder"][:2], P["right_shoulder"][:2])))
+    shown = [NAMES.index(k) + 1 for k in ("skin", "watch", "bracelet", "shirt", "tshirt", "gloves") if k in NAMES]
+    r = int(max(3, 0.06 * sw))
+    share = {}
+    for sd in ("left", "right"):
+        x, y = (int(round(v)) for v in P[f"{sd}_wrist"][:2])
+        win = lab[max(y - r, 0):y + r + 1, max(x - r, 0):x + r + 1]
+        share[sd] = float(np.isin(win, shown).mean()) if win.size else 0.0
+    if abs(share["left"] - share["right"]) < 0.25:
+        return None
+    return "left" if share["left"] > share["right"] else "right"
+
+
+def _fold_arms(V, F, part_w, names, inputs, ref):
+    """Folded arms as the photo holds them: each forearm (and its hand)
+    reaching to where the photo's wrist is (the fit trusts wrists little and
+    keeps bones near average length; folded forearms lie flat across the
+    body at their full length), and the arm whose wrist shows lying over the
+    other where they overlap."""
+    P = inputs.pose or {}
+    J = {k: np.asarray(v, dtype=np.float64) for k, v in (ref.get("joints_px") or {}).items()}
+    info = {}
+    if not all(k in P and k in J for k in ("left_elbow", "right_elbow", "left_wrist", "right_wrist")):
+        return V, info
+    V = V.copy()
+    side = {"left": "L", "right": "R"}
+    arm_w = {}
+    for sd, s_ in side.items():
+        fw = part_w[:, names.index(f"forearm.{s_}")] if f"forearm.{s_}" in names else np.zeros(len(V))
+        hw = part_w[:, names.index(f"hand.{s_}")] if f"hand.{s_}" in names else np.zeros(len(V))
+        e, w = J[f"{sd}_elbow"][:2], J[f"{sd}_wrist"][:2]
+        axis = w - e
+        L = float(np.hypot(*axis))
+        if L < 1e-6:
+            continue
+        # how far along elbow -> wrist each point is (0 at the elbow, 1 past the wrist)
+        frac = np.clip(((V[:, :2] - e) @ axis) / (L * L), 0.0, 1.0)
+        wt = np.clip(fw + hw, 0.0, 1.0) * np.where(hw > 0.5, 1.0, frac)
+        arm_w[sd] = wt
+        want = np.asarray(P[f"{sd}_wrist"][:2], dtype=np.float64)
+        move = want - w
+        reach = float(np.hypot(*(want - e))) / L - 1.0
+        if reach > _ARM_REACH_MAX:
+            move *= _ARM_REACH_MAX / reach
+        V[:, :2] += wt[:, None] * move[None, :]
+        info[f"{sd}_reach"] = round(reach, 3)
+    # folded: both forearms lie across the body (more across than up and
+    # down) and over each other (a hand raised to the collar isn't)
+    sw = float(np.linalg.norm(np.subtract(P["left_shoulder"][:2], P["right_shoulder"][:2]))) if "left_shoulder" in P and "right_shoulder" in P else 0.0
+    seg = {sd: (np.asarray(P[f"{sd}_elbow"][:2], dtype=np.float64), np.asarray(P[f"{sd}_wrist"][:2], dtype=np.float64)) for sd in side}
+    across = all(abs(b[0] - a[0]) > 1.5 * abs(b[1] - a[1]) for a, b in seg.values())
+    xs = {sd: sorted((a[0], b[0])) for sd, (a, b) in seg.items()}
+    overlap = min(xs["left"][1], xs["right"][1]) - max(xs["left"][0], xs["right"][0])
+    near_rows = abs(np.mean([seg["left"][0][1], seg["left"][1][1]]) - np.mean([seg["right"][0][1], seg["right"][1][1]])) < 0.3 * max(sw, 1.0)
+    folded = across and near_rows and overlap > 0.2 * max(sw, 1.0)
+    info["folded"] = bool(folded)
+    top = top_arm(inputs) if folded else None
+    info["top"] = top
+    if top is not None and len(arm_w) == 2:
+        under = "right" if top == "left" else "left"
+        shape = inputs.photo_mask.shape
+        sel = {sd: ((part_w[:, names.index(f"forearm.{side[sd]}")] + part_w[:, names.index(f"hand.{side[sd]}")])[F] > 0.5).all(axis=1)
+               for sd in (top, under)}
+        tn, tf = _raster_front(V, F[sel[top]], shape)
+        un, _ = _raster_front(V, F[sel[under]], shape)
+        both = np.isfinite(tf) & np.isfinite(un)
+        if both.sum() > 20:
+            # (depth runs toward the back) the top's back must sit in front of the other's front
+            gap = _ARM_REST_GAP * float(ref["px_per_m"])
+            need = min(float(np.percentile((tf - un)[both], 90)) + gap, _ARM_LIFT_MAX * float(ref["px_per_m"]))
+            if need > 0:
+                V[:, 2] -= arm_w[top] * need
+            info["lifted_px"] = round(max(need, 0.0), 1)
+    return V, info
 
 
 def _cover_unseen(V, F, part_w, names, inputs, ppm, still=None):
@@ -429,6 +521,10 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         part_w = part_w / np.maximum(part_w.sum(axis=1, keepdims=True), 1e-9)
         body_ref = dict(body_ref, part_w=part_w, core_depth=kept["core"], ear_w=kept["ear_w"])
 
+    # the arms as the photo holds them: folded arms reach where the photo's
+    # wrists are, the arm whose wrist shows lies over the other
+    V, arms = _fold_arms(V, F, part_w, names, inputs, ref)
+
     # 4. clothes' (and hair's) room: grown out to the photo's outline
     d_in, d_out = distance_transform_edt(mask), distance_transform_edt(~mask)
     # (grown along the normals of a smoothed copy: along its own, in tight
@@ -476,6 +572,17 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         if n in names:
             hand = np.maximum(hand, part_w[:, names.index(n)])
     if hand.max() > 0.5:
+        # (the body's hands are open, fingers spread, ~18 cm across: drawn in
+        # toward their own centre to a closed hand's size, then smoothed --
+        # smoothing alone left the fingers standing out once the hands were
+        # out in view)
+        for n in ("hand.L", "hand.R"):
+            if n in names:
+                w_ = part_w[:, names.index(n)]
+                on = w_ > 0.5
+                if on.sum() > 10:
+                    c_ = V[on].mean(axis=0)
+                    V = V + np.clip(w_ * 1.5, 0.0, 1.0)[:, None] * ((c_ + _FIST * (V - c_)) - V)
         lap = sr._mesh_laplacian(F, len(V))
         Vs = np.column_stack([sr._mesh_smooth(lap, V[:, k], _MITTEN_SMOOTH) for k in range(3)])
         V = V + np.clip(hand * 1.5, 0.0, 1.0)[:, None] * (Vs - V)
@@ -483,6 +590,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # the four sides, understood before anything is built on them
     V, plan = plan_four_sides(V, F, part_w, names, inputs, body_ref)
     plan["cut_at_row"] = cut_row
+    plan["arms"] = arms
 
     # clothes and hair round the sides the photo doesn't show: a part the
     # photo shows mostly under clothes is clothed all round -- cloth lies
