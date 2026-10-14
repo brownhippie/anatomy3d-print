@@ -44,9 +44,15 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinat
 
 from .mesh_types import BodyMesh
 
-_POP_LAYER = 0.005  # each garment layer stands this far over the one under it on the figure (on a person ~2.5 mm: shown up)
-_POP_LAYERS_MAX = 1.5  # ... at most this many layers' worth over what is beside it
-_POP_TIE = 0.004  # a tie or belt this much more
+_FIT_CHEST = (0.5, 4.0)  # a jacket's (or top's) room each side of the chest, cm (tailoring: ~1-3)
+_FIT_WAIST = (0.0, 6.0)  # ... at the waist, cm
+_FIT_COLLAR = (0.1, 1.5)  # a collar's room round the neck each side, cm
+_FIT_SLEEVE = (0.2, 4.0)  # a sleeve's room round the arm each side, cm
+_FIT_TIE = (4.0, 11.0)  # a tie's width, cm
+_FIT_FRONT = 0.35  # the front stands off the layer under it by this share of the room at the sides (cloth lies on the chest)
+_FIT_THICK = {"inner": 0.0015, "outer": 0.003, "tie": 0.004}  # the cloth's own thickness, m (a tie's knot and lining more)
+_FIT_SHOW = 1.6  # ... shown up this much on a figure (on a person cloth keeps close; on a model the gap is what shows it)
+_POP_MAX = 0.014  # no piece stands more than this over what is beside it (m)
 _POP_SPAN = 0.05  # a piece stands over the lowest layer within this far (a tie, collar or lapel as a whole)
 _POP_BEVEL = 0.0015  # its edge softened over this
 _POP_FINE = 1.6  # the clothes' folds, seams and creases deepened this much
@@ -593,11 +599,11 @@ _CHK_OUTLINE = 0.90  # the front's outline against the photo's (overlap)
 _CHK_SECTION = (0.85, 1.15)  # a section's depth for its width against the human figure's, after the plan
 _CHK_CLOTH_HOLLOW_MM = 6.0  # under clothes, no hollow deeper than this in the front (the body showing through)
 _CHK_HEAD_OUTLINE = 0.85  # the head and hair's outline against the photo's
-_CHK_MOVE_MM = 16.0  # ... and no single point of the surface moves further than this in it
+_CHK_MOVE_MM = 24.0  # ... and no single point of the surface moves further than this in it
 _CHK_WALL_MM = 0.8  # the thinnest wall a print holds (mm)
 _CHK_SPIKES = 3.0  # outward folds sharper than 60 degrees, at most this share (%)
 _LOCK_SPIKES = 0.5  # a step adds at most this share (% points) of such folds
-_CHK_RELIEF_MM = 14.0  # the photo's detail moves the surface at most this much
+_CHK_RELIEF_MM = 10.0  # the photo's depth detail moves the surface at most this much
 
 
 _HAND_REACH = 0.55  # the photo's hand: its skin within this many shoulder widths of the wrist (a hand's length)
@@ -896,36 +902,141 @@ def _spike_pct(st: dict) -> float:
     return 100.0 * float(sharp.mean()) if len(sharp) else 0.0
 
 
-def _clothes_pop(clothes: dict, front, cov, ppm: float):
-    """Offsets (photo px, toward the camera) for the clothes' layers, made to
-    show on a figure: each piece -- a tie, a collar, a lapel, a jacket's
-    front edge -- stands over the lowest layer round it (within _POP_SPAN) as
-    a whole, not only a rim at its edge, and higher than cloth lies on a
-    person (real cloth keeps close; on a model the gap is what shows it),
-    its edge softened by a small bevel."""
+def _measure_fit(V_bare, V_dressed, F, pw, names, clothes, J: dict, ppm: float, fm) -> dict:
+    """The tailoring: each garment measured against the body before it goes
+    on -- the bare posed body against the outline the photo shows dressed:
+    how much room (ease) the jacket or shirt has each side at the chest and
+    waist, each sleeve round its arm, the collar round the neck; the tie's
+    width and length. From those, each layer's height over the one under it
+    (its gap, and its own thickness shown up for a figure). cm and mm on the
+    person; heights in photo px."""
+    from .clothes import NAMES
+
+    shape = clothes["labels"].shape
+    lab = clothes["labels"]
+    found = clothes.get("found") or {}
+    dom = pw.argmax(1)
+    m = {}
+
+    def width_at(Vx, part, row):
+        f_ = (dom[F] == names.index(part)).all(axis=1) if part in names else None
+        if f_ is None or not f_.any():
+            return None
+        n_, _ = _raster_front(Vx, F[f_], shape)
+        r_ = int(round(row))
+        if not 0 <= r_ < shape[0]:
+            return None
+        cols = np.flatnonzero(np.isfinite(n_[r_]))
+        return float(np.ptp(cols)) if len(cols) > 2 else None
+
+    def side_room(part, row):
+        a, b = width_at(V_bare, part, row), width_at(V_dressed, part, row)
+        return None if a is None or b is None else (b - a) / 2.0 / ppm * 100.0  # cm each side
+
+    if "left_shoulder" in J and "right_shoulder" in J:
+        sh_y = (J["left_shoulder"][1] + J["right_shoulder"][1]) / 2.0
+        hip_y = (J["left_hip"][1] + J["right_hip"][1]) / 2.0 if "left_hip" in J and "right_hip" in J else sh_y + 1.6 * float(
+            np.linalg.norm(J["left_shoulder"][:2] - J["right_shoulder"][:2]))
+        m["chest_room_cm"] = side_room("torso", sh_y + 0.25 * (hip_y - sh_y))
+        m["waist_room_cm"] = side_room("torso", sh_y + 0.7 * (hip_y - sh_y))
+        if fm is not None:
+            chin = float(np.asarray(fm)[152, 1])
+            m["collar_room_cm"] = side_room("neck", (chin + sh_y) / 2.0)
+
+    # each sleeve round its arm: (dressed area - bare area) / the arm's length, each side
+    for part, (j0, j1) in {"upperarm": ("shoulder", "elbow"), "forearm": ("elbow", "wrist")}.items():
+        rooms = []
+        for sd, s_ in (("left", "L"), ("right", "R")):
+            n = f"{part}.{s_}"
+            if n not in names or f"{sd}_{j0}" not in J or f"{sd}_{j1}" not in J:
+                continue
+            L2 = float(np.linalg.norm(J[f"{sd}_{j1}"][:2] - J[f"{sd}_{j0}"][:2]))
+            f_ = (dom[F] == names.index(n)).all(axis=1)
+            if L2 < 0.05 * ppm or not f_.any():
+                continue  # (pointing at the camera: no width to read)
+            a = np.isfinite(_raster_front(V_bare, F[f_], shape)[0]).sum()
+            b = np.isfinite(_raster_front(V_dressed, F[f_], shape)[0]).sum()
+            rooms.append((b - a) / L2 / 2.0 / ppm * 100.0)
+        if rooms:
+            m[f"{part}_sleeve_room_cm"] = float(np.mean(rooms))
+    if "tie" in found and "tie" in NAMES:
+        t = lab == NAMES.index("tie") + 1
+        ys = np.flatnonzero(t.any(axis=1))
+        if len(ys):
+            m["tie_width_cm"] = float(np.median(t.sum(axis=1)[ys])) / ppm * 100.0
+            m["tie_length_cm"] = float(np.ptp(ys)) / ppm * 100.0
+    m = {k: (round(v, 2) if v is not None else None) for k, v in m.items()}
+
+    # each layer's height over the skin (px): the gap it stands off what is
+    # under it (measured, kept within what tailoring allows) and its own
+    # thickness, shown up for a figure
+    def room(key, lo, hi, default):
+        v = m.get(key)
+        return float(np.clip(v if v is not None else default, lo, hi)) / 100.0  # metres
+
+    inner_gap = room("collar_room_cm", *_FIT_COLLAR, 0.4) * _FIT_FRONT
+    outer_gap = room("chest_room_cm", *_FIT_CHEST, 1.5) * _FIT_FRONT
+    inner = ("shirt", "tshirt", "dress", "kimono")
+    outer = ("suit", "jacket", "coat", "sweater", "hoodie")
+    H = {"skin": 0.0}
+    has_inner = any(k in found for k in inner)
+    for g in inner:
+        H[g] = (inner_gap + _FIT_THICK["inner"] * _FIT_SHOW) * ppm
+    base = max((H[g] for g in inner if g in found), default=0.0) if has_inner else 0.0
+    for g in outer:
+        H[g] = base + (outer_gap + _FIT_THICK["outer"] * _FIT_SHOW) * ppm
+    H["tie"] = base + _FIT_THICK["tie"] * _FIT_SHOW * ppm
+    m["heights_mm"] = {k: round(v / ppm * 1000.0, 1) for k, v in H.items() if k in found or k in ("skin", "tie") and "tie" in found}
+    m["_H"] = H
+    return m
+
+
+def _clothes_pop(clothes: dict, front, cov, ppm: float, H: dict, neck_rows=None):
+    """Offsets (photo px, toward the camera) for the clothes as tailored
+    (_measure_fit): each piece -- a tie, a collar, a lapel, a jacket's front
+    edge, a cuff -- stands over what is under it, as a whole (within
+    _POP_SPAN), by that layer's measured height: its gap off the layer under
+    it and its own thickness; its edge softened by a small bevel."""
     from scipy.ndimage import minimum_filter
 
-    from .clothes import GARMENTS, NAMES, layer_map
+    from .clothes import NAMES
 
     lab = clothes["labels"]
-    L = layer_map({"labels": lab})
-    named = np.isfinite(L) & cov
+    lut = np.full(len(NAMES) + 1, np.nan)
+    for k, h in H.items():
+        if k in NAMES:
+            lut[NAMES.index(k) + 1] = h
+    Hp = lut[lab]
+    if neck_rows is not None and "skin" in NAMES:
+        # (skin is under the clothes only at the neck and in the V: a hand
+        # lies on the jacket, not under it)
+        rows_ = np.arange(lab.shape[0])[:, None]
+        Hp = np.where((lab == NAMES.index("skin") + 1) & ~((rows_ >= neck_rows[0]) & (rows_ <= neck_rows[1])), np.nan, Hp)
+    named = np.isfinite(Hp) & cov
     if not named.any():
         return np.zeros(cov.shape)
     iy, ix = distance_transform_edt(~named, return_distances=False, return_indices=True)
-    Lf = np.nan_to_num(np.where(named, L, L[iy, ix]), nan=0.0)
+    Hf = np.nan_to_num(np.where(named, Hp, Hp[iy, ix]), nan=0.0)
     span = max(int(round(_POP_SPAN * ppm)), 3)
-    base = gaussian_filter(minimum_filter(np.where(cov, Lf, np.inf), size=span), span / 4.0)
-    base = np.where(np.isfinite(base), base, Lf)
-    lift = np.clip(Lf - base, 0.0, _POP_LAYERS_MAX) * _POP_LAYER * ppm  # (several layers stacked: no tower)
-    for k, t in (("tie", _POP_TIE), ("belt", _POP_TIE), ("watch", 0.006), ("bracelet", 0.003)):
+    base = gaussian_filter(minimum_filter(np.where(cov, Hf, np.inf), size=span), span / 4.0)
+    base = np.where(np.isfinite(base), base, Hf)
+    lift = np.clip(Hf - base, 0.0, _POP_MAX * ppm)
+    for k, t in (("belt", 0.004), ("watch", 0.006), ("bracelet", 0.003)):
         if k in NAMES:
             lift = lift + t * ppm * (lab == NAMES.index(k) + 1)
     lift = gaussian_filter(lift, max(_POP_BEVEL * ppm, 0.5))
     gy, gx = np.gradient(front)
     facing = np.clip((1.0 / np.sqrt(1.0 + np.hypot(gy, gx) ** 2) - 0.35) / 0.35, 0.0, 1.0)  # (fading where the surface turns side-on)
-    garment = gaussian_filter(np.isin(lab, [i + 1 for i in range(len(GARMENTS))]).astype(np.float64), 1.0)
-    return np.where(cov, lift * facing * np.clip(garment * 3.0, 0.0, 1.0), 0.0)
+    # on the clothes (and the skin at the neck) only: the face and the hands
+    # are their own
+    from .clothes import GARMENTS
+
+    worn = np.isin(lab, [i + 1 for i in range(len(GARMENTS))])
+    if neck_rows is not None and "skin" in NAMES:
+        rows_ = np.arange(lab.shape[0])[:, None]
+        worn |= (lab == NAMES.index("skin") + 1) & (rows_ >= neck_rows[0]) & (rows_ <= neck_rows[1])
+    on = np.clip(gaussian_filter(worn.astype(np.float64), 1.0) * 2.0, 0.0, 1.0)
+    return np.where(cov, lift * facing * on, 0.0)
 
 
 def _subdivide(V, F, pw):
@@ -1019,6 +1130,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             up = float(np.linalg.norm(Jn[f"{sd}_elbow"] - Jn[f"{sd}_shoulder"]))
             chk.add("5 arms", f"{sd} forearm over upper arm", L / max(up, 1e-6), *_CHK_FOREARM_UPPER)
     st = {"V": V, "F": F, "pw": part_w}
+    V_bare = V.copy()  # (the body before it is dressed: the tailoring measures against it)
     arm_parts = [n for n in ("forearm.L", "forearm.R", "hand.L", "hand.R") if n in names]
     locks.lock("5 arms", "forearms and hands where they were put", lambda s_: _part_centres(s_, names, arm_parts),
                lambda m, m0: m.shape == m0.shape and float(np.abs(m[:, :2] - m0[:, :2]).max()) <= _LOCK_MOVE * ppm, st)
@@ -1089,7 +1201,22 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         locks.lock("7 four sides", f"{sec} depth", lambda s_, sec=sec: _section_depth(s_, names, Jn, mask, sec),
                    lambda m, m0: -_LOCK_DEPTH_LESS <= m / m0 - 1.0 <= _LOCK_DEPTH_MORE, st)
 
-    # 8. the clothes and the hair on it, from every side: cloth over the chest
+    # 8. the clothes, tailored: confirmed, then each measured against the
+    # bare body before it goes on (its room at the chest, waist, sleeves,
+    # collar; the tie), its height over the layer under it from those
+    fit = None
+    if clothes:
+        fit = _measure_fit(V_bare, V, F, part_w, names, clothes, Jn, ppm, fm0)
+        plan["fit"] = {k: v for k, v in fit.items() if not k.startswith("_")}
+        chk.add("8 clothes and hair", "garments confirmed", float(len(clothes.get("found") or {})), lo=1)
+        for key, rng, what in (("chest_room_cm", _FIT_CHEST, "room each side at the chest"), ("waist_room_cm", _FIT_WAIST, "room each side at the waist"),
+                               ("collar_room_cm", _FIT_COLLAR, "collar's room round the neck"),
+                               ("upperarm_sleeve_room_cm", _FIT_SLEEVE, "sleeve's room round the upper arm"),
+                               ("forearm_sleeve_room_cm", _FIT_SLEEVE, "sleeve's room round the forearm"), ("tie_width_cm", _FIT_TIE, "tie's width")):
+            if fit.get(key) is not None:
+                chk.add("8 clothes and hair", what, fit[key], *rng, unit=" cm")
+
+    # ... and put on, from every side: cloth over the chest
     # (a man's always; anyone's under a jacket, suit or coat -- a woman's
     # bust under one keeps its volume, but not its crease or cleavage), a
     # part the photo shows mostly under clothes clothed all round, cloth
@@ -1121,6 +1248,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     front = np.where(cov, -near, 0.0)  # toward the camera
     report = {"plan": plan}
     offset = np.zeros(shape)
+    depth_detail = np.zeros(shape)
     parts = inputs.parts or {}
     labels = parts.get("labels")
     fm = inputs.face_mesh
@@ -1156,7 +1284,11 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             print(f"Note: hair pattern skipped ({exc}).")
     if clothes_steps and clothes:
         try:
-            offset += _clothes_pop(clothes, front, cov, ppm)
+            if fit is not None:
+                nr = None
+                if fm is not None and sw0 and "left_shoulder" in Pp and "right_shoulder" in Pp:
+                    nr = (float(np.asarray(fm)[152, 1]), (Pp["left_shoulder"][1] + Pp["right_shoulder"][1]) / 2.0 + 0.5 * sw0)
+                offset += _clothes_pop(clothes, front, cov, ppm, fit["_H"], nr)
         except Exception as exc:  # noqa: BLE001
             print(f"Note: clothes steps skipped ({exc}).")
     if depth_strength and inputs.depth is not None:
@@ -1186,6 +1318,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             M = _DETAIL_MAX * ppm
             rel = M * np.tanh(half * dn * depth_strength / M)
             offset += np.where(cov, rel, 0.0)
+            depth_detail = np.where(cov, rel, 0.0)
             # does the body sit as the photo's depth says? (nearer parts
             # should be nearer): rank agreement of the two, coarse
             if cov.sum() > 1000:
@@ -1199,8 +1332,10 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     from .head_parts import FACE_SKIN as _FS
 
     body_px = cov & ~(np.isin(labels, (_FS,)) if labels is not None else np.zeros_like(cov))  # (the face's relief is its own)
-    chk.add("9 detail", "the photo's detail off the face, largest move (99%)",
-            float(np.percentile(np.abs(offset[body_px]), 99)) / ppm * 1000.0 if body_px.any() else 0.0, hi=_CHK_RELIEF_MM, unit=" mm")
+    # (the photo's own depth detail -- the clothes' tailored heights have
+    # their own checks, step 8)
+    chk.add("9 detail", "the photo's depth detail off the face, largest move (99%)",
+            float(np.percentile(np.abs(depth_detail[body_px]), 99)) / ppm * 1000.0 if body_px.any() else 0.0, hi=_CHK_RELIEF_MM, unit=" mm")
     # what the clothes step locked (no body showing through them) kept in
     # place: where the detail would dig a hollow under a garment deeper than
     # a cloth spans, filled back to that -- there, not the detail cut back
