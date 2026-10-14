@@ -341,7 +341,9 @@ def build(code: str, inputs: LabInputs):
                                 depth_strength=None if o["depth"] == "off" else float(o["depth"]),
                                 face_strength={"off": 0.0, "half": 0.45, "full": 1.0}[o["face"]],
                                 clothes_steps=o["clothes"] == "on")
-        return add_base_disk(body, HEIGHT_MM)
+        out = add_base_disk(body, HEIGHT_MM)
+        out.report = getattr(body, "report", None)  # (the reality checks of each step)
+        return out
     if fam == "C":
         if inputs.capsule is None:
             raise RuntimeError(f"Capsule builder can't use this photo: {inputs.capsule_unavailable}")

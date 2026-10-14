@@ -169,6 +169,11 @@ def _work_one(run_id: str) -> bool:
                 body = lab.build(code, inputs)
                 metrics, preview, thumb = lab.score(code, body, inputs)
             row.update(status="ok", **metrics)
+            rep = getattr(body, "report", None) or {}
+            if "checks" in rep:
+                # each step's reality check: how many ran, which failed
+                row["checks_n"] = len(rep["checks"])
+                row["checks_failed"] = rep["checks_failed"]
             added = 0
             if _disk_free() > LAB_MIN_FREE:
                 (d / "t").mkdir(exist_ok=True)

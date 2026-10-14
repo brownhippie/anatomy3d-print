@@ -57,6 +57,8 @@ LAYER = {"skin": 0, "shirt": 1, "tshirt": 1, "dress": 1, "kimono": 1, "trousers"
          "socks": 0.5, "boots": 1.2, "bracelet": 2}
 # small things that sit on whatever garment is round them: half a layer over it
 ON_TOP = ("buttons", "pocket", "badge", "zip")
+_TIE_CROP = 3.2  # the close look for a tie: a square this many face widths across, from the chin down
+_TIE_MARGIN = 0.3  # ... where "a necktie" outscores the other garments by this much (logits)
 _MIN_SHARE = {"tie": 0.003, "belt": 0.003, "watch": 0.0005, "strap": 0.003, "gloves": 0.002, "shoes": 0.003, "necklace": 0.001,
               "buttons": 0.0005, "pocket": 0.002, "badge": 0.001, "lanyard": 0.002, "zip": 0.001, "socks": 0.002, "boots": 0.003,
               "backpack": 0.003, "bracelet": 0.0005}
@@ -100,6 +102,22 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
         # the head's own wear (cap, mask, glasses) is head_parts' to name
         worn &= np.arange(H)[:, None] > float(np.asarray(face_mesh)[152, 1])
     labels[worn] = win[worn] + 1
+    if face_mesh is not None and "tie" in GARMENTS:
+        # a tie, looked for close up: in crops as wide as the person it is a
+        # narrow strip and the jacket round it always outscored it -- round
+        # the neck and chest it can win where it is
+        fm = np.asarray(face_mesh)[:468, :2]
+        fw = float(np.ptp(fm[:, 0]))
+        chin = float(np.asarray(face_mesh)[152, 1])
+        tside = int(max(_TIE_CROP * fw, 64))
+        crop, (cx0, cy0), (sx0, sy0, sx1, sy1) = _square(rgb, float(fm[:, 0].mean()), chin + tside / 2.0, tside)
+        near = {k: GARMENTS[k] for k in ("tie", "shirt", "suit", "jacket", "coat", "sweater") if k in GARMENTS}
+        lg = _clipseg(crop, near)
+        sc = {k: _back(lg[k].astype(np.float32), tside)[sy0 - cy0:sy1 - cy0, sx0 - cx0:sx1 - cx0] for k in near}
+        others = np.max(np.stack([v for k, v in sc.items() if k != "tie"]), axis=0)
+        tie = np.zeros((H, W), bool)
+        tie[sy0:sy1, sx0:sx1] = (sc["tie"] > others + _TIE_MARGIN) & (sc["tie"] > 0.0)
+        labels[tie & worn] = NAMES.index("tie") + 1
     labels[person & np.isin(seg, (BODY_SKIN, FACE_SKIN))] = NAMES.index("skin") + 1
     labels[person & (seg == HAIR)] = NAMES.index("hair") + 1
     total = float(person.sum())
