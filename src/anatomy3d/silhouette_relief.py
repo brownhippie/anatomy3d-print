@@ -876,7 +876,10 @@ _EYE_INSET = 0.0015  # an open eye's ball sits this far behind its lids, roundin
 _IRIS_DEPTH = 0.0004  # the iris, carved this shallow (a sculptor's eye)
 _LID_CREASE = 0.0006  # the crease above the upper lid
 _LID_LINE = 0.0005  # a closed eye's lid line
-_BROW_HEIGHT = 0.0012  # eyebrow hair stands this proud
+_BROW_HEIGHT = 0.003  # eyebrow hair stands this proud (shown up: ~1 mm on a person reads as nothing on a figure)
+_BROW_GRAIN = 0.35  # ... with a hair grain this deep (share of its height)
+_BROW_GRAIN_STEP = 0.0015  # ... this far apart (m)
+_BROW_GRAIN_ANGLE = 25.0  # ... the hairs running this many degrees up off the brow's line
 _NOSTRIL_DEPTH = 0.003  # a nostril's hollow
 _LIP_RIM = 0.0004  # the lips' edge stands this proud
 _LIP_FULL = 0.0  # the lips' own fullness, a dome over their outline (a study sets it)
@@ -2059,8 +2062,22 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
             lid = f[EYE[s_][:9]]
             rel -= m(_LID_LINE) * line(lid, 0.02 * float(np.ptp(lid[:, 0])))
     # eyebrows
+    # (stood up as a whole, its edge crisp, shown up for a figure: on a person
+    # brows show by their colour, on a one-colour print only by their shape;
+    # with a hair grain along them, so they read as brows, not a band)
     for b_ in reading.get("brows", {}).values():
-        rel += m(_BROW_HEIGHT) * gaussian_filter(sample(b_["mask"]), 1.0)
+        bm = sample(b_["mask"])
+        ys_, xs_ = np.nonzero(np.asarray(b_["mask"]))
+        grain = 1.0
+        if len(xs_) > 10:
+            P_ = np.column_stack([xs_, ys_]).astype(np.float64)
+            _, _, vt = np.linalg.svd(P_ - P_.mean(axis=0), full_matrices=False)
+            ax = vt[0] * (1.0 if vt[0][0] >= 0 else -1.0)  # along the brow
+            ang = np.deg2rad(_BROW_GRAIN_ANGLE)
+            dirn = np.array([ax[0] * np.cos(ang) - ax[1] * np.sin(ang), ax[0] * np.sin(ang) + ax[1] * np.cos(ang)])
+            across = PX * -dirn[1] + PY * dirn[0]  # distance across the hairs' run (reading px)
+            grain = 1.0 - _BROW_GRAIN * 0.5 * (1.0 + np.cos(2.0 * np.pi * across / max(m(_BROW_GRAIN_STEP), 1.5)))
+        rel += m(_BROW_HEIGHT) * gaussian_filter(bm, 0.7) * grain
     # nostrils
     for n_ in reading.get("nostrils", []):
         nx_, ny_ = n_["c"][0] - bx0, n_["c"][1] - by0

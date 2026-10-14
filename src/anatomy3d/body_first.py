@@ -598,6 +598,7 @@ _CHK_HAND_SW = (0.10, 0.40)  # a hand's breadth over the shoulders' width (a han
 _CHK_OUTLINE = 0.90  # the front's outline against the photo's (overlap)
 _CHK_SECTION = (0.85, 1.15)  # a section's depth for its width against the human figure's, after the plan
 _CHK_CLOTH_HOLLOW_MM = 6.0  # under clothes, no hollow deeper than this in the front (the body showing through)
+_CHK_BROW_MM = 1.0  # the eyebrows stand at least this far off the skin round them (mm, on the person)
 _CHK_HEAD_OUTLINE = 0.85  # the head and hair's outline against the photo's
 _CHK_MOVE_MM = 24.0  # ... and no single point of the surface moves further than this in it
 _CHK_WALL_MM = 0.8  # the thinnest wall a print holds (mm)
@@ -1039,6 +1040,35 @@ def _clothes_pop(clothes: dict, front, cov, ppm: float, H: dict, neck_rows=None)
     return np.where(cov, lift * facing * on, 0.0)
 
 
+def _brows_stand_mm(st: dict, face_read: dict, shape, ppm: float) -> Optional[float]:
+    """How far (mm, on the person) the eyebrows stand off the skin just round
+    them on the model's front -- the reading's brow hair against a ring of
+    skin round it."""
+    from scipy.ndimage import binary_dilation
+
+    brows = face_read.get("brows") or {}
+    box = face_read.get("box")
+    if not brows or box is None:
+        return None
+    bm = np.zeros(shape, dtype=bool)
+    bx0, by0 = int(box[0]), int(box[1])
+    for b_ in brows.values():
+        mk = np.asarray(b_["mask"], dtype=bool)
+        h_, w_ = mk.shape
+        ys_, xs_ = slice(max(by0, 0), min(by0 + h_, shape[0])), slice(max(bx0, 0), min(bx0 + w_, shape[1]))
+        bm[ys_, xs_] |= mk[ys_.start - by0:ys_.stop - by0, xs_.start - bx0:xs_.stop - bx0]
+    if bm.sum() < 10:
+        return None
+    ring = binary_dilation(bm, iterations=max(int(0.006 * ppm), 2)) & ~binary_dilation(bm, iterations=2)
+    # (the forehead just above: below them the eye sockets sit lower anyway)
+    ring &= np.arange(shape[0])[:, None] < float(np.mean(np.nonzero(bm)[0]))
+    n, _ = _raster_front(st["V"], st["F"], shape)
+    ok_b, ok_r = bm & np.isfinite(n), ring & np.isfinite(n)
+    if ok_b.sum() < 10 or ok_r.sum() < 10:
+        return None
+    return float(np.mean(-n[ok_b]) - np.mean(-n[ok_r])) / ppm * 1000.0
+
+
 def _subdivide(V, F, pw):
     """The finer surface for the detail, the part weights carried with it
     (Loop's new points are fixed blends of the old: the weights blend the
@@ -1391,6 +1421,9 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     hi_ = _head_iou(st, mask, fm)
     if hi_ is not None:
         chk.add("9 detail", "head and hair outline against the photo's", hi_, lo=_CHK_HEAD_OUTLINE)
+    bh = _brows_stand_mm(st, parts.get("face") or {}, shape, ppm)
+    if bh is not None:
+        chk.add("9 detail", "eyebrows stand off the skin round them", bh, lo=_CHK_BROW_MM, unit=" mm")
 
     # 10. the hands the photo shows, solids of their own on what they lie on
     # (kept only if the whole stays one closed solid and the locks hold)
