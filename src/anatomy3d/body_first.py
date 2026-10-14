@@ -10,20 +10,25 @@ an ear against the head) is one column. Here the posed body *is* the model:
    (lab.prepare_inputs);
 2. the 3D body: the Anny body (body_reference) shaped to the photo -- build,
    head size, bone lengths kept to human proportions -- and posed onto its
-   points; already fitted when the inputs are prepared;
-3. all four sides understood before anything is built on them
+   points (fitted when the inputs are prepared), then grown along smoothed
+   normals out to the photo's outline (the room clothes and hair take; the
+   face held to its own points), hands closed to mittens;
+3. cut where the photo is cut (a bust) -- the first thing done with the 3D
+   body, so all that follows works on the torso the figure will be;
+4. all four sides understood before anything is built on them
    (plan_four_sides): the front against the photo's outline and depth, each
    section's depth from the side against the human figure's (corrected
    toward it, within limits), the posture from the side, what the clothes
    and hair will cover round the back;
-4. the clothes on it: the body grown along its normals out to the photo's
-   outline (the room clothes and hair take), each garment stepping over the
-   one under it where they meet;
-5. the photo's detail on the surface the camera sees: face shaping, the
+5. the clothes and hair on it: a part the photo shows mostly under clothes
+   clothed all round (smooth as cloth lies, with a cloth's thickness), hair
+   over the back of the head, each garment stepping over the one under it
+   where they meet;
+6. the photo's detail on the surface the camera sees: face shaping, the
    face's parts, clothes' steps and fine depth detail, pushed toward the
    camera on the vertices that are frontmost (an arm across the chest gets
    the sleeve's folds, the chest under it nothing);
-6. out: cut where the photo is cut (a bust), scaled to the figure's height.
+7. out, scaled to the figure's height.
 
 Hands come out as mittens (the body's are open with the fingers spread);
 the hair is the body grown to the outline over the head (thick hair and
@@ -55,6 +60,48 @@ def _largest_piece(V, F, per_vertex: dict):
     keep_f = labels == np.bincount(labels).argmax()
     used, inv = np.unique(F[keep_f], return_inverse=True)
     return V[used], inv.reshape(-1, 3), {k: (None if v is None else np.asarray(v)[used]) for k, v in per_vertex.items()}
+
+
+def _cut_below(V, F, row: float, per_vertex: dict):
+    """The body cut at a photo row (keeps what's above it: y runs down) and
+    capped, still a closed solid (manifold3d); each per-vertex array carried
+    through the cut (interpolated where the cut makes new points)."""
+    from manifold3d import Manifold, Mesh
+
+    names_, cols = [], [V]
+    for k, a in per_vertex.items():
+        if a is None:
+            continue
+        a = np.asarray(a, dtype=np.float64)
+        a = a[:, None] if a.ndim == 1 else a
+        names_.append((k, a.shape[1], per_vertex[k].ndim == 1))
+        cols.append(a)
+    props = np.hstack(cols).astype(np.float32)
+    man = Manifold(mesh=Mesh(vert_properties=props, tri_verts=np.asarray(F, dtype=np.uint32)))
+    if man.is_empty():
+        raise RuntimeError("the posed body isn't a closed solid")
+    man = man.trim_by_plane((0.0, -1.0, 0.0), -float(row))
+    pieces = man.decompose()
+    if len(pieces) > 1:
+        man = max(pieces, key=lambda c: c.num_tri())
+    m = man.to_mesh()
+    P = np.asarray(m.vert_properties, dtype=np.float64)
+    T = np.asarray(m.tri_verts, dtype=np.int64)
+    # (points at one position with different values come back as separate
+    # points -- a seam the later smoothing opened into cracks: one point
+    # each, its values averaged)
+    _, first, inv = np.unique(np.round(P[:, :3], 5), axis=0, return_index=True, return_inverse=True)
+    inv = inv.ravel()
+    merged = np.zeros((len(first), P.shape[1]))
+    np.add.at(merged, inv, P)
+    merged /= np.bincount(inv, minlength=len(first))[:, None]
+    P, T = merged, inv[T]
+    T = T[(T[:, 0] != T[:, 1]) & (T[:, 1] != T[:, 2]) & (T[:, 0] != T[:, 2])]
+    out, i = {k: None for k in per_vertex}, 3
+    for k, w, flat in names_:
+        out[k] = P[:, i] if flat else P[:, i:i + w]
+        i += w
+    return P[:, :3], T, out
 
 
 def _cover_unseen(V, F, part_w, names, inputs, ppm):
@@ -319,8 +366,21 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         Vs = np.column_stack([sr._mesh_smooth(lap, V[:, k], _MITTEN_SMOOTH) for k in range(3)])
         V = V + np.clip(hand * 1.5, 0.0, 1.0)[:, None] * (Vs - V)
 
+    # the first thing done with the 3D body: cut where the photo is cut (a
+    # bust), so the plan, the clothes and the detail all work on the torso
+    # the figure will be -- not on legs that won't be there
+    rows = np.flatnonzero(mask.any(axis=1))
+    cut_off = bust if bust is not None else bool(rows[-1] >= shape[0] - 3)
+    cut_row = float(rows[-1]) if cut_off else None
+    if cut_off:
+        V, F, kept = _cut_below(V, F, cut_row, {"part_w": part_w, "core": body_ref.get("core_depth"), "ear_w": body_ref.get("ear_w")})
+        part_w = kept["part_w"]
+        part_w = part_w / np.maximum(part_w.sum(axis=1, keepdims=True), 1e-9)
+        body_ref = dict(body_ref, part_w=part_w, core_depth=kept["core"], ear_w=kept["ear_w"])
+
     # the four sides, understood before anything is built on them
     V, plan = plan_four_sides(V, F, part_w, names, inputs, body_ref)
+    plan["cut_at_row"] = cut_row
 
     # clothes and hair round the sides the photo doesn't show: a part the
     # photo shows mostly under clothes is clothed all round -- cloth lies
@@ -403,22 +463,11 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     off_v = map_coordinates(offset, [py, px], order=1, mode="nearest")
     V[:, 2] = V[:, 2] - np.where(visible, off_v * facing, 0.0)
 
-    # 6. out: cut where the photo is cut, then to the figure's frame
+    # out, to the figure's frame (the bottom stays flat on the cut: clothes
+    # and smoothing rounded it a little)
+    if cut_row is not None:
+        V[:, 1] = np.minimum(V[:, 1], cut_row)
     mesh = trimesh.Trimesh(V, F, process=False)
-    rows = np.flatnonzero(mask.any(axis=1))
-    cut_off = bust if bust is not None else bool(rows[-1] >= shape[0] - 3)
-    if cut_off:
-        # (manifold3d: cut and capped, still a closed solid; keeps y above the photo's bottom)
-        from manifold3d import Manifold, Mesh
-
-        man = Manifold(mesh=Mesh(vert_properties=np.asarray(mesh.vertices, dtype=np.float32),
-                                 tri_verts=np.asarray(mesh.faces, dtype=np.uint32)))
-        if man.is_empty():
-            raise RuntimeError("the posed body isn't a closed solid")
-        man = man.trim_by_plane((0.0, -1.0, 0.0), -float(rows[-1]))
-        mm_ = man.to_mesh()
-        mesh = trimesh.Trimesh(np.asarray(mm_.vert_properties[:, :3], dtype=np.float64), np.asarray(mm_.tri_verts, dtype=np.int64),
-                               process=False)
     pieces = mesh.split(only_watertight=False)
     if len(pieces) > 1:
         mesh = max(pieces, key=lambda p: len(p.faces))
