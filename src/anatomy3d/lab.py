@@ -563,7 +563,7 @@ def _photo_detail(preview: trimesh.Trimesh, floor: float, inputs: LabInputs) -> 
     A smooth body that drops the clothes scores low however clean its
     outline; bumps everywhere add as much on plain photo as on detail (and
     count as spikes)."""
-    from scipy.ndimage import binary_erosion, gaussian_filter, zoom
+    from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt, gaussian_filter, zoom
 
     from .study import front_in_photo
 
@@ -583,9 +583,15 @@ def _photo_detail(preview: trimesh.Trimesh, floor: float, inputs: LabInputs) -> 
     mm = to_z(mask) > 0.5
     h_, w_ = min(rgb.shape[0], zy), min(rgb.shape[1], zx)
     rgb, mm, z = rgb[:h_, :w_], mm[:h_, :w_], z[:h_, :w_]
-    fill = np.where(np.isfinite(z), z, float(np.nanmin(np.where(np.isfinite(z), z, np.nan))))
+    # cells no surface sample landed in (about 2 %, by chance) take their
+    # nearest neighbour's height and are left out of the count -- filled with
+    # the lowest height they were pits, and which cells they were moved with
+    # every small change to the mesh
+    finite = np.isfinite(z)
+    iy, ix = distance_transform_edt(~finite, return_distances=False, return_indices=True)
+    fill = z[iy, ix]
     # inside the outline only: the outline itself is shape_iou's
-    inside = binary_erosion(mm & np.isfinite(z), iterations=max(2, int(0.015 * h_)))
+    inside = binary_erosion(mm, iterations=max(2, int(0.015 * h_))) & ~binary_dilation(~finite, iterations=1)
     if inside.sum() < 500:
         return None
     sg = max(0.8, 0.004 * h_)

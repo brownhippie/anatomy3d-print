@@ -38,6 +38,7 @@ KNOBS = [
     Knob(_SR, "_HAIR_SHELL_MAX", 0.03, 0.07, "hair", "thickest hair lying round the skull (m)"),
     Knob(_SR, "_HAIR_FEATHER", 0.003, 0.012, "hair", "hair over skin feathers out over this (m)"),
     Knob(_SR, "_HAIR_SMOOTH", 0.002, 0.008, "hair", "hair and hat surfaces smoothed across their edges (m)"),
+    Knob(_SR, "_HAIR_SHORT", 0.0, 0.008, "hair", "short hair stands at least this proud of the scalp in front (m)"),
     Knob(_SR, "_HAIR_THIN", 0.006, 0.02, "hair", "hair thinner than this is the head's own outline (m)"),
     Knob(_SR, "_HAIR_FACE_MEET", 0.006, 0.02, "hair", "hair this near the face comes down to the cheek (m)"),
     Knob(_SR, "_HAIR_NECK_BEHIND", 0.003, 0.015, "hair", "hair beside the neck lies this far behind its front (m)"),
@@ -108,6 +109,9 @@ KNOBS = [
     # each part of the face
     Knob(_SR, "_EYE_INSET", 0.0, 0.004, "face parts", "an open eye's ball sits this far behind its lids (m)"),
     Knob(_SR, "_IRIS_DEPTH", 0.0, 0.0012, "face parts", "the iris carved this deep (m)"),
+    Knob(_SR, "_LID_RIM", 0.0, 0.0015, "face parts", "the upper eyelid's rim stands this proud (m)"),
+    Knob(_SR, "_LIP_FULL", 0.0, 0.004, "face parts", "the lips' fullness, a dome over their outline (m)"),
+    Knob(_SR, "_CHIN_PROUD", 0.0, 0.005, "face parts", "the chin's pad stands this proud (m)"),
     Knob(_SR, "_LID_CREASE", 0.0, 0.0015, "face parts", "the crease above the upper lid (m)"),
     Knob(_SR, "_LID_LINE", 0.0, 0.0012, "face parts", "a closed eye's lid line (m)"),
     Knob(_SR, "_BROW_HEIGHT", 0.0, 0.003, "face parts", "eyebrow hair stands this proud (m)"),

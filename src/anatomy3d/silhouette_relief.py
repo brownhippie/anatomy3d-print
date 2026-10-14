@@ -807,6 +807,7 @@ _HAIR_SHELL_MAX = 0.05  # thickest hair (or hat) lying round the skull, metres (
 _HAIR_FEATHER = 0.006  # where hair over the skin ends: feathered over this, metres
 _HAIR_SMOOTH = 0.004  # hair and hat surfaces smoothed across their edges by this, metres
 _HAIR_THIN = 0.012  # hair thinner than this is the head's own outline (the skull grows to it), metres
+_HAIR_SHORT = 0.004  # ... but stands at least this proud of the scalp in front, its hairline a step (metres)
 _HAIR_FACE_MEET = 0.012  # hair this near the face comes down to the cheek's level, metres
 _HAIR_NECK_BEHIND = 0.008  # hair beside the neck lies this far behind its front, metres
 _HAIR_NAPE_EDGE = 0.004  # the hairline at the nape: hair ends over this, metres
@@ -870,6 +871,9 @@ _LID_LINE = 0.0005  # a closed eye's lid line
 _BROW_HEIGHT = 0.0012  # eyebrow hair stands this proud
 _NOSTRIL_DEPTH = 0.003  # a nostril's hollow
 _LIP_RIM = 0.0004  # the lips' edge stands this proud
+_LIP_FULL = 0.0  # the lips' own fullness, a dome over their outline (a study sets it)
+_LID_RIM = 0.0  # the upper eyelid's rim over the eyeball (a study sets it)
+_CHIN_PROUD = 0.0  # the chin's pad, with half as deep a groove above it (a study sets it)
 _MOUTH_LINE = 0.0008  # a closed mouth's line between the lips
 _MOUTH_DEPTH = 0.008  # an open mouth's dark, this far in
 _TEETH_INSET = 0.002  # teeth sit this far behind the lips
@@ -1566,7 +1570,11 @@ def _hair_and_hat(front, back, grid_mask, photo_cells, parts_g, cov, face_mesh, 
     # (feathered only where it meets skin: where it meets the hair beside
     # the skull it carries straight on -- feathering there left a seam)
     feather = np.clip(distance_transform_edt(over | hair_here) / max(_HAIR_FEATHER * px_per_m * scale, 1.0), 0.0, 1.0)
-    F = F + lay * feather * thick
+    # short hair (thinner than _HAIR_THIN: its outline is the head's own) is
+    # still a layer on the scalp, with a hairline across the forehead --
+    # without it a short cut read as a bare head
+    short = np.where(over, _HAIR_SHORT * px_per_m * (1.0 - thick), 0.0)  # (thicker hair has its own layer)
+    F = F + np.maximum(lay * thick, short) * feather
     # long hair over the shoulders and chest: a layer on them
     on_body = hairish & cov & (rows > chin_r)
     F[on_body] = F[on_body] + _HAIR_LAYER * px_per_m * np.clip(distance_transform_edt(on_body)[on_body] / 2.0, 0.0, 1.0)
@@ -1894,6 +1902,8 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
             upper = f[EYE[s_][:9]]
             eye_w = float(np.ptp(upper[:, 0]))
             rel -= m(_LID_CREASE) * line(upper - [0, 0.18 * eye_w], 0.02 * eye_w) * (1 - op)
+            # the upper lid's rim, standing over the eyeball along the opening's top
+            rel += m(_LID_RIM) * line(upper, 0.015 * eye_w) * (1 - op)
         else:
             lid = f[EYE[s_][:9]]
             rel -= m(_LID_LINE) * line(lid, 0.02 * float(np.ptp(lid[:, 0])))
@@ -1911,6 +1921,20 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
     size = reading.get("size_px", 100.0)
     if not reading.get("masked"):
         rel += m(_LIP_RIM) * line(np.vstack([f[OUTER_LIPS], f[OUTER_LIPS[:1]]]), 0.006 * size)
+        # the lips' own fullness: a dome over the photo's outer lip outline
+        from skimage.measure import points_in_poly
+
+        lips = points_in_poly(np.column_stack([PX.ravel(), PY.ravel()]), f[OUTER_LIPS]).reshape(PY.shape)
+        if lips.any():
+            dl = distance_transform_edt(lips)
+            rel += m(_LIP_FULL) * gaussian_filter(np.sqrt(np.clip(dl / max(dl.max(), 1e-6), 0, 1)), 0.8)
+        # the chin: its pad (round the point between the lower lip and the
+        # chin's bottom) and the groove above it, placed by the face points
+        chin, sulcus = f[152], f[18]
+        pad_c = chin * 0.6 + sulcus * 0.4
+        r_c = max(0.35 * float(np.hypot(*(chin - sulcus))), 1.0)
+        rel += m(_CHIN_PROUD) * np.exp(-((PX - pad_c[0]) ** 2 + (PY - pad_c[1]) ** 2) / (2 * r_c ** 2))
+        rel -= 0.5 * m(_CHIN_PROUD) * np.exp(-((PX - sulcus[0]) ** 2 + (PY - sulcus[1]) ** 2) / (2 * (0.5 * r_c) ** 2))
         if mouth.get("open") and "inside" in mouth:
             inside = sample(mouth["inside"])
             depth = np.full(PY.shape, m(_MOUTH_DEPTH))
