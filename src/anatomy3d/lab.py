@@ -79,6 +79,7 @@ TEMPLATES = [
 ]
 
 
+_RESCUE_ANIMAL_MIN = 0.15  # forced layer rescue only where the photo is at least this much an animal
 VERIFY_CLOTHES_PCT = 50.0  # a build is verified when it shows at least this share of the photo's garment-over-garment boundaries the right way round
 CODE_PRODUCTION = "O-" + "0" * len(FAMILIES["O"]["dims"])  # option 0 everywhere: what Generate builds
 
@@ -345,6 +346,10 @@ def build(code: str, inputs: LabInputs):
         out = add_base_disk(body, HEIGHT_MM)
         out.report = getattr(body, "report", None)  # (the reality checks of each step)
         return out
+    if fam == "O" and o["rescue"] == "on" and inputs.animal_frac <= _RESCUE_ANIMAL_MIN:
+        # (its depth bands on a person are lines of equal estimated depth,
+        # not edges: steps along them cut grooves across the chest)
+        raise RuntimeError("Layer rescue is for animals: on a person it cuts grooves along the depth estimate's bands.")
     if fam == "C":
         if inputs.capsule is None:
             raise RuntimeError(f"Capsule builder can't use this photo: {inputs.capsule_unavailable}")
