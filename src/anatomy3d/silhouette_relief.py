@@ -982,7 +982,8 @@ def _harmonic_fill(lap, known, values):
     return x
 
 
-def _drape_chest(V: np.ndarray, F: np.ndarray, torso_w: np.ndarray, px_per_m: float, joints: dict) -> np.ndarray:
+def _drape_chest(V: np.ndarray, F: np.ndarray, torso_w: np.ndarray, px_per_m: float, joints: dict,
+                 frontmost: bool = False, drape: float = _REF_DRAPE) -> np.ndarray:
     """Cloth over a man's chest (photo px, depth toward the back): the front
     of the chest lifted toward the camera onto a ball of _REF_DRAPE rolled
     over it, and hanging from the chest down instead of tucking in under it.
@@ -1004,10 +1005,10 @@ def _drape_chest(V: np.ndarray, F: np.ndarray, torso_w: np.ndarray, px_per_m: fl
     if have.sum() < 20:
         return V
     rise = np.where(have, -near, 0.0)  # toward the camera
-    n = int(round(_REF_DRAPE * 100))
+    n = int(round(drape * 100))
     yy, xx = np.mgrid[-n:n + 1, -n:n + 1]
     ball = (yy**2 + xx**2) <= n * n
-    R = _REF_DRAPE * px_per_m
+    R = drape * px_per_m
     cap = np.where(ball, np.sqrt(np.maximum(R * R - (yy**2 + xx**2) * cell * cell, 0.0)) - R, 0.0)
     floor = float(rise[have].min()) - 4.0 * R
     cloth = grey_closing(np.where(have, rise, floor), footprint=ball, structure=cap)
@@ -1032,7 +1033,13 @@ def _drape_chest(V: np.ndarray, F: np.ndarray, torso_w: np.ndarray, px_per_m: fl
     lift = np.where(have, np.maximum(cloth - rise, 0.0) * zone, 0.0)
     lift = _masked_blur(lift, have, 1.0)
     at = map_coordinates(lift, [gy, gx], order=1, mode="constant", cval=0.0)
-    facing = np.clip((-_vertex_normals(V, F)[:, 2] - 0.2) / 0.3, 0.0, 1.0)  # front-facing (depth points back)
+    if frontmost:
+        # what the front view sees, facing the camera or not: the underside
+        # of a bust faces down, and is just what the cloth hangs over
+        near_v = map_coordinates(np.where(have, near, 1e9), [gy, gx], order=0, mode="nearest")
+        facing = (V[:, 2] <= near_v + cell).astype(np.float64)
+    else:
+        facing = np.clip((-_vertex_normals(V, F)[:, 2] - 0.2) / 0.3, 0.0, 1.0)  # front-facing (depth points back)
     V = V.copy()
     V[:, 2] -= at * facing * np.clip((torso_w - 0.5) / 0.3, 0.0, 1.0)
     return V

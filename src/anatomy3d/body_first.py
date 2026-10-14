@@ -403,6 +403,9 @@ def plan_four_sides(V, F, part_w, names, inputs, ref):
     return V, plan
 
 
+_JACKET_DETAIL = 0.015  # under a jacket the photo's depth adds only detail finer than this share of the photo
+_BUST_DRAPE = 0.2  # a bust under a jacket: the cloth spans it as one form (a ball this size, m, rolled over it)
+_STIFF = ("suit", "jacket", "coat", "hoodie", "sweater", "kimono")  # garments a bust doesn't show through
 _CLOTH_HANG = 0.12  # down the back cloth comes in at most this much per unit it falls (a jacket hangs nearly straight)
 
 
@@ -560,8 +563,15 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         hw = part_w[:, names.index("head")] if "head" in names else 0.0
         m_ = hw * sr._REF_HEAD_MARGIN + (1.0 - hw) * sr._REF_DEPTH_MARGIN
         V[:, 2] = core + m_ * (V[:, 2] - core)
-    if (ref.get("report") or {}).get("gender") == "male" and "torso" in names:
-        V = sr._drape_chest(V, F, part_w[:, names.index("torso")], ppm, ref.get("joints_px") or {})
+    # cloth over the chest: a man's always; anyone's under a jacket, suit or
+    # coat (a woman's bust under one keeps its volume, but not its crease or
+    # cleavage -- bare, it read as a bra)
+    found = ((inputs.parts or {}).get("clothes") or {}).get("found") or {}
+    stiff = any(k in found for k in _STIFF)
+    draped = ((ref.get("report") or {}).get("gender") == "male" or stiff) and "torso" in names
+    drape_r = _BUST_DRAPE if (ref.get("report") or {}).get("gender") != "male" else sr._REF_DRAPE
+    if draped:
+        V = sr._drape_chest(V, F, part_w[:, names.index("torso")], ppm, ref.get("joints_px") or {}, frontmost=True, drape=drape_r)
     if ref.get("ears") and body_ref.get("ear_w") is not None and ref.get("head_axes") is not None:
         from .body_reference import place_ears
 
@@ -649,7 +659,16 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         vals = sampled[cov]
         if vals.size and vals.std() > 1e-9:
             dn = (sampled - vals.mean()) / vals.std()
+            dn_fine = dn - sr._masked_blur(dn, cov, max(_JACKET_DETAIL * max(shape), 1.0))
             dn = dn - sr._masked_blur(dn, cov, max(0.05 * max(shape), 1.0))  # fine detail only: the body has the big shapes
+            if stiff and clothes:
+                # under a jacket, finer still: its lapels, seams and folds,
+                # not the bust and the dip under it the estimate sees through it
+                from .clothes import NAMES
+
+                jk = np.isin(clothes["labels"], [NAMES.index(g) + 1 for g in _STIFF if g in NAMES])
+                jk = gaussian_filter(jk.astype(np.float64), 3.0)
+                dn = jk * dn_fine + (1.0 - jk) * dn
             half = np.where(cov, (far - near) / 2.0, 0.0)
             rel = np.clip(half * dn * depth_strength, -sr._REF_RELIEF_MAX * ppm, sr._REF_RELIEF_MAX * ppm)
             offset += np.where(cov, rel, 0.0)
