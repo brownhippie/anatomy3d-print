@@ -204,10 +204,120 @@ def read_face(rgb: np.ndarray, face_mesh: np.ndarray, labels: Optional[np.ndarra
             darker = float(np.median(L[cheek]) - np.median(L[jaw]))
             rough = float(hp[jaw].std() / (hp[cheek].std() + 1e-6))
             fh["stubble"] = round(float(np.clip((darker - 4.0) / 12.0, 0, 1) * np.clip(rough - 1.0, 0, 1)), 3)
+    try:
+        fh["sideburns"] = None if masked or lab_c is None else _sideburns(lab_c == HAIR, crop, q, size, shape, fh)
+    except Exception:  # noqa: BLE001 - read without them then
+        fh["sideburns"] = None
     out["facial_hair"] = fh
 
     # scars
     out["scars"] = [] if masked else _scars(L, q, skin, size, shape, x0, y0)
+    return out
+
+
+# each side of the face, from the temple down past the jaw's angle: the
+# temple (ear top), the tragus, the ear lobe, the jaw's angle
+SIDE_EDGE = {"R": [127, 234, 93, 132, 58, 172], "L": [356, 454, 323, 361, 288, 397]}
+_SB_BAND = 0.07  # the band round the face's edge where a sideburn grows, x the face's size
+_SB_ON = 0.3  # a row of that band has hair when this share of it does
+_SB_TEMPLE = 0.12  # the band starts this far above the brows (x the face's size), at the temple's hair
+
+
+_SB_PROMPTS = {"hair": [49406, 3005, 2225, 49407], "skin": [49406, 3575, 49407], "ear": [49406, 550, 8373, 49407],
+               "beard": [49406, 320, 9052, 49407]}  # "short hair", "skin", "an ear", "a beard"
+
+
+def _sideburns(hair_map: np.ndarray, crop: np.ndarray, q: np.ndarray, size: float, shape, fh: dict) -> Optional[dict]:
+    """Side whiskers, in front of each ear, read down the face's edge from the
+    temple: how far down they reach (none; short, above the tragus; medium,
+    to the ear lobe; long, past it towards the jaw's angle; joined, into a
+    beard), how wide they are (x the face's size), whether they flare out at
+    the foot (mutton chops) or taper, and how full. Hair there is what the
+    head-parts map calls hair or, close up round each ear, what CLIPSeg
+    calls "short hair" over skin, an ear and a beard (a sideburn is short,
+    and the map missed short dark hair on dark skin). Where long hair falls
+    over the side of the face the sideburn is under it: "covered". The
+    better-seen side is read for both: a person's two sides match."""
+    from scipy import ndimage
+
+    from .head_parts import _back, _clipseg, _square
+
+    sides = {}
+    for side, idx in SIDE_EDGE.items():
+        P = q[idx]
+        seen_px = float(abs(P[1, 0] - q[4, 0]))  # how much of that side the camera sees: the face's edge to the nose
+        # from the temple: the face's edge carried on up past the ear's top
+        # (about the brows' height) to where the temple's hair is
+        y_brow = float(q[[105, 334], 1].mean())
+        y_start = y_brow - _SB_TEMPLE * size
+        up = P[0] - P[1]
+        k = (y_start - P[0, 1]) / up[1] if up[1] < -1e-6 else 0.0
+        P = np.vstack([P[0] + max(k, 0.0) * up, P])
+        # close up round the ear: what is short hair there
+        hair = hair_map.copy()
+        sq = int(0.9 * size)
+        cr, (cx0, cy0), (sx0, sy0, sx1, sy1) = _square(crop, float(P[2, 0]), float(P[2, 1]), sq)
+        lg = _clipseg(cr, _SB_PROMPTS)
+        sc = {k: _back(lg[k].astype(np.float32), sq)[sy0 - cy0:sy1 - cy0, sx0 - cx0:sx1 - cx0] for k in _SB_PROMPTS}
+        others = np.max(np.stack([v for k, v in sc.items() if k != "hair"]), axis=0)
+        hair[sy0:sy1, sx0:sx1] |= (sc["hair"] > others) & (sc["hair"] > 0.0)
+        # the band: within _SB_BAND of the face's edge there
+        line = np.zeros(shape, bool)
+        for a, b in zip(P[:-1], P[1:]):
+            n = int(max(abs(b - a).max(), 2))
+            for t in np.linspace(0, 1, n):
+                x, y = a + t * (b - a)
+                if 0 <= int(y) < shape[0] and 0 <= int(x) < shape[1]:
+                    line[int(y), int(x)] = True
+        dist = ndimage.distance_transform_edt(~line)
+        band = dist < _SB_BAND * size
+        y_top, y_trg, y_lobe, y_jaw = P[0, 1], P[2, 1], P[4, 1], P[6, 1]
+        # long hair over the side of the face, beyond the ear, below the tragus
+        out_dir = np.sign(P[2, 0] - q[4, 0])
+        yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+        beyond = ((xx - P[2, 0]) * out_dir > 0.12 * size) & ((xx - P[2, 0]) * out_dir < 0.3 * size) & (yy > y_trg) & (yy < y_jaw)
+        if beyond.sum() > 20 and hair[beyond].mean() > 0.5:
+            sides[side] = {"type": "covered", "seen": seen_px}
+            continue
+        rows = np.arange(int(max(y_top, 0)), int(min(y_jaw + 0.05 * size, shape[0] - 1)))
+        if len(rows) < 6:
+            continue
+        frac = np.array([float(hair[r][band[r]].mean()) if band[r].any() else 0.0 for r in rows])
+        width = np.array([float(hair[r][band[r]].sum()) for r in rows])
+        if frac[: max(len(frac) // 5, 2)].mean() <= _SB_ON:
+            sides[side] = {"type": "none", "seen": seen_px}
+            continue
+        # how far down: the first run of three rows without it
+        off = np.flatnonzero(np.convolve(frac < _SB_ON * 0.8, np.ones(3), "valid") >= 3)
+        end = rows[min(int(off[0]), len(rows) - 1)] if len(off) else rows[-1]
+        length = float(np.clip((end - y_brow) / max(y_jaw - y_brow, 1.0), 0.0, 1.2))  # (0 at the ear's top, 1 at the jaw's angle)
+        if end < y_brow + 0.02 * size:
+            kind = "none"  # (the temple's hair only: the hairline goes up over the ear)
+        elif end < y_trg:
+            kind = "short"
+        elif end < y_lobe + 0.03 * size:
+            kind = "medium"
+        elif fh.get("beard") is not None and end >= y_jaw - 0.02 * size:
+            kind = "joined"
+        else:
+            kind = "long"
+        n_on = max(int(np.searchsorted(rows, end)), 2)
+        w_on = width[:n_on]
+        w_mid = float(np.median(w_on)) / size
+        foot = float(np.median(w_on[-max(n_on // 5, 1):])) / size
+        flare = foot / max(w_mid, 1e-6)
+        fill = float(np.mean(frac[:n_on]))
+        sides[side] = {"type": kind, "length": round(length, 3), "width": round(w_mid, 3), "flare": round(flare, 2),
+                       "end": "tapered" if flare < 0.55 else ("flared" if flare > 1.8 else "straight"),
+                       "fill": "full" if fill > 0.6 else "trimmed",
+                       "mutton_chops": bool(kind in ("long", "joined") and flare > 1.8), "seen": seen_px}
+    if not sides:
+        return None
+    seen = {k: v.get("seen", 0.0) for k, v in sides.items()}
+    best = max(seen, key=seen.get)
+    out = dict(sides[best])
+    out["read_from"] = best
+    out["sides"] = sides
     return out
 
 

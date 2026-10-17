@@ -54,6 +54,13 @@ _FIT_THICK = {"inner": 0.0015, "outer": 0.003, "tie": 0.004, "collar": 0.004, "l
 _FIT_SHOW = 1.6  # ... shown up this much on a figure (on a person cloth keeps close; on a model the gap is what shows it)
 _HAIR_EDGE_SHARE = 0.35  # short hair at its hairline: this share of its layer ...
 _HAIRLINE_TAPER = 0.01  # ... the full layer this far in (m)
+_SB_JAW = 0.45  # the jaw's angle this many ear heights below the ear's bottom
+_SB_ABOVE = 0.25  # side whiskers start at the temple's hair, this many ear heights above the ear's top
+_SB_SIDEWAYS = 0.35  # ... only on the head's side (its surface facing sideways at least this much)
+_SB_SMOOTH = 8  # its outline eased over this many mesh steps
+_SB_TRIMMED = 0.6  # a trimmed whisker's layer, of a full one's
+_HAIR_FLAT = ("sleek",)  # hair pulled flat to the head: no layer of its own over the unseen scalp (it raised folds there)
+_HAIR_UNSEEN = 1.0  # the short hair's layer over the scalp the front doesn't see, of the seen layer's
 _HAIR_SEAM_SMOOTH = 4  # the layer eased across where the front view stops seeing the scalp (mesh steps)
 _HAIR_NORMAL_SMOOTH = 6  # ... and laid along the surface's direction smoothed this much (mesh steps)
 _PIECE_MIN_H = 0.0008  # a garment piece: where it stands at least this over what is under it (m)
@@ -1152,6 +1159,64 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
     return out, made
 
 
+def _sideburns_3d(V, F, part_w, names, ear_w, head_axes, read: dict, fm, ppm: float):
+    """The side whiskers as read (face_parts._sideburns), on the side of the
+    head in front of each ear: from the temple's hair down to the read
+    length (0 at the ear's top, 1 at the jaw's angle), the read width (x the
+    face's size), widening to the foot by the read flare (mutton chops) or
+    narrowing (tapered), a short hair's layer thick (less where trimmed),
+    laid along the smoothed surface. The same on both sides. Returns the
+    surface and what was built."""
+    from . import silhouette_relief as sr
+
+    kind = read.get("type")
+    if kind in (None, "none", "covered") or "head" not in names:
+        return V, {"type": kind, "built": False}
+    A = head_axes  # columns: the head's left, back, up (photo px)
+    loc = V @ A
+    head = (part_w[:, names.index("head")] > 0.5) & (ear_w.max(axis=1) < 0.5)  # (the skin round the ear's base is where they grow)
+    if not head.any():
+        return V, {"type": kind, "built": False}
+    loc[:, 0] -= float(np.median(loc[head, 0]))  # (side to side from the head's middle)
+    lap = sr._mesh_laplacian(F, len(V))
+    n_s = sr._vertex_normals(V, F)
+    n_s = np.column_stack([sr._mesh_smooth(lap, n_s[:, j], _HAIR_NORMAL_SMOOTH) for j in range(3)])
+    n_s /= np.linalg.norm(n_s, axis=1, keepdims=True) + 1e-12
+    nrm = n_s @ A  # (smoothed: the raw ones made its edge lumpy)
+    fsize = max(float(np.ptp(np.asarray(fm)[:468, 0])), float(np.ptp(np.asarray(fm)[:468, 1])))
+    h = np.zeros(len(V))
+    built = {}
+    for i, side in enumerate("LR"):
+        core = ear_w[:, i] > 0.95
+        if core.sum() < 10:
+            continue
+        u = 1.0 if side == "L" else -1.0
+        e = loc[core]
+        front, top, bottom = float(e[:, 1].min()), float(e[:, 2].max()), float(e[:, 2].min())
+        ear_h = max(top - bottom, 1.0)
+        jaw = bottom - _SB_JAW * ear_h
+        z_start = top + _SB_ABOVE * ear_h
+        z_end = top - float(read.get("length", 0.2)) * (top - jaw)
+        w_top = float(read.get("width", 0.06)) * fsize
+        flare = float(np.clip(read.get("flare", 1.0), 0.3, 2.5))
+        # down the whisker: 0 at its top, 1 at its foot
+        t = np.clip((z_start - loc[:, 2]) / max(z_start - z_end, 1.0), 0.0, 1.0)
+        width = w_top * (1.0 + (flare - 1.0) * t) if read.get("end") != "tapered" else w_top * (1.0 - 0.8 * t)
+        ahead = front - loc[:, 1]  # how far in front of the ear's front edge
+        on = head & (u * nrm[:, 0] > _SB_SIDEWAYS) & (u * loc[:, 0] > 0) & (loc[:, 2] <= z_start) & (loc[:, 2] >= z_end - 0.1 * ear_h)
+        across = np.clip(1.0 - (ahead - 0.5 * width) / np.maximum(0.25 * width, 1.0), 0.0, 1.0) * (ahead > -0.15 * ear_h)
+        foot = np.clip((loc[:, 2] - (z_end - 0.1 * ear_h)) / (0.1 * ear_h), 0.0, 1.0)  # (a clean cut at the foot)
+        hs = np.where(on, np.clip(across, 0.0, 1.0) * foot, 0.0)
+        h = np.maximum(h, hs)
+        built[side] = int((hs > 0.5).sum())
+    if not built or h.max() <= 0:
+        return V, {"type": kind, "built": False}
+    h = np.clip(sr._mesh_smooth(lap, h, _SB_SMOOTH), 0.0, 1.0)
+    thick = sr._HAIR_SHORT * ppm * (1.0 if read.get("fill") == "full" else _SB_TRIMMED)
+    return V + (h * thick)[:, None] * n_s, {"type": kind, "built": True, "vertices": built,
+                                             "thick_mm": round(thick / ppm * 1000.0, 2)}
+
+
 def _set_eyes_back(V, F, face_read: dict, shape, ppm: float):
     from scipy.ndimage import binary_dilation
 
@@ -1447,7 +1512,14 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
 
     # 9. the detail, from the front, on what the camera sees (a finer
     # surface for it, the parts carried along)
-    V, F, part_w = _subdivide(V, F, part_w)
+    ew = body_ref.get("ear_w")
+    ear_w9 = None
+    if ew is not None and len(ew) == len(V):
+        # (the ears carried along too: the side whiskers grow in front of them)
+        V, F, pw_all = _subdivide(V, F, np.column_stack([part_w, np.asarray(ew, dtype=np.float64)]))
+        part_w, ear_w9 = pw_all[:, :part_w.shape[1]], pw_all[:, part_w.shape[1]:]
+    else:
+        V, F, part_w = _subdivide(V, F, part_w)
     st = {"V": V, "F": F, "pw": part_w}
     before = st
     locks.lock("9 detail", "no new spikes", _spike_pct, lambda m, m0: m <= m0 + _LOCK_SPIKES, st)
@@ -1602,7 +1674,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             # back of the head above the nape): left bare there, the layer
             # stopped where the front view does, a ridge over the top of the
             # head from ear to ear that read as a hairband
-            if "head" in names:
+            if "head" in names and (hair_read or {}).get("kind") not in _HAIR_FLAT:
                 head_w = part_w[:, names.index("head")]
                 fm_ = np.asarray(fm)
                 brow_y, nape_y = float(fm_[[105, 334], 1].mean()), float(fm_[2, 1])
@@ -1613,7 +1685,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
                     scalp = hd & ~visible & (V[:, 1] < nape_y) & ((V[:, 1] < brow_y) | (V[:, 2] > zc + 0.15 * zr))
                     # (thinning to the nape as to the front hairline)
                     nape_t = np.clip((nape_y - V[:, 1]) / (_HAIRLINE_TAPER * ppm * 2.0), 0.0, 1.0)
-                    hv = np.where(scalp, _HAIR_EDGE_SHARE + (1.0 - _HAIR_EDGE_SHARE) * nape_t, hv)
+                    hv = np.where(scalp, _HAIR_UNSEEN * (_HAIR_EDGE_SHARE + (1.0 - _HAIR_EDGE_SHARE) * nape_t), hv)
             lap_f = sr._mesh_laplacian(F, len(V))
             hv = np.clip(sr._mesh_smooth(lap_f, hv, _HAIR_SEAM_SMOOTH), 0.0, 1.0)
             # (along the surface's direction smoothed: along each vertex's own,
@@ -1631,6 +1703,16 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             hi=_CHK_MOVE_MM, unit=" mm")
     st = locks.hold("9 detail", before, dict(st, V=V))
     V = st["V"]
+    # the side whiskers as read: a measured place too, after the locks
+    sb_read = ((parts.get("face") or {}).get("facial_hair") or {}).get("sideburns")
+    if sb_read and ear_w9 is not None and ref.get("head_axes") is not None and fm is not None:
+        try:
+            V, sb_info = _sideburns_3d(V, F, part_w, names, ear_w9, np.asarray(ref["head_axes"], dtype=np.float64), sb_read, fm, ppm)
+            report["sideburns"] = sb_info
+            if sb_read.get("type") in ("short", "medium", "long", "joined"):
+                chk.add("9 detail", f"side whiskers built as read ({sb_read.get('type')})", float(bool(sb_info.get("built"))), lo=1.0)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Note: sideburns skipped ({exc}).")
     # the open eyes sit back behind their lids, measured on the surface as it
     # now is (after the locks: a measured place, not detail to ease off) and
     # against the lids themselves -- the body's own eyeballs stood in front
