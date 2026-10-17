@@ -322,7 +322,10 @@ def layering(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") ->
     return {"layering": round(100.0 * hits / total, 1), "layering_n": total}
 
 
-GARMENT_STEP_MM = 0.5  # a garment's edge shows on the model when it stands at least this far over what is beside it
+GARMENT_STEP_MM = 0.5  # a garment shows on the model when its panel stands at least this far (mm) over what is beside it
+_PANEL_NEAR = 0.008  # ... the panel taken from this far into it (m, on the person) ...
+_PANEL_FAR = 0.025  # ... to this far (a lapel is 6-9 cm wide, a tie 4-9, a collar band 3-4 tall)
+_PANEL_FALLBACK_H = 0.9  # (no body posed: the photo's subject taken as this tall, m)
 _GARMENT_CODES = ("jacket", "suit", "coat", "tie", "sweater", "hoodie", "scarf", "belt", "collar", "lapel", "shirt", "tshirt",
                   "dress", "kimono", "neck", "trousers", "jeans", "skirt")
 
@@ -330,13 +333,15 @@ _GARMENT_CODES = ("jacket", "suit", "coat", "tie", "sweater", "hoodie", "scarf",
 def garment_edges(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
     """Where the photo shows one garment over another -- a lapel over the
     jacket, the jacket's edge over the shirt and the tie, the tie over the
-    shirt, the collar round the neck -- how much of that edge stands as a
-    step on the model (% of edge points with the outer one at least
-    GARMENT_STEP_MM in front), and the median step (mm). Each side's
-    surface is taken a little way off the edge and carried on to it along
-    its own slope, so a step a pixel or two from where the photo draws the
-    line still counts and a slope alone doesn't. Hands, hair and the face
-    are left to layering."""
+    shirt, the collar round the neck -- whether the outer one stands over the
+    inner as a panel on the model: each side's surface taken across a band
+    _PANEL_NEAR to _PANEL_FAR into it (on the person, metres: a thin ridge
+    along the edge alone doesn't count), the body's own slope across the
+    edge taken out (the two bands' mean slope), and the outer band's height
+    over the inner's compared with GARMENT_STEP_MM. % of edge points that
+    stand, each pair of garments counted on its own (so one long edge
+    doesn't outweigh the rest), and the median step (mm). Hands, hair and
+    the face are left to layering."""
     from scipy.ndimage import zoom
 
     H, W = inputs.photo_mask.shape
@@ -354,30 +359,69 @@ def garment_edges(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs
     o = zoom(o, (z.shape[0] / o.shape[0], z.shape[1] / o.shape[1]), order=0)[: z.shape[0], : z.shape[1]]
     h_, w_ = min(o.shape[0], z.shape[0]), min(o.shape[1], z.shape[1])
     o, z = o[:h_, :w_], z[:h_, :w_]
-    P = 10
+    ppm = float((inputs.reference or {}).get("px_per_m") or 0.0)
+    if ppm <= 0:
+        ppm = (box[3] - box[1]) / _PANEL_FALLBACK_H  # (no body posed: the photo's subject taken as a bust this tall)
+    g = ppm / k  # raster px per metre on the person
+    d0 = max(2, int(round(_PANEL_NEAR * g)))
+    d1 = max(d0 + 2, int(round(_PANEL_FAR * g)))
+    dm = (d0 + d1) // 2
+    P = d1 + 3
     zp = np.pad(z, P, constant_values=np.nan)
     op = np.pad(o, P, constant_values=0)
-    steps = []
+    per_pair = {}
     with np.errstate(invalid="ignore"):
         for dy, dx in ((0, 1), (1, 0)):
-            def sh(a, k):
-                return np.roll(np.roll(a, -k * dy, axis=0), -k * dx, axis=1)
+            def sh(a, j):
+                return np.roll(np.roll(a, -j * dy, axis=0), -j * dx, axis=1)
 
             A, B = op, sh(op, 1)
-            a_near = (sh(zp, -2) + sh(zp, -3)) / 2.0
-            a_far = (sh(zp, -5) + sh(zp, -6)) / 2.0
-            b_near = (sh(zp, 3) + sh(zp, 4)) / 2.0
-            b_far = (sh(zp, 6) + sh(zp, 7)) / 2.0
-            a_e = np.where(np.isfinite(a_far), a_near + (a_near - a_far) * (2.5 / 3.5), a_near)
-            b_e = np.where(np.isfinite(b_far), b_near + (b_near - b_far) * (2.5 / 3.5), b_near)
-            ok = np.isfinite(a_e) & np.isfinite(b_e)
-            steps.append((a_e - b_e)[pairs[A, B] & ok])
-            steps.append((b_e - a_e)[pairs[B, A] & ok])
-    s = np.concatenate(steps) if steps else np.zeros(0)
-    if len(s) < 20:
+
+            def band(side_lab, sign, lo, hi, start):
+                # the mean height over offsets lo..hi from the edge on one side,
+                # only where that side's own garment still is
+                acc, cnt = np.zeros(zp.shape), np.zeros(zp.shape)
+                for j in range(lo, hi + 1):
+                    jj = start + sign * j
+                    zz, ll = sh(zp, jj), sh(op, jj)
+                    ok = np.isfinite(zz) & (ll == side_lab)
+                    acc += np.where(ok, zz, 0.0)
+                    cnt += ok
+                return np.where(cnt >= max(1, (hi - lo + 1) // 2), acc / np.maximum(cnt, 1), np.nan)
+
+            a_n, a_f = band(A, -1, d0, dm, 0), band(A, -1, dm, d1, 0)
+            b_n, b_f = band(B, 1, d0, dm, 1), band(B, 1, dm, d1, 1)
+            # each band's centre, from the edge between the two pixels
+            xa_n, xa_f = -(d0 + dm) / 2.0, -(dm + d1) / 2.0
+            xb_n, xb_f = 1 + (d0 + dm) / 2.0, 1 + (dm + d1) / 2.0
+            slope = ((a_n - a_f) / (xa_n - xa_f) + (b_f - b_n) / (xb_f - xb_n)) / 2.0
+            a_m, b_m = (a_n + a_f) / 2.0, (b_n + b_f) / 2.0
+            xa, xb = (xa_n + xa_f) / 2.0, (xb_n + xb_f) / 2.0
+            a_over_b = (a_m - b_m) - slope * (xa - xb)  # A's panel over B's, the slope taken out
+            ok = np.isfinite(a_over_b)
+            for over, step, lab_o, lab_i in ((pairs[A, B] & ok, a_over_b, A, B), (pairs[B, A] & ok, -a_over_b, B, A)):
+                if not over.any():
+                    continue
+                for i, j in set(zip(lab_o[over].tolist(), lab_i[over].tolist())):
+                    sel = over & (lab_o == i) & (lab_i == j)
+                    per_pair.setdefault((names[i], names[j]), []).append(step[sel])
+    if not per_pair:
         return {}
-    return {"garment_edges": round(100.0 * float((s >= GARMENT_STEP_MM).mean()), 1),
-            "garment_step_mm": round(float(np.median(s)), 2), "garment_edges_n": int(len(s))}
+    shares, wts, allv, detail = [], [], [], {}
+    for key, parts in per_pair.items():
+        v = np.concatenate(parts)
+        if len(v) < 8:
+            continue
+        sh_ = float((v >= GARMENT_STEP_MM).mean())
+        shares.append(sh_)
+        wts.append(np.sqrt(len(v)))
+        allv.append(v)
+        detail[f"{key[0]} over {key[1]}"] = [round(100.0 * sh_, 1), int(len(v)), round(float(np.median(v)), 2)]
+    if not shares or sum(len(v) for v in allv) < 20:
+        return {}
+    allv = np.concatenate(allv)
+    return {"garment_edges": round(100.0 * float(np.average(shares, weights=wts)), 1),
+            "garment_step_mm": round(float(np.median(allv)), 2), "garment_edges_n": int(len(allv)), "garment_pairs": detail}
 
 
 def ears_fit(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:

@@ -601,7 +601,11 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
         m["clothes_pct"] = lay.get("layering")
     except Exception:  # noqa: BLE001 - no clothes boundaries to judge on
         m["clothes_pct"] = None
-    m["verified"] = bool(m["watertight"] and m["min_wall_mm"] >= 0.8
+    # (the walls of the full model, where its build checked them: the
+    # preview is lighter and smoothed over thin spots the print would have)
+    rep = getattr(body, "report", None) or {}
+    full_wall_ok = not any("thinnest wall" in str(c) for c in (rep.get("checks_failed") or []))
+    m["verified"] = bool(m["watertight"] and m["min_wall_mm"] >= 0.8 and full_wall_ok
                          and (m["garment_edges"] is None or m["garment_edges"] >= VERIFY_GARMENT_EDGES))
     try:
         params = _parameters(m, inputs, preview, floor, sil, got, head)
@@ -941,5 +945,5 @@ SCORE_FORMULA = (
     "score = shape match % − 4 × spikes % − 25 if not sealed − 20 if thinnest wall < 0.8 mm "
     "+ (30 − face error %) when a face is found + photo detail (how much of the whole photo -- clothes, "
     "hair, face, hands -- the model's surface carries inside its outline) + 0.4 × garment edges % (how much of "
-    "the photo's lapel, jacket-front, tie and collar edges stand as a step on the model)"
+    "the photo's lapels, jacket front, tie and collar stand over what is beside them as panels on the model)"
 )
