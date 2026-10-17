@@ -54,6 +54,8 @@ _FIT_THICK = {"inner": 0.0015, "outer": 0.003, "tie": 0.004, "collar": 0.004, "l
 _FIT_SHOW = 1.6  # ... shown up this much on a figure (on a person cloth keeps close; on a model the gap is what shows it)
 _HAIR_EDGE_SHARE = 0.35  # short hair at its hairline: this share of its layer ...
 _HAIRLINE_TAPER = 0.01  # ... the full layer this far in (m)
+_GV_SMOOTH = 4  # the collars', seams' and hems' edges eased over this many mesh steps
+_GV_COLLAR_FRONT = 55.0  # degrees either side of the front: the collar there is the photo's
 _SB_JAW = 0.45  # the jaw's angle this many ear heights below the ear's bottom
 _SB_ABOVE = 0.25  # side whiskers start at the temple's hair, this many ear heights above the ear's top
 _SB_SIDEWAYS = 0.35  # ... only on the head's side (its surface facing sideways at least this much)
@@ -1217,6 +1219,153 @@ def _sideburns_3d(V, F, part_w, names, ear_w, head_axes, read: dict, fm, ppm: fl
                                              "thick_mm": round(thick / ppm * 1000.0, 2)}
 
 
+def _garment_views(V, F, part_w, names, found, J: dict, ppm: float):
+    """The garments read on the front, made all round as they are sewn
+    (garment_designs): the collars round the back and sides of the neck (a
+    jacket's, the shirt's showing above it; a knitted band; a hood), the
+    outermost top's seams (down each side, down the back, along the
+    shoulders, across a shirt's yoke, round the armholes), its hem and a
+    waistband where the body reaches them. Only off the front: the front is
+    the photo's. In a frame round the torso: up from the hips to the
+    shoulders, across between the shoulders, round about its middle at each
+    height (0 at the front, 180 degrees at the back). Returns the surface
+    and what was made."""
+    from . import garment_designs as gd
+    from . import silhouette_relief as sr
+
+    wd = gd.worn_designs(found)
+    made = {"outer": wd["outer"], "collars": [], "seams": [], "hem": False, "waistband": False}
+    need = ("left_shoulder", "right_shoulder", "left_hip", "right_hip")
+    if not (wd["outer"] or wd["waistband"]) or not all(k in J and len(J[k]) > 2 for k in need) or "torso" not in names:
+        return V, made
+    msh = (J["left_shoulder"][:3] + J["right_shoulder"][:3]) / 2.0
+    mhip = (J["left_hip"][:3] + J["right_hip"][:3]) / 2.0
+    up = msh - mhip
+    up /= np.linalg.norm(up) + 1e-12
+    lat = J["left_shoulder"][:3] - J["right_shoulder"][:3]
+    lat -= up * (lat @ up)
+    sw = float(np.linalg.norm(lat))
+    lat /= sw + 1e-12
+    fwd = np.cross(up, lat)
+    if fwd[2] > 0:
+        fwd = -fwd  # (toward the camera: depth runs toward the back)
+    rel = V - msh
+    s_up = rel @ up  # above the shoulders' line (px)
+    pl, pf = rel @ lat, rel @ fwd
+    w_t = part_w[:, names.index("torso")]
+    w_n = part_w[:, names.index("neck")] if "neck" in names else np.zeros(len(V))
+    body = (w_t + w_n) > 0.5
+    # the middle at each height
+    bins = np.linspace(s_up[body].min(), s_up[body].max(), 40)
+    k = np.clip(np.digitize(s_up, bins) - 1, 0, len(bins) - 2)
+    cl, cf = np.zeros(len(bins) - 1), np.zeros(len(bins) - 1)
+    for b in range(len(bins) - 1):
+        sel = body & (k == b)
+        if sel.sum() > 5:
+            cl[b], cf[b] = np.median(pl[sel]), (pf[sel].max() + pf[sel].min()) / 2.0
+        elif b:
+            cl[b], cf[b] = cl[b - 1], cf[b - 1]
+    ker = np.ones(5) / 5.0  # (the middle eased from height to height: stepped, it made the seams ragged)
+    cl = np.convolve(np.pad(cl, 2, mode="edge"), ker, "valid")
+    cf = np.convolve(np.pad(cf, 2, mode="edge"), ker, "valid")
+    tpos = np.clip((s_up - bins[0]) / (bins[1] - bins[0]) - 0.5, 0.0, len(cl) - 1.0)
+    a_l, a_f = pl - np.interp(tpos, np.arange(len(cl)), cl), pf - np.interp(tpos, np.arange(len(cf)), cf)
+    theta = np.degrees(np.arctan2(a_l, a_f))  # 0 front, +-180 back
+    r = np.hypot(a_l, a_f)
+    lap = sr._mesh_laplacian(F, len(V))
+    n_s = sr._vertex_normals(V, F)
+    n_s = np.column_stack([sr._mesh_smooth(lap, n_s[:, j], _HAIR_NORMAL_SMOOTH) for j in range(3)])
+    n_s /= np.linalg.norm(n_s, axis=1, keepdims=True) + 1e-12
+    off_front = np.clip((-n_s[:, 2] - 0.2) / 0.3, 0.0, 1.0)  # (facing the camera: the photo's)
+    back_w = 1.0 - off_front
+    m = ppm  # px per metre
+    off = np.zeros(len(V))
+
+    # the collars: from the neck's base (the neck's lowest at each angle) up
+    neck = w_n > 0.5
+    if wd["collars"] and neck.sum() > 20:
+        tb = np.clip(((theta + 180.0) / 15.0).astype(int), 0, 23)
+        base = np.full(24, np.nan)
+        for b in range(24):
+            sel = neck & (tb == b)
+            if sel.sum() > 3:
+                base[b] = s_up[sel].min()
+        ok = np.isfinite(base)
+        if ok.any():
+            base = np.where(ok, base, np.nanmedian(base))
+            base = np.convolve(np.concatenate([base[-2:], base, base[:2]]), np.ones(5) / 5.0, "valid")  # (round the neck)
+            tpos_ = (theta + 180.0) / 15.0 - 0.5
+            above = s_up - np.interp(tpos_, np.arange(-1, 25), np.concatenate([[base[-1]], base, [base[0]]]))
+            side = np.clip((np.abs(theta) - _GV_COLLAR_FRONT) / 20.0, 0.0, 1.0)  # (the front's collar is the photo's)
+            under = 0.0
+            heights = {kind: h for _, kind, h in wd["collars"]}
+            for g, kind, h in sorted(wd["collars"], key=lambda c: gd.DESIGNS[c[0]]["outer"]):
+                hh = h
+                if kind == "shirt" and "notched" in heights:
+                    hh = max(h, heights["notched"] + gd.SHIRT_ABOVE_JACKET)
+                t = gd.COLLAR_THICK[kind] * gd.SHOW * m
+                if kind == "hood":
+                    # a hood lies folded on the upper back below the neck's base
+                    d = np.clip(-above / (hh * m), 0.0, 1.0)
+                    band = np.sin(np.pi * d) * np.clip((np.abs(theta) - 100.0) / 30.0, 0.0, 1.0) * ((w_t + w_n) > 0.3)
+                    off = np.maximum(off, band * t)
+                else:
+                    band = np.clip(1.0 - np.abs(above - 0.45 * hh * m) / (0.55 * hh * m), 0.0, 1.0) ** 0.3 * side * ((w_t + w_n) > 0.3)
+                    off = np.maximum(off, band * (under + t))
+                    under += t
+                made["collars"].append(g)
+
+    # the outermost top's seams, grooves off the front
+    groove = np.zeros(len(V))
+    half_w = 0.5 * gd.SEAM_WIDTH * m
+    armpit = -0.12 * m
+    torso = w_t > 0.5
+    lowest = s_up[torso].min() if torso.any() else 0.0
+    for seam in wd["seams"]:
+        if seam == "side":
+            d = r * np.radians(np.abs(np.abs(theta) - 90.0))
+            sel = torso & (s_up < armpit)
+        elif seam == "back":
+            d = r * np.radians(180.0 - np.abs(theta))
+            sel = torso & (s_up < 0.02 * m)
+        elif seam == "shoulder":
+            top = n_s @ up
+            d = np.abs(a_f - np.median(a_f[torso & (np.abs(s_up) < 0.03 * m)]) if (torso & (np.abs(s_up) < 0.03 * m)).any() else a_f)
+            sel = torso & (top > 0.5) & (np.abs(a_l) > 0.12 * sw) & (np.abs(a_l) < 0.5 * sw)
+        elif seam == "yoke":
+            d = np.abs(s_up + 0.1 * m)
+            sel = torso & (np.abs(theta) > 110.0)
+        elif seam == "armhole":
+            arms = [names.index(n) for n in ("upperarm.L", "upperarm.R") if n in names]
+            if not arms:
+                continue
+            wa = part_w[:, arms].max(axis=1)
+            d = np.abs(wa - 0.5) / 0.5 * (0.03 * m)  # (along the torso and arm's meeting)
+            sel = (wa > 0.2) & (wa < 0.8)
+        else:
+            continue
+        g_ = np.where(sel, np.clip(1.0 - (d / half_w) ** 2, 0.0, 1.0), 0.0)
+        if (g_ > 0.5).sum() > 10:
+            groove = np.maximum(groove, g_)
+            made["seams"].append(seam)
+    off -= groove * gd.SEAM_DEPTH * m
+
+    # its hem, and a waistband, where the body reaches them
+    s_hip = float((mhip - msh) @ up)
+    hem_at = {"hip": s_hip - 0.08 * m, "waist": s_hip + 0.12 * m}.get(wd["hem"] or "", None)
+    if hem_at is not None and lowest < hem_at - 0.02 * m:
+        below = np.clip((hem_at - s_up) / (0.004 * m), 0.0, 1.0)
+        off -= below * gd.HEM_STEP * gd.SHOW * m * torso
+        made["hem"] = True
+    if wd["waistband"] and lowest < s_hip + 0.05 * m - wd["waistband"] * m:
+        wb = np.clip(1.0 - np.abs(s_up - (s_hip + 0.05 * m)) / (0.5 * wd["waistband"] * m), 0.0, 1.0) ** 0.3
+        off += wb * 0.002 * gd.SHOW * m * torso
+        made["waistband"] = True
+    off = sr._mesh_smooth(lap, off * back_w, _GV_SMOOTH)
+    made["views"] = wd["views"]
+    return V + off[:, None] * n_s, made
+
+
 def _set_eyes_back(V, F, face_read: dict, shape, ppm: float):
     from scipy.ndimage import binary_dilation
 
@@ -1713,6 +1862,19 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
                 chk.add("9 detail", f"side whiskers built as read ({sb_read.get('type')})", float(bool(sb_info.get("built"))), lo=1.0)
         except Exception as exc:  # noqa: BLE001
             print(f"Note: sideburns skipped ({exc}).")
+    # the clothes all round, as they are made (garment_designs): what the
+    # front can't show of them -- collars round the back, seams, hems
+    if clothes_steps and clothes and ref.get("joints_px"):
+        try:
+            J3 = {k_: np.asarray(v_, dtype=np.float64) for k_, v_ in (ref.get("joints_px") or {}).items()}
+            V, gv = _garment_views(V, F, part_w, names, (clothes or {}).get("found") or {}, J3, ppm)
+            report["garment_views"] = {k_: v_ for k_, v_ in gv.items() if k_ != "views"}
+            report["garment_designs"] = gv.get("views")
+            if gv.get("outer"):
+                chk.add("9 detail", f"{gv['outer']} made all round (collar and seams off the front)",
+                        float(bool(gv["collars"]) or bool(gv["seams"])), lo=1.0)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Note: garment views skipped ({exc}).")
     # the open eyes sit back behind their lids, measured on the surface as it
     # now is (after the locks: a measured place, not detail to ease off) and
     # against the lids themselves -- the body's own eyeballs stood in front
