@@ -2139,7 +2139,7 @@ def _clothes_relief(reading: dict, front: np.ndarray, cells: np.ndarray, y0: int
     it, a belt over trousers, a scarf over everything), easing back to the
     garment's own surface away from the edge; fading where the surface
     turns side-on."""
-    from .clothes import GARMENTS, NAMES, layer_map
+    from .clothes import GARMENTS, NAMES, layer_map, worn_ids
 
     gh, gw = cells.shape
     labels = reading["labels"]
@@ -2157,7 +2157,7 @@ def _clothes_relief(reading: dict, front: np.ndarray, cells: np.ndarray, y0: int
     w = gaussian_filter(cells.astype(np.float64), span) + 1e-6
     local = gaussian_filter(np.where(cells, Lf, 0.0), span) / w
     step = _CLOTH_LAYER * px_per_m * (Lf - local)
-    garment = np.isin(lab_g, [i + 1 for i in range(len(GARMENTS))])
+    garment = np.isin(lab_g, worn_ids())
     for k, t in (("tie", _TIE_THICK), ("belt", _BELT_THICK), ("watch", _WATCH_THICK), ("bracelet", _BRACELET_THICK)):
         m_ = lab_g == NAMES.index(k) + 1
         if m_.any():

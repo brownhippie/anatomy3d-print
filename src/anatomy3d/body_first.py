@@ -50,12 +50,15 @@ _FIT_COLLAR = (0.1, 1.5)  # a collar's room round the neck each side, cm
 _FIT_SLEEVE = (0.2, 4.0)  # a sleeve's room round the arm each side, cm
 _FIT_TIE = (4.0, 11.0)  # a tie's width, cm
 _FIT_FRONT = 0.35  # the front stands off the layer under it by this share of the room at the sides (cloth lies on the chest)
-_FIT_THICK = {"inner": 0.0015, "outer": 0.003, "tie": 0.004}  # the cloth's own thickness, m (a tie's knot and lining more)
+_FIT_THICK = {"inner": 0.0015, "outer": 0.003, "tie": 0.004, "collar": 0.004, "lapel": 0.004}  # the cloth's own thickness, m (a tie's knot and lining more)
 _FIT_SHOW = 1.6  # ... shown up this much on a figure (on a person cloth keeps close; on a model the gap is what shows it)
 _HAIR_OVER_REACH = 0.02  # hair clears the forehead beside it, eased out over this far (m)
 _PIECE_MIN_H = 0.0008  # a garment piece: where it stands at least this over what is under it (m)
 _PIECE_MIN_W = 0.006  # ... nothing of it narrower than this (m)
 _PIECE_MIN_AREA = 0.0002  # ... at least this big (m^2: 2 cm^2)
+_PIECE_DZ = 0.5  # a piece's depth layers (photo px)
+_PIECE_MIN_FACING = 0.3  # ... and none where the surface turns this far side-on (the front view can't place it there)
+_PIECE_EDGE_SMOOTH = 0.002  # a piece's outline smoothed over this much (m)
 _PIECE_SINK = 0.002  # ... its back this far into the surface under it, so they join (m)
 _POP_MAX = 0.014  # no piece stands more than this over what is beside it (m)
 _POP_SPAN = 0.05  # a piece stands over the lowest layer within this far (a tie, collar or lapel as a whole)
@@ -256,7 +259,7 @@ def _fold_arms(V, F, part_w, names, inputs, ref):
 
 def _cover_unseen(V, F, part_w, names, inputs, ppm, still=None):
     from . import silhouette_relief as sr
-    from .clothes import GARMENTS, NAMES
+    from .clothes import GARMENTS, NAMES, WORN
 
     parts = inputs.parts or {}
     clothes = parts.get("clothes")
@@ -271,7 +274,7 @@ def _cover_unseen(V, F, part_w, names, inputs, ppm, still=None):
     nrm = sr._vertex_normals(V, F)
     out = V.copy()
     if clothes:
-        g_ids = [NAMES.index(g) + 1 for g in GARMENTS]
+        g_ids = [NAMES.index(g) + 1 for g in WORN]
         worn = np.isin(clothes["labels"][r, c], g_ids)
         cover = np.zeros(len(V))
         for i, n in enumerate(names):
@@ -885,7 +888,7 @@ def _cloth_hollow_mm(st: dict, names, clothes, ppm: float) -> Optional[float]:
     percentile, mm) a cloth wouldn't follow: the body showing through."""
     from scipy.ndimage import binary_erosion, grey_closing
 
-    from .clothes import GARMENTS, NAMES as CNAMES
+    from .clothes import GARMENTS, WORN, NAMES as CNAMES
 
     if not clothes or "torso" not in names:
         return None
@@ -893,7 +896,7 @@ def _cloth_hollow_mm(st: dict, names, clothes, ppm: float) -> Optional[float]:
     Ft = F[(st["pw"][:, names.index("torso")][F] > 0.5).all(axis=1)]
     nt, _ = _raster_front(V, Ft, clothes["labels"].shape)
     on_t = np.isfinite(nt)
-    worn = np.isin(clothes["labels"], [CNAMES.index(g) + 1 for g in GARMENTS]) & on_t
+    worn = np.isin(clothes["labels"], [CNAMES.index(g) + 1 for g in WORN]) & on_t
     worn = binary_erosion(worn, iterations=int(max(0.02 * ppm, 1)))
     if worn.sum() <= 200:
         return None
@@ -1003,7 +1006,11 @@ def _measure_fit(V_bare, V_dressed, F, pw, names, clothes, J: dict, ppm: float, 
     for g in outer:
         H[g] = base + (outer_gap + _FIT_THICK["outer"] * _FIT_SHOW) * ppm
     H["tie"] = base + _FIT_THICK["tie"] * _FIT_SHOW * ppm
-    m["heights_mm"] = {k: round(v / ppm * 1000.0, 1) for k, v in H.items() if k in found or k in ("skin", "tie") and "tie" in found}
+    # a shirt's collar: its band stands round the neck over the shirt; a
+    # lapel: the jacket's front folded back on itself, over the jacket
+    H["collar"] = max((H[g] for g in inner if g in found), default=H["shirt"]) + _FIT_THICK["collar"] * _FIT_SHOW * ppm
+    H["lapel"] = max((H[g] for g in outer if g in found), default=H["suit"]) + _FIT_THICK["lapel"] * _FIT_SHOW * ppm
+    m["heights_mm"] = {k: round(v / ppm * 1000.0, 1) for k, v in H.items() if k in found or k == "skin"}
     m["_H"] = H
     return m
 
@@ -1048,9 +1055,9 @@ def _clothes_pop(clothes: dict, front, cov, ppm: float, H: dict, neck_rows=None,
     facing = np.clip((1.0 / np.sqrt(1.0 + np.hypot(gy, gx) ** 2) - 0.35) / 0.35, 0.0, 1.0)  # (fading where the surface turns side-on)
     # on the clothes (and the skin at the neck) only: the face and the hands
     # are their own
-    from .clothes import GARMENTS
+    from .clothes import GARMENTS, NAMES, WORN
 
-    worn = np.isin(lab, [i + 1 for i in range(len(GARMENTS))])
+    worn = np.isin(lab, [NAMES.index(g) + 1 for g in WORN])
     if neck_rows is not None and "skin" in NAMES:
         rows_ = np.arange(lab.shape[0])[:, None]
         worn |= (lab == NAMES.index("skin") + 1) & (rows_ >= neck_rows[0]) & (rows_ <= neck_rows[1])
@@ -1086,7 +1093,7 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
     from scipy.ndimage import binary_fill_holes, binary_opening, label as cc_label
 
     from . import silhouette_relief as sr
-    from .clothes import GARMENTS, NAMES
+    from .clothes import GARMENTS, NAMES, WORN
 
     shape = lab.shape
     near, _ = _raster_front(V, F, shape)
@@ -1102,7 +1109,7 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
     disk = np.hypot(*np.mgrid[-r:r + 1, -r:r + 1]) <= r
     from .study import _OUTER
 
-    names = [g for g in dict.fromkeys(list(GARMENTS) + ["belt", "watch", "bracelet"]) if g in NAMES]
+    names = [g for g in dict.fromkeys(list(WORN) + ["belt", "watch", "bracelet"]) if g in NAMES]
     rows_ = np.arange(shape[0])[:, None]
     neck_skin = (lab == NAMES.index("skin") + 1) & ((rows_ >= neck_rows[0]) & (rows_ <= neck_rows[1]) if neck_rows else False)
     for g in names:
@@ -1113,10 +1120,13 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
         clear = _over_neighbour(np.where(have, rest, 0.0), own, inner & have, _POP_SPAN * ppm,
                                 np.where(own, np.maximum(lift, _PIECE_MIN_H * ppm), 0.0))
         lift_g = np.minimum(np.maximum(lift, clear), _POP_MAX * ppm)  # (clearing a raised arm beside it, a piece climbed 3 cm)
-        reg = own & have & (lift_g * facing > _PIECE_MIN_H * ppm)
+        reg = own & have & (lift_g * facing > _PIECE_MIN_H * ppm) & (facing > _PIECE_MIN_FACING)
         if reg.sum() < 20:
             continue
         reg = binary_opening(binary_fill_holes(reg), structure=disk)
+        # (its outline smoothed: the photo's label edge is a pixel staircase
+        # that read as a row of steps along a lapel or a tie)
+        reg = gaussian_filter(reg.astype(np.float64), _PIECE_EDGE_SMOOTH * ppm) > 0.5
         comps, n = cc_label(reg)
         for k in range(1, n + 1):
             P = comps == k
@@ -1126,8 +1136,8 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
             front = rest + h
             back = rest - _PIECE_SINK * ppm
             h0 = float(back[P].min()) - 3.0
-            zs = np.arange(0.0, float(front[P].max()) - h0 + 3.0, 1.0)
-            piece = sr._layer_solid(front - h0, back - h0, P, zs, 1.0, 1.0, True)
+            zs = np.arange(0.0, float(front[P].max()) - h0 + 3.0, _PIECE_DZ)  # (finer than a pixel: on a turning surface whole-pixel layers showed as terraces)
+            piece = sr._layer_solid(front - h0, back - h0, P, zs, _PIECE_DZ, 1.0, True)
             if piece is None:
                 continue
             pv, pf = piece
@@ -1501,7 +1511,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             dn_fine = dn - sr._masked_blur(dn, cov, max(_JACKET_DETAIL * max(shape), 1.0))
             dn = dn - sr._masked_blur(dn, cov, max(0.05 * max(shape), 1.0))  # fine detail only: the body has the big shapes
             if clothes:
-                from .clothes import GARMENTS, NAMES
+                from .clothes import GARMENTS, NAMES, WORN
 
                 # on the clothes, their folds, seams and creases deepened so
                 # they show on a figure; under a jacket finer still (its
@@ -1509,7 +1519,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
                 # the estimate sees through it)
                 jk = gaussian_filter(np.isin(clothes["labels"], [NAMES.index(g) + 1 for g in _STIFF if g in NAMES]).astype(np.float64), 3.0) \
                     if stiff else np.zeros(shape)
-                gm = gaussian_filter(np.isin(clothes["labels"], [i + 1 for i in range(len(GARMENTS))]).astype(np.float64), 3.0)
+                gm = gaussian_filter(np.isin(clothes["labels"], [NAMES.index(g) + 1 for g in WORN]).astype(np.float64), 3.0)
                 dn = (1.0 + (_POP_FINE - 1.0) * gm) * (jk * dn_fine + (1.0 - jk) * dn)
             half = np.where(cov, (far - near) / 2.0, 0.0)
             # (as big as cloth's detail is -- folds, lapels, seams: scaled by
@@ -1542,12 +1552,12 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     if clothes and "torso" in names:
         from scipy.ndimage import binary_erosion, grey_closing
 
-        from .clothes import GARMENTS, NAMES as CNAMES
+        from .clothes import GARMENTS, WORN, NAMES as CNAMES
 
         Ft = F[(part_w[:, names.index("torso")][F] > 0.5).all(axis=1)]
         nt, _ = _raster_front(V, Ft, shape)
         on_t = np.isfinite(nt) & cov & (np.abs(nt - np.where(cov, near, np.inf)) < 1.5)  # (the torso is what the camera sees there)
-        worn = binary_erosion(np.isin(clothes["labels"], [CNAMES.index(g) + 1 for g in GARMENTS]) & on_t,
+        worn = binary_erosion(np.isin(clothes["labels"], [CNAMES.index(g) + 1 for g in WORN]) & on_t,
                               iterations=int(max(0.02 * ppm, 1)))
         if worn.sum() > 200:
             h_new = gaussian_filter(np.where(on_t, -nt + offset, float(np.nanmin(np.where(on_t, -nt, np.nan)))), _HOLLOW_SCALE * ppm)  # (the folds kept)

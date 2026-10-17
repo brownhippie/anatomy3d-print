@@ -80,6 +80,8 @@ TEMPLATES = [
 
 
 _RESCUE_ANIMAL_MIN = 0.15  # forced layer rescue only where the photo is at least this much an animal
+GARMENT_EDGE_W = 0.4  # score points per % of the photo's garment-over-garment edges standing as a step on the model
+VERIFY_GARMENT_EDGES = 60.0  # a build is verified when at least this share of them do (and it is sealed, walls a print holds)
 VERIFY_CLOTHES_PCT = 50.0  # a build is verified when it shows at least this share of the photo's garment-over-garment boundaries the right way round
 CODE_PRODUCTION = "O-" + "0" * len(FAMILIES["O"]["dims"])  # option 0 everywhere: what Generate builds
 
@@ -575,6 +577,18 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
         s += max(0.0, 30.0 - m["face_err_pct"])
     if m["photo_detail"] is not None:
         s += PHOTO_DETAIL_W * m["photo_detail"]
+    # the clothes as the photo shows them: how much of each garment-over-
+    # garment edge (lapel, jacket front, tie, collar) stands as a step
+    try:
+        from .study import garment_edges
+
+        ge = garment_edges(preview, floor, inputs)
+    except Exception:  # noqa: BLE001 - no garment edges to judge on
+        ge = {}
+    m["garment_edges"] = ge.get("garment_edges")
+    m["garment_step_mm"] = ge.get("garment_step_mm")
+    if m["garment_edges"] is not None:
+        s += GARMENT_EDGE_W * m["garment_edges"]
     m["score"] = round(s, 1)
     # verified: a closed solid, walls a print holds, and the clothes the
     # photo shows recognised on it -- where the photo has one garment over
@@ -588,7 +602,7 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
     except Exception:  # noqa: BLE001 - no clothes boundaries to judge on
         m["clothes_pct"] = None
     m["verified"] = bool(m["watertight"] and m["min_wall_mm"] >= 0.8
-                         and (m["clothes_pct"] is None or m["clothes_pct"] >= VERIFY_CLOTHES_PCT))
+                         and (m["garment_edges"] is None or m["garment_edges"] >= VERIFY_GARMENT_EDGES))
     try:
         params = _parameters(m, inputs, preview, floor, sil, got, head)
         m["params"] = {k: v for k, v in params.items()}
@@ -926,5 +940,6 @@ def _parameters(m: dict, inputs: "LabInputs", preview: trimesh.Trimesh, floor: f
 SCORE_FORMULA = (
     "score = shape match % − 4 × spikes % − 25 if not sealed − 20 if thinnest wall < 0.8 mm "
     "+ (30 − face error %) when a face is found + photo detail (how much of the whole photo -- clothes, "
-    "hair, face, hands -- the model's surface carries inside its outline)"
+    "hair, face, hands -- the model's surface carries inside its outline) + 0.4 × garment edges % (how much of "
+    "the photo's lapel, jacket-front, tie and collar edges stand as a step on the model)"
 )

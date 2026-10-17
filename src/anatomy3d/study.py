@@ -201,6 +201,7 @@ _OUTER = {
     "scarf": ("shirt", "tshirt", "sweater", "jacket", "suit", "coat", "dress", "hoodie", "kimono"),
     "belt": ("trousers", "jeans", "skirt", "dress", "shorts", "kimono"),
     "collar": ("neck",),
+    "lapel": ("suit", "jacket", "coat", "shirt", "tshirt", "tie", "sweater"),
     "hair": ("forehead",), "earring": ("hair", "neck", "face"),
     "hand": _ALL_WORN, "gloves": _ALL_WORN + ("wrist",), "watch": ("wrist",), "bracelet": ("wrist",),
     "necklace": ("neck", "shirt", "tshirt", "dress", "sweater", "kimono"),
@@ -219,13 +220,13 @@ def _codes(inputs: "lab.LabInputs", H: int, W: int):
     from .clothes import GARMENTS, NAMES
     from .head_parts import FACE_SKIN, GLASSES, HAIR, HAT, MASK
 
-    names = ["", "hat", "hair", "face", "glasses", "mask", "neck", "collar", "forehead", "earring", "hand", "wrist"] + list(GARMENTS)
+    names = ["", "hat", "hair", "face", "glasses", "mask", "neck", "collar", "forehead", "earring", "hand", "wrist"] + list(GARMENTS) + ["lapel"]
     code = np.zeros((H, W), np.uint8)
     parts = inputs.parts or {}
     cl = parts.get("clothes")
     if cl:
         for i, k in enumerate(NAMES):
-            if k in GARMENTS:
+            if k in GARMENTS or k in ("collar", "lapel"):
                 code[cl["labels"] == i + 1] = names.index(k)
         if inputs.face_mesh is not None:
             fm = np.asarray(inputs.face_mesh)
@@ -319,6 +320,64 @@ def layering(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") ->
     if total < 20:
         return {}
     return {"layering": round(100.0 * hits / total, 1), "layering_n": total}
+
+
+GARMENT_STEP_MM = 0.5  # a garment's edge shows on the model when it stands at least this far over what is beside it
+_GARMENT_CODES = ("jacket", "suit", "coat", "tie", "sweater", "hoodie", "scarf", "belt", "collar", "lapel", "shirt", "tshirt",
+                  "dress", "kimono", "neck", "trousers", "jeans", "skirt")
+
+
+def garment_edges(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
+    """Where the photo shows one garment over another -- a lapel over the
+    jacket, the jacket's edge over the shirt and the tie, the tie over the
+    shirt, the collar round the neck -- how much of that edge stands as a
+    step on the model (% of edge points with the outer one at least
+    GARMENT_STEP_MM in front), and the median step (mm). Each side's
+    surface is taken a little way off the edge and carried on to it along
+    its own slope, so a step a pixel or two from where the photo draws the
+    line still counts and a slope alone doesn't. Hands, hair and the face
+    are left to layering."""
+    from scipy.ndimage import zoom
+
+    H, W = inputs.photo_mask.shape
+    code, names = _codes(inputs, H, W)
+    pairs = np.zeros((len(names), len(names)), bool)
+    for a, inner in _OUTER.items():
+        for b in inner:
+            if a in names and b in names and a in _GARMENT_CODES and b in _GARMENT_CODES:
+                pairs[names.index(a), names.index(b)] = True
+    ys, xs = np.nonzero(inputs.photo_mask)
+    box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    z, have, k = front_in_photo(preview, floor, inputs, box)
+    z = np.where(np.isfinite(z), z, np.nan)
+    o = code[box[1]:box[3], box[0]:box[2]]
+    o = zoom(o, (z.shape[0] / o.shape[0], z.shape[1] / o.shape[1]), order=0)[: z.shape[0], : z.shape[1]]
+    h_, w_ = min(o.shape[0], z.shape[0]), min(o.shape[1], z.shape[1])
+    o, z = o[:h_, :w_], z[:h_, :w_]
+    P = 10
+    zp = np.pad(z, P, constant_values=np.nan)
+    op = np.pad(o, P, constant_values=0)
+    steps = []
+    with np.errstate(invalid="ignore"):
+        for dy, dx in ((0, 1), (1, 0)):
+            def sh(a, k):
+                return np.roll(np.roll(a, -k * dy, axis=0), -k * dx, axis=1)
+
+            A, B = op, sh(op, 1)
+            a_near = (sh(zp, -2) + sh(zp, -3)) / 2.0
+            a_far = (sh(zp, -5) + sh(zp, -6)) / 2.0
+            b_near = (sh(zp, 3) + sh(zp, 4)) / 2.0
+            b_far = (sh(zp, 6) + sh(zp, 7)) / 2.0
+            a_e = np.where(np.isfinite(a_far), a_near + (a_near - a_far) * (2.5 / 3.5), a_near)
+            b_e = np.where(np.isfinite(b_far), b_near + (b_near - b_far) * (2.5 / 3.5), b_near)
+            ok = np.isfinite(a_e) & np.isfinite(b_e)
+            steps.append((a_e - b_e)[pairs[A, B] & ok])
+            steps.append((b_e - a_e)[pairs[B, A] & ok])
+    s = np.concatenate(steps) if steps else np.zeros(0)
+    if len(s) < 20:
+        return {}
+    return {"garment_edges": round(100.0 * float((s >= GARMENT_STEP_MM).mean()), 1),
+            "garment_step_mm": round(float(np.median(s)), 2), "garment_edges_n": int(len(s))}
 
 
 def ears_fit(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") -> dict:
