@@ -34,7 +34,8 @@ class Knob:
 
 _SR, _BR, _BF = "silhouette_relief", "body_reference", "body_first"
 # (Some ranges start above what the study could otherwise reach: the clothes'
-# steps, the tie, the eyebrows, the irises, the hairline and the hair's layer
+# steps, the tie, the eyebrows, the eyes (their set-back, iris, lid rim and
+# crease), the hairline and the hair's layer
 # are kept at least as they show on a figure -- tuning only for the score, the
 # study took them down to nothing, undoing what was asked of the figure. A
 # tuned value below a floor is raised to it when applied.)
@@ -115,13 +116,13 @@ KNOBS = [
     Knob(_BR, "_STRETCH_PRIOR", 0.01, 0.3, "bones", "how hard bone lengths hold to the reference's (cost per unit)"),
     Knob(_BR, "_STRETCH_RANGE", 0.05, 0.25, "bones", "most a bone may lengthen or shorten (share)"),
     # each part of the face
-    Knob(_SR, "_EYE_INSET", 0.0, 0.004, "face parts", "an open eye's ball sits this far behind its lids (m)"),
-    Knob(_SR, "_IRIS_DEPTH", 0.0003, 0.0012, "face parts", "the iris carved this deep (m)"),
-    Knob(_SR, "_LID_RIM", 0.0, 0.0015, "face parts", "the upper eyelid's rim stands this proud (m)"),
+    Knob(_SR, "_EYE_INSET", 0.0015, 0.005, "face parts", "an open eye's ball sits this far behind its lids (m)"),
+    Knob(_SR, "_IRIS_DEPTH", 0.001, 0.003, "face parts", "the iris carved this deep (m)"),
+    Knob(_SR, "_LID_RIM", 0.0008, 0.0025, "face parts", "the upper eyelid's rim stands this proud (m)"),
     Knob(_SR, "_LIP_FULL", 0.0, 0.004, "face parts", "the lips' fullness, a dome over their outline (m)"),
     Knob(_SR, "_CHIN_PROUD", 0.0, 0.005, "face parts", "the chin's pad stands this proud (m)"),
-    Knob(_SR, "_LID_CREASE", 0.0, 0.0015, "face parts", "the crease above the upper lid (m)"),
-    Knob(_SR, "_LID_LINE", 0.0, 0.0012, "face parts", "a closed eye's lid line (m)"),
+    Knob(_SR, "_LID_CREASE", 0.0008, 0.0025, "face parts", "the crease above the upper lid (m)"),
+    Knob(_SR, "_LID_LINE", 0.0006, 0.002, "face parts", "a closed eye's lid line (m)"),
     Knob(_SR, "_BROW_HEIGHT", 0.0025, 0.006, "face parts", "eyebrows stand this proud (m, shown up for a figure)"),
     Knob(_SR, "_BROW_GRAIN", 0.0, 0.6, "face parts", "the brows' hair grain, this deep (share of their height)"),
     Knob(_SR, "_NOSTRIL_DEPTH", 0.0, 0.006, "face parts", "a nostril's hollow (m)"),

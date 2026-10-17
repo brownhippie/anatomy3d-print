@@ -872,10 +872,10 @@ _HAIRLINE_EDGE = 0.004  # the pattern ends over this at the hairline
 _PARTING_DEPTH = 0.0015  # a parting's groove
 # Each part of the face, read from the photo (face_parts.py) and shaped by
 # _face_parts_relief, metres on the person:
-_EYE_INSET = 0.0015  # an open eye's ball sits this far behind its lids, rounding up to them
-_IRIS_DEPTH = 0.0004  # the iris, carved this shallow (a sculptor's eye)
-_LID_CREASE = 0.0006  # the crease above the upper lid
-_LID_LINE = 0.0005  # a closed eye's lid line
+_EYE_INSET = 0.0025  # an open eye's ball sits this far behind its lids, rounding up to them (shown up for a figure)
+_IRIS_DEPTH = 0.0015  # the iris, carved this deep (a sculptor's eye; 0.4 mm read as nothing on a figure)
+_LID_CREASE = 0.0012  # the crease above the upper lid
+_LID_LINE = 0.001  # a closed eye's lid line
 _BROW_HEIGHT = 0.003  # eyebrow hair stands this proud (shown up: ~1 mm on a person reads as nothing on a figure)
 _BROW_GRAIN = 0.35  # ... with a hair grain this deep (share of its height)
 _BROW_GRAIN_STEP = 0.0015  # ... this far apart (m)
@@ -883,7 +883,7 @@ _BROW_GRAIN_ANGLE = 25.0  # ... the hairs running this many degrees up off the b
 _NOSTRIL_DEPTH = 0.003  # a nostril's hollow
 _LIP_RIM = 0.0004  # the lips' edge stands this proud
 _LIP_FULL = 0.0  # the lips' own fullness, a dome over their outline (a study sets it)
-_LID_RIM = 0.0  # the upper eyelid's rim over the eyeball (a study sets it)
+_LID_RIM = 0.0012  # the upper eyelid's rim over the eyeball (none, the eye's opening had no edge on a figure)
 _CHIN_PROUD = 0.0  # the chin's pad, with half as deep a groove above it (a study sets it)
 _MOUTH_LINE = 0.0008  # a closed mouth's line between the lips
 _MOUTH_DEPTH = 0.008  # an open mouth's dark, this far in

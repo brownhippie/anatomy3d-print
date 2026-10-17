@@ -295,14 +295,26 @@ def layering(preview: trimesh.Trimesh, floor: float, inputs: "lab.LabInputs") ->
     hits, total = 0, 0
     h_, w_ = min(o.shape[0], z.shape[0]), min(o.shape[1], z.shape[1])
     o, z = o[:h_, :w_], z[:h_, :w_]
+    # the step itself, not the slope: each side's surface carried on across
+    # the boundary (from the point a further step back) and compared with the
+    # other side where it is -- straight across a sloped forehead or neck the
+    # slope alone outweighed a real step
+    zp = np.pad(z, 4, constant_values=np.nan)
+    op = np.pad(o, 4, constant_values=0)
     for dy, dx in ((0, 2), (2, 0), (2, 2), (2, -2)):
-        ya, yb = slice(0, h_ - dy), slice(dy, h_)
-        xa, xb = (slice(0, w_ - dx), slice(dx, w_)) if dx >= 0 else (slice(-dx, w_), slice(0, w_ + dx))
-        A, B, ZA, ZB = o[ya, xa], o[yb, xb], z[ya, xa], z[yb, xb]
-        ok = np.isfinite(ZA) & np.isfinite(ZB)
+        H2, W2 = zp.shape
+
+        def sh(a, k):  # a moved by k steps of (dy, dx), same shape
+            return np.roll(np.roll(a, -k * dy, axis=0), -k * dx, axis=1)
+
+        A, B = op, sh(op, 1)
+        ZA, ZB, ZA0, ZB1 = zp, sh(zp, 1), sh(zp, -1), sh(zp, 2)
+        a_at_b = 2.0 * ZA - ZA0  # A's surface carried on to where B is
+        b_at_a = 2.0 * ZB - ZB1  # B's carried back to where A is
+        ok = np.isfinite(ZA) & np.isfinite(ZB) & np.isfinite(ZA0) & np.isfinite(ZB1)
         a_over = pairs[A, B] & ok
         b_over = pairs[B, A] & ok
-        hits += int((a_over & (ZA - ZB >= LAYER_MIN_MM)).sum() + (b_over & (ZB - ZA >= LAYER_MIN_MM)).sum())
+        hits += int((a_over & (a_at_b - ZB >= LAYER_MIN_MM)).sum() + (b_over & (b_at_a - ZA >= LAYER_MIN_MM)).sum())
         total += int(a_over.sum() + b_over.sum())
     if total < 20:
         return {}
