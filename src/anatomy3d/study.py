@@ -54,7 +54,7 @@ OVERHANG_W = 0.05  # % of the surface facing steeply down
 EAR_W = 0.2  # the ears' reach beside the head off the photo's, % of the face's width
 NAPE_W = 1.0  # the back of the neck's bumps, %
 FIT_W = 0.5  # the posed body's joints (and bone lengths) on the photo's: its miss, % of the shoulders' width
-LAYER_W = 0.05  # overlaps kept: what lies over what in the photo is in front on the model (0..100)
+LAYER_W = 0.3  # overlaps kept: what lies over what in the photo is in front on the model (0..100; the clothes recognised on it -- at 0.05 the study traded them away)
 OPEN_W = 20.0  # mouth and eyes as open as in the photo (lid / lip gap over width)
 BUMP_MM = 0.4  # bumps: % of the surface standing off its smoothed copy by more than this
 OBJECTIVE = (f"study score = Lab score + {HELD_W} × held mean − {BUMP_W} × bumps "

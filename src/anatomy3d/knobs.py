@@ -33,12 +33,17 @@ class Knob:
 
 
 _SR, _BR, _BF = "silhouette_relief", "body_reference", "body_first"
+# (Some ranges start above what the study could otherwise reach: the clothes'
+# steps, the tie, the eyebrows, the irises, the hairline and the hair's layer
+# are kept at least as they show on a figure -- tuning only for the score, the
+# study took them down to nothing, undoing what was asked of the figure. A
+# tuned value below a floor is raised to it when applied.)
 KNOBS = [
     # hair
     Knob(_SR, "_HAIR_SHELL_MAX", 0.03, 0.07, "hair", "thickest hair lying round the skull (m)"),
     Knob(_SR, "_HAIR_FEATHER", 0.003, 0.012, "hair", "hair over skin feathers out over this (m)"),
     Knob(_SR, "_HAIR_SMOOTH", 0.002, 0.008, "hair", "hair and hat surfaces smoothed across their edges (m)"),
-    Knob(_SR, "_HAIR_SHORT", 0.0, 0.008, "hair", "short hair stands at least this proud of the scalp in front (m)"),
+    Knob(_SR, "_HAIR_SHORT", 0.003, 0.008, "hair", "short hair stands at least this proud of the scalp in front (m)"),
     Knob(_SR, "_HAIR_THIN", 0.006, 0.02, "hair", "hair thinner than this is the head's own outline (m)"),
     Knob(_SR, "_HAIR_FACE_MEET", 0.006, 0.02, "hair", "hair this near the face comes down to the cheek (m)"),
     Knob(_SR, "_HAIR_NECK_BEHIND", 0.003, 0.015, "hair", "hair beside the neck lies this far behind its front (m)"),
@@ -94,9 +99,9 @@ KNOBS = [
     Knob(_SR, "_LIMB_SOLIDS", 0, 1, "bones", "crossed forearms and hands on the body as solids of their own (1) or merged in (0)", integer=True),
     Knob(_SR, "_HAND_THICK", 0.02, 0.05, "bones", "a hand lying on the body stands this thick (m)"),
     Knob(_SR, "_LIMB_DETAIL", 0.0, 1.0, "bones", "share of the photo's detail (sleeve folds) carried onto a crossed forearm"),
-    Knob(_SR, "_CLOTH_LAYER", 0.0, 0.006, "clothes", "one garment layer's step over the one under it (m)"),
-    Knob(_SR, "_CLOTH_STEP_SPAN", 0.006, 0.04, "clothes", "the step eases back over this (m)"),
-    Knob(_SR, "_TIE_THICK", 0.0, 0.005, "clothes", "a tie stands this proud of the shirt (m)"),
+    Knob(_SR, "_CLOTH_LAYER", 0.0025, 0.006, "clothes", "one garment layer's step over the one under it (m)"),
+    Knob(_SR, "_CLOTH_STEP_SPAN", 0.012, 0.04, "clothes", "the step eases back over this (m)"),
+    Knob(_SR, "_TIE_THICK", 0.002, 0.005, "clothes", "a tie stands this proud of the shirt (m)"),
     Knob(_SR, "_BELT_THICK", 0.0, 0.005, "clothes", "a belt stands this proud (m)"),
     Knob(_SR, "_WATCH_THICK", 0.002, 0.012, "clothes", "a watch stands this proud of the wrist (m)"),
     Knob(_SR, "_BRACELET_THICK", 0.001, 0.006, "clothes", "a bracelet stands this proud of the wrist (m)"),
@@ -111,13 +116,13 @@ KNOBS = [
     Knob(_BR, "_STRETCH_RANGE", 0.05, 0.25, "bones", "most a bone may lengthen or shorten (share)"),
     # each part of the face
     Knob(_SR, "_EYE_INSET", 0.0, 0.004, "face parts", "an open eye's ball sits this far behind its lids (m)"),
-    Knob(_SR, "_IRIS_DEPTH", 0.0, 0.0012, "face parts", "the iris carved this deep (m)"),
+    Knob(_SR, "_IRIS_DEPTH", 0.0003, 0.0012, "face parts", "the iris carved this deep (m)"),
     Knob(_SR, "_LID_RIM", 0.0, 0.0015, "face parts", "the upper eyelid's rim stands this proud (m)"),
     Knob(_SR, "_LIP_FULL", 0.0, 0.004, "face parts", "the lips' fullness, a dome over their outline (m)"),
     Knob(_SR, "_CHIN_PROUD", 0.0, 0.005, "face parts", "the chin's pad stands this proud (m)"),
     Knob(_SR, "_LID_CREASE", 0.0, 0.0015, "face parts", "the crease above the upper lid (m)"),
     Knob(_SR, "_LID_LINE", 0.0, 0.0012, "face parts", "a closed eye's lid line (m)"),
-    Knob(_SR, "_BROW_HEIGHT", 0.001, 0.006, "face parts", "eyebrows stand this proud (m, shown up for a figure)"),
+    Knob(_SR, "_BROW_HEIGHT", 0.0025, 0.006, "face parts", "eyebrows stand this proud (m, shown up for a figure)"),
     Knob(_SR, "_BROW_GRAIN", 0.0, 0.6, "face parts", "the brows' hair grain, this deep (share of their height)"),
     Knob(_SR, "_NOSTRIL_DEPTH", 0.0, 0.006, "face parts", "a nostril's hollow (m)"),
     Knob(_SR, "_LIP_RIM", 0.0, 0.001, "face parts", "the lips' edge stands this proud (m)"),
@@ -130,14 +135,14 @@ KNOBS = [
     Knob(_SR, "_STUBBLE_DEPTH", 0.0, 0.0008, "face parts", "stubble's grain (m)"),
     # body first: the tailoring of the clothes, their detail, the hands
     Knob(_BF, "_FIT_FRONT", 0.2, 0.6, "tailoring", "a garment's front stands off the layer under it by this share of its room at the sides"),
-    Knob(_BF, "_FIT_SHOW", 1.0, 2.5, "tailoring", "cloth's thickness shown up this much on a figure"),
-    Knob(_BF, "_POP_SPAN", 0.03, 0.08, "tailoring", "a piece stands over the lowest layer within this far, as a whole (m)"),
+    Knob(_BF, "_FIT_SHOW", 1.3, 2.5, "tailoring", "cloth's thickness shown up this much on a figure"),
+    Knob(_BF, "_POP_SPAN", 0.04, 0.08, "tailoring", "a piece stands over the lowest layer within this far, as a whole (m)"),
     Knob(_BF, "_POP_BEVEL", 0.0005, 0.003, "tailoring", "a piece's edge softened over this (m)"),
     Knob(_BF, "_BUST_DRAPE", 0.12, 0.3, "tailoring", "a bust under a jacket: the cloth spans it as a ball this size (m)"),
     Knob(_BF, "_CLOTH_HANG", 0.05, 0.2, "tailoring", "down the back cloth comes in at most this much per unit it falls"),
     Knob(_BF, "_POP_FINE", 1.0, 2.2, "body first", "the clothes' folds, seams and creases deepened this much"),
     Knob(_BF, "_DETAIL_MAX", 0.004, 0.012, "body first", "the photo's depth detail stands at most about this far (m)"),
-    Knob(_BF, "_HAIR_LAYER", 0.003, 0.008, "body first", "short hair's layer over the scalp (m)"),
+    Knob(_BF, "_HAIR_LAYER", 0.0045, 0.008, "body first", "short hair's layer over the scalp (m)"),
     Knob(_BF, "_HAND_THICK_RATIO", 0.28, 0.42, "body first", "a palm is this thick for its breadth"),
     # face
     Knob(_SR, "_FACE_RELIEF_FADE_FRAC", 0.1, 0.3, "face", "face detail fades out over this share of the face"),
