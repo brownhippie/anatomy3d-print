@@ -197,6 +197,20 @@ def _work_one(run_id: str) -> bool:
     return True
 
 
+def _release_memory() -> None:
+    """Give freed memory back to the system after each job: a build peaks near
+    2 GB in large numpy arrays, and without this the process kept what it had
+    freed until the service ran out (8 GB) and was restarted mid-run."""
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def _worker_loop() -> None:
     turn = 0
     while True:
@@ -206,17 +220,20 @@ def _worker_loop() -> None:
             housekeeping()
             sid = study_api.active()
             if sid is None and study_api.autopilot_step(_generation_lock):
+                _release_memory()
                 continue
             run_id = _active_run()
             if sid and (run_id is None or turn % 3):  # a running study gets two turns to a run's one
                 run_id = None
                 study_api.work_one(sid, _generation_lock)
+                _release_memory()
                 time.sleep(0.3)
                 continue
             if run_id is None:
                 time.sleep(3)
                 continue
             _work_one(run_id)
+            _release_memory()
             time.sleep(0.3)  # let a person's own Generate take the lock between combinations
         except Exception as exc:  # noqa: BLE001 - keep the worker alive whatever happens
             print(f"Lab worker error on {run_id or 'a study'}: {exc}")
