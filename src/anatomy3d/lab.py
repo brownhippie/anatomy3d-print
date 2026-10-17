@@ -768,7 +768,7 @@ def _centre_depth(mesh: trimesh.Trimesh, y: float, x_mid: float, half_band: floa
     return float(np.ptp(pts[near, 2])) if near.sum() >= 2 else None
 
 
-def _depth_ratio(mesh: trimesh.Trimesh, y: float, x_mid: float) -> Optional[float]:
+def _loop_at(mesh: trimesh.Trimesh, y: float, x_mid: float):
     sec = mesh.section(plane_origin=[0.0, y, 0.0], plane_normal=[0.0, 1.0, 0.0])
     if sec is None:
         return None
@@ -779,7 +779,27 @@ def _depth_ratio(mesh: trimesh.Trimesh, y: float, x_mid: float) -> Optional[floa
             area = (x1 - x0) * np.ptp(loop[:, 2])
             if best is None or area > best[0]:
                 best = (area, x1 - x0, float(np.ptp(loop[:, 2])))
-    return best[2] / best[1] if best and best[1] > 1e-6 else None
+    return best
+
+
+def _depth_ratio(mesh: trimesh.Trimesh, y: float, x_mid: float) -> Optional[float]:
+    """Head length over breadth as the human figure's are measured: length
+    the deepest front to back from the brows (the eyes' level, y) up, breadth
+    the widest across above the ears (the upper half from the eyes to the
+    crown, where the ears don't reach)."""
+    top = float(mesh.vertices[:, 1].max())
+    if top <= y:
+        return None
+    length, breadth = 0.0, 0.0
+    for t in np.linspace(0.0, 0.85, 12):
+        b = _loop_at(mesh, y + t * (top - y), x_mid)
+        if b is None:
+            continue
+        if t <= 0.5:
+            length = max(length, b[2])
+        if t >= 0.4:
+            breadth = max(breadth, b[1])
+    return length / breadth if breadth > 1e-6 and length > 0 else None
 
 
 _sface = {}

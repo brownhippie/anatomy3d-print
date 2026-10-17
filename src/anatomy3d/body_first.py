@@ -422,17 +422,25 @@ def plan_four_sides(V, F, part_w, names, inputs, ref):
             plan["torso_lean"] = round(float((hip_z - sh_z) / sw), 3)
     if "head" in names and inputs.face_mesh is not None:
         fm = np.asarray(inputs.face_mesh)
+        # measured the way the human figure's are: breadth the widest across
+        # the head above the ears (the ears and the head's sides beside them
+        # left out of it), length the deepest front to back from the brows up
         ear_w = ref.get("ear_w")
-        no_ear = np.ones(len(V), bool) if ear_w is None else np.asarray(ear_w).max(axis=1) < 0.05
-        head_f = ((dom[F] == names.index("head")) & no_ear[F]).all(axis=1)
-        if head_f.sum() > 50:
+        ear = None if ear_w is None else np.asarray(ear_w).max(axis=1) > 0.5
+        head_f = (dom[F] == names.index("head")).all(axis=1)
+        r_ = int(round((fm[33, 1] + fm[263, 1]) / 2.0))  # the eyes' row (glabella level)
+        if head_f.sum() > 50 and 0 <= r_ < shape[0]:
             hn, hf = _raster_front(V, F[head_f], shape)
-            r_ = int(round((fm[33, 1] + fm[263, 1]) / 2.0))  # the eyes' row (glabella level)
-            if 0 <= r_ < shape[0]:
-                row_ok = np.isfinite(hn[r_]) & np.isfinite(hf[r_])
-                if row_ok.sum() > 4:
-                    breadth = float(np.ptp(np.flatnonzero(row_ok)))
-                    length = float(np.max((hf[r_] - hn[r_])[row_ok]))
+            both = np.isfinite(hn) & np.isfinite(hf)
+            rows = np.flatnonzero(both.any(axis=1))
+            if len(rows) and rows[0] < r_:
+                top = int(rows[0])
+                ear_top = int(V[ear, 1].min()) - 2 if ear is not None and ear.any() else int(top + 0.6 * (r_ - top))
+                ear_top = int(np.clip(ear_top, top + 2, r_))
+                wid = [float(np.ptp(np.flatnonzero(both[r]))) for r in range(top, ear_top) if both[r].sum() > 4]
+                thick = np.where(both[top:r_ + 1], (hf - hn)[top:r_ + 1], -np.inf).max()
+                if wid and np.isfinite(thick):
+                    breadth, length = max(wid), float(thick)
                     plan["sections"]["head"] = {"length_over_breadth": round(length / max(breadth, 1e-6), 3), "human": _ANSUR["head"]}
 
     # correct each section's depth toward the human figure, about its own
