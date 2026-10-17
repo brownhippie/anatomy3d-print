@@ -52,7 +52,10 @@ _FIT_TIE = (4.0, 11.0)  # a tie's width, cm
 _FIT_FRONT = 0.35  # the front stands off the layer under it by this share of the room at the sides (cloth lies on the chest)
 _FIT_THICK = {"inner": 0.0015, "outer": 0.003, "tie": 0.004, "collar": 0.004, "lapel": 0.004}  # the cloth's own thickness, m (a tie's knot and lining more)
 _FIT_SHOW = 1.6  # ... shown up this much on a figure (on a person cloth keeps close; on a model the gap is what shows it)
-_HAIR_OVER_REACH = 0.02  # hair clears the forehead beside it, eased out over this far (m)
+_HAIR_EDGE_SHARE = 0.35  # short hair at its hairline: this share of its layer ...
+_HAIRLINE_TAPER = 0.01  # ... the full layer this far in (m)
+_HAIR_SEAM_SMOOTH = 4  # the layer eased across where the front view stops seeing the scalp (mesh steps)
+_HAIR_NORMAL_SMOOTH = 6  # ... and laid along the surface's direction smoothed this much (mesh steps)
 _PIECE_MIN_H = 0.0008  # a garment piece: where it stands at least this over what is under it (m)
 _PIECE_MIN_W = 0.006  # ... nothing of it narrower than this (m)
 _PIECE_MIN_AREA = 0.0002  # ... at least this big (m^2: 2 cm^2)
@@ -1566,17 +1569,10 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             # from the camera, and filled to the limit itself it fell short)
             dig = (grey_closing(h_new, size=(k, k)) - h_new) - 0.5 * _CHK_CLOTH_HOLLOW_MM / 1000.0 * ppm
             offset = offset + np.where(worn & (dig > 0), dig, 0.0)
-    if labels is not None and fm is not None:
-        from .head_parts import FACE_SKIN as _FS2, HAIR as _HR, HAT as _HT
-
-        # hair lies over the forehead: where they meet, its face at least the
-        # hair's layer in front of the forehead's actual surface (sculpted,
-        # the forehead had come out in front of the hairline)
-        brow_y = float(np.asarray(fm)[[105, 334], 1].mean())
-        rows_ = np.arange(shape[0])[:, None]
-        forehead = np.isin(labels, (_FS2,)) & cov & (rows_ < brow_y)
-        hair_px = np.isin(labels, (_HR, _HT)) & cov
-        offset = offset + _over_neighbour(front + offset, hair_px, forehead, _HAIR_OVER_REACH * ppm, sr._HAIR_SHORT * ppm)
+    # (no push of the hair toward the camera where it meets the forehead:
+    # moved toward the camera on a head turning away, it stood as a lip round
+    # the hairline that read as a hairband; the hair's layer is laid along
+    # the scalp below, thinning to its edge)
     nrm = trimesh.Trimesh(V, F, process=False).vertex_normals
     facing = np.clip((-nrm[:, 2] - _DETAIL_FACING[0]) / (_DETAIL_FACING[1] - _DETAIL_FACING[0]), 0.0, 1.0)
     px, py = V[:, 0], V[:, 1]
@@ -1593,12 +1589,39 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         # the hair's layer eased over a couple of vertices: no hairline, a
         # bare head) -- a layer over the scalp, out along it, not toward the
         # camera (faded as the surface turns, it was a millimetre)
-        hairy = gaussian_filter((np.isin(labels, (HAIR, HAT)) & cov).astype(np.float64), 1.0)
+        # (thinning toward the hairline as short hair does: a small step at
+        # its edge, the full layer a centimetre in -- not a band)
+        hmask = np.isin(labels, (HAIR, HAT)) & cov
+        hairy = gaussian_filter(np.where(hmask, np.clip(_HAIR_EDGE_SHARE + (1.0 - _HAIR_EDGE_SHARE) * distance_transform_edt(hmask)
+                                                         / (_HAIRLINE_TAPER * ppm), 0.0, 1.0), 0.0), 1.0)
         # (short hair only: longer hair's own volume is the outline's growth
         # -- pushed out along it too, its folds stood out as spikes)
         if hairy.max() > 0.5 and (hair_read or {}).get("kind") not in _LONG_HAIR:
             hv = np.where(visible, map_coordinates(hairy, [py, px], order=1, mode="nearest"), 0.0)
-            V = V + (hv * sr._HAIR_SHORT * ppm)[:, None] * sr._vertex_normals(V, F)
+            # ... and over the scalp the front doesn't see (the crown, the
+            # back of the head above the nape): left bare there, the layer
+            # stopped where the front view does, a ridge over the top of the
+            # head from ear to ear that read as a hairband
+            if "head" in names:
+                head_w = part_w[:, names.index("head")]
+                fm_ = np.asarray(fm)
+                brow_y, nape_y = float(fm_[[105, 334], 1].mean()), float(fm_[2, 1])
+                hd = head_w > 0.5
+                if hd.any():
+                    zc = float(np.median(V[hd, 2]))
+                    zr = float(np.ptp(V[hd, 2]))
+                    scalp = hd & ~visible & (V[:, 1] < nape_y) & ((V[:, 1] < brow_y) | (V[:, 2] > zc + 0.15 * zr))
+                    # (thinning to the nape as to the front hairline)
+                    nape_t = np.clip((nape_y - V[:, 1]) / (_HAIRLINE_TAPER * ppm * 2.0), 0.0, 1.0)
+                    hv = np.where(scalp, _HAIR_EDGE_SHARE + (1.0 - _HAIR_EDGE_SHARE) * nape_t, hv)
+            lap_f = sr._mesh_laplacian(F, len(V))
+            hv = np.clip(sr._mesh_smooth(lap_f, hv, _HAIR_SEAM_SMOOTH), 0.0, 1.0)
+            # (along the surface's direction smoothed: along each vertex's own,
+            # noisy on the fine mesh, the step broke into shards)
+            nrm_h = sr._vertex_normals(V, F)
+            nrm_h = np.column_stack([sr._mesh_smooth(lap_f, nrm_h[:, j], _HAIR_NORMAL_SMOOTH) for j in range(3)])
+            nrm_h /= np.linalg.norm(nrm_h, axis=1, keepdims=True) + 1e-12
+            V = V + (hv * sr._HAIR_SHORT * ppm)[:, None] * nrm_h
     moved = np.linalg.norm(V - before["V"], axis=1)
     if labels is not None:
         lr = np.clip(np.rint(py).astype(int), 0, shape[0] - 1)
