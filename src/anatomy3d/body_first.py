@@ -624,6 +624,10 @@ _CHK_HAND_SW = (0.10, 0.40)  # a hand's breadth over the shoulders' width (a han
 _CHK_OUTLINE = 0.90  # the front's outline against the photo's (overlap)
 _CHK_SECTION = (0.85, 1.15)  # a section's depth for its width against the human figure's, after the plan
 _CHK_CLOTH_HOLLOW_MM = 6.0  # under clothes, no hollow deeper than this in the front (the body showing through)
+_PUPIL_DEPTH = 0.0015  # the pupil, drilled this much deeper than the iris round it (m), as a sculptor does
+_PUPIL_R = 0.5  # ... over this share of the iris's radius
+_IRIS_EDGE = 0.25  # the iris's and pupil's rims, steep over this share of their radius (a soft bowl read as a blank eye)
+_EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
 _EYE_DOME = 0.5  # an open eye's ball domes up to this share of its set-back in the middle
 _CHK_EYE_MM = 1.0  # an open eye sits at least this far behind the lids round it (mm, on the person)
 _CHK_BROW_MM = 1.0  # the eyebrows stand at least this far off the skin round them (mm, on the person)
@@ -1385,13 +1389,38 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float):
         ys_, xs_ = slice(max(by0, 0), min(by0 + h_, shape[0])), slice(max(bx0, 0), min(bx0 + w_, shape[1]))
         op[ys_, xs_] = mk[ys_.start - by0:ys_.stop - by0, xs_.start - bx0:xs_.stop - bx0]
         op &= have
+        # opened up for a figure: a smiling or narrowed eye's slit, at a
+        # figure's size, left no room for its iris to show -- its height
+        # taken _EYE_OPEN_SHOW times, over its own width only
+        if op.any():
+            gap = int(op.sum(axis=0).max())
+            k = max(int(round((_EYE_OPEN_SHOW - 1.0) * gap / 2.0)), 0)
+            if k:
+                cols = op.any(axis=0)
+                grown = binary_dilation(op, structure=np.ones((2 * k + 1, 1), dtype=bool))
+                op = grown & cols[None, :] & have
         lids = binary_dilation(op, iterations=max(int(0.003 * ppm), 2)) & ~op & have
         if op.sum() < 6 or lids.sum() < 6:
             continue
         d = distance_transform_edt(op)
         dome = np.sqrt(np.clip(d / max(float(d.max()), 1e-6), 0.0, 1.0))
         target = float(np.mean(surf[lids])) - sr._EYE_INSET * ppm * (1.0 - _EYE_DOME * dome)
-        off = np.where(op, np.clip(np.nan_to_num(surf) - target, 0.0, None), off)
+        # the iris and its pupil carved into the eyeball itself: pushed back
+        # onto a plain dome, the eye had been left blank (the iris carved
+        # earlier went with it)
+        if e.get("iris") is not None:
+            ys_o, xs_o = np.nonzero(op)
+            rr = np.hypot(xs_o - float(e["iris"][0]), ys_o - float(e["iris"][1]))
+            ri = max(float(e.get("iris_r_px") or 0.0), 1.0)
+            cut = np.zeros(shape)
+            cut[ys_o, xs_o] = (sr._IRIS_DEPTH * np.clip((1.0 - rr / ri) / _IRIS_EDGE, 0.0, 1.0)
+                               + _PUPIL_DEPTH * np.clip((1.0 - rr / (_PUPIL_R * ri)) / _IRIS_EDGE, 0.0, 1.0)) * ppm
+        else:
+            cut = 0.0
+        # the eyeball onto its dome, then the iris and pupil cut into it --
+        # on top of wherever the ball ends up, so a ball already sitting
+        # behind its dome still shows them
+        off = np.where(op, np.clip(np.nan_to_num(surf) - target, 0.0, None) + cut, off)
     if not off.any():
         return V
     off = gaussian_filter(off, 0.7)
