@@ -634,6 +634,9 @@ _EYE_ALIGN_MAX = 1.5  # a slit is the body's eye if its middle is within this ma
 _EYE_ALIGN_KEEP = 0.6  # a body's eye within this many of the photo's eye heights of it is the photo's: kept as it is
 _EYE_ALIGN_SPREAD = 1.0  # ... the face carried along with it out to about this many eye widths
 _EYE_CARRY = 0.006  # ... those within this of the skin (m) carried with it when it is carved
+_SLIT_LEFT = 0.0  # a body's eye slit squeezed to this share of its height
+_SLIT_EASE = 0.008  # ... the skin round it following, easing off over this (m)
+_BODY_EYE_SMOOTH = 8  # the closed slit's seam smoothed over this many rounds
 _BODY_EYE_KEEP = 0.02  # what's left of the socket's depth, pressed flat (its order kept: nothing folds over)
 _IRIS_EDGE = 0.12  # the iris's and pupil's rims, steep over this share of their radius (a soft funnel read as a blank eye)
 _EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
@@ -1422,6 +1425,46 @@ def _body_eyes_onto_photo(V, F, f, groove, near, have, ppm: float):
     return V
 
 
+def _squeeze_slits(V, groove, near, have, ppm: float):
+    """The body's eye slits (`groove`, photo px) squeezed shut: each
+    column's rims brought onto the slit's middle line, the skin round it
+    following less the further it is (in order: nothing folds over), easing
+    off past the slit's ends and to the head's back."""
+    from scipy.ndimage import label as cc_label
+
+    lab, n = cc_label(groove)
+    H, W = groove.shape
+    Dy = np.zeros((H, W))
+    rows = np.arange(H, dtype=np.float64)
+    r = _SLIT_EASE * ppm
+    for i in range(1, n + 1):
+        ys, xs = np.nonzero(lab == i)
+        if len(ys) < 4:
+            continue
+        c0, c1 = int(xs.min()), int(xs.max())
+        cols = np.arange(c0, c1 + 1)
+        mid = np.array([ys[xs == c].mean() if (xs == c).any() else np.nan for c in cols])
+        half = np.array([(ys[xs == c].max() - ys[xs == c].min()) / 2.0 + 1.5 if (xs == c).any() else np.nan for c in cols])
+        ok = np.isfinite(mid)
+        mid = np.interp(cols, cols[ok], mid[ok])
+        half = np.interp(cols, cols[ok], half[ok])
+        for c in range(max(c0 - int(r), 0), min(c1 + int(r) + 1, W)):
+            j = min(max(c - c0, 0), len(cols) - 1)
+            wx = 1.0 - min(max(c0 - c, c - c1, 0), r) / r
+            d = rows - mid[j]
+            w = np.clip(1.0 - (np.abs(d) - half[j]) / r, 0.0, 1.0)
+            Dy[:, c] -= (1.0 - _SLIT_LEFT) * d * w * wx
+    if not Dy.any():
+        return V
+    Dy = gaussian_filter(Dy, 1.0)
+    zf = map_coordinates(np.where(have, near, np.nanmax(np.where(have, near, -np.inf))), [V[:, 1], V[:, 0]], order=1, mode="nearest")
+    deep = _BODY_EYE_SOCKET[2] * ppm
+    wd = np.clip((2.0 * deep - (V[:, 2] - zf)) / deep, 0.0, 1.0)
+    V = V.copy()
+    V[:, 1] += wd * map_coordinates(Dy, [V[:, 1], V[:, 0]], order=1, mode="nearest")
+    return V
+
+
 def _close_body_eyes(V, F, fm, shape, ppm: float):
     """The fitted body's own eyes closed over, level with the skin round
     them. They are the reference figure's eyes, not the photo's: their
@@ -1436,6 +1479,8 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     if fm is None:
         return V, None
     from scipy.ndimage import grey_closing
+
+    from . import silhouette_relief as sr
 
     f = np.asarray(fm)[:, :2]
     corners = f[[33, 133, 362, 263]]
@@ -1472,6 +1517,14 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     groove = band & (hc - h > _BODY_EYE_GROOVE * ppm)
     if not groove.any():
         return V, None
+    # each slit squeezed shut, its lids' rims brought together onto its
+    # middle line (only pressed flat, its two rims stayed apart and what lay
+    # between them showed as a line through the middle of the photo's eyes)
+    V = _squeeze_slits(V, groove, near, have, ppm)
+    near, _ = _raster_front(V, F, shape)
+    have = np.isfinite(near)
+    h = np.where(have, -near, np.nanmin(np.where(have, -near, np.inf)))
+    hc = grey_closing(h, size=(k, k))
     hc = np.maximum(gaussian_filter(hc, 0.002 * ppm), h)  # (the filling smoothed: square plateaus otherwise)
     # over the socket (it runs on under the lids round the slit), easing off
     # round it; to the socket's depth, easing off behind it
@@ -1485,6 +1538,12 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     wd = np.clip((deep - dz) / (0.3 * deep), 0.0, 1.0) * (dz > -1.5)
     V = V.copy()
     V[:, 2] -= wl * wd * (1.0 - _BODY_EYE_KEEP) * np.clip(dz, 0.0, None)
+    # the closed slit's seam smoothed away (its lids' rims met in a line
+    # that showed through the middle of the photo's eyes)
+    wt = np.clip(wl * wd, 0.0, 1.0)
+    if (wt > 0.05).any():
+        zs = sr._mesh_smooth(sr._mesh_laplacian(F, len(V)), V[:, 2], _BODY_EYE_SMOOTH)
+        V[:, 2] = V[:, 2] + wt * (zs - V[:, 2])
     return V, w_lat > 0.01  # (and where the socket was, pressed flat behind the skin)
 
 
