@@ -18,7 +18,10 @@ import io
 import json
 import os
 import re
+import pickle
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -34,6 +37,7 @@ from trimesh.exchange.obj import export_obj
 
 from anatomy3d import lab
 
+import jobs
 import study_api
 
 
@@ -130,8 +134,26 @@ def _active_run() -> Optional[str]:
 def _inputs(run_id: str, d: Path):
     if run_id not in _inputs_cache:
         _inputs_cache.clear()
-        meta = _read_json(d / "meta.json", {})
-        _inputs_cache[run_id] = lab.prepare_inputs(str(d / meta["photo_file"]))
+        # read from the photo once and kept with the run: each build runs in
+        # a process of its own (lab_job.py) and loads it instead of reading
+        # the photo again (a minute and the photo-reading models each time)
+        p = d / "inputs.pkl"
+        inputs = None
+        if p.exists():
+            try:
+                inputs = pickle.loads(p.read_bytes())
+            except Exception:  # noqa: BLE001 - (an older code's inputs: read again)
+                inputs = None
+        if inputs is None:
+            meta = _read_json(d / "meta.json", {})
+            inputs = lab.prepare_inputs(str(d / meta["photo_file"]))
+            try:
+                tmp = p.with_suffix(".tmp")
+                tmp.write_bytes(pickle.dumps(inputs))
+                tmp.replace(p)
+            except OSError:
+                pass
+        _inputs_cache[run_id] = inputs
     return _inputs_cache[run_id]
 
 
@@ -151,6 +173,16 @@ def _work_one(run_id: str) -> bool:
     code = pending[0]
     t0 = time.time()
     row = {"code": code, "n": lab.number(code), "at": t0}
+    key = f"run:{run_id}:{code}"
+    why = jobs.stopped(key)
+    if why:
+        # (it took its process down before: failed, not built again)
+        row.update(status="fail", error=f"stopped: {why}", seconds=0.0)
+        with _state_lock:
+            with open(d / "results.jsonl", "a") as f:
+                f.write(json.dumps(row) + "\n")
+        return True
+    jobs.mark(key)
     with _generation_lock:
         try:
             with contextlib.redirect_stdout(io.StringIO()):
@@ -194,6 +226,7 @@ def _work_one(run_id: str) -> bool:
     with _state_lock:
         with open(d / "results.jsonl", "a") as f:
             f.write(json.dumps(row) + "\n")
+    jobs.clear()
     return True
 
 
@@ -222,6 +255,31 @@ def _release_memory() -> None:
         pass
 
 
+JOB_TIMEOUT = 40 * 60  # a build stopped after this long (the longest take a few minutes)
+
+
+def _run_job(kind: str, arg: str) -> None:
+    """One build, in a process of its own (lab_job.py), the generation lock
+    held while it runs as it was for a build here. Whatever it takes is given
+    back when it ends; if it is killed (out of memory) or stuck, only it
+    goes, and the build it was on is stopped for good (jobs.py) -- recorded
+    as failed the next time round, not tried again."""
+    with _generation_lock:
+        try:
+            rc = subprocess.run([sys.executable, str(Path(__file__).resolve().with_name("lab_job.py")), kind, arg],
+                                timeout=JOB_TIMEOUT).returncode
+        except subprocess.TimeoutExpired:
+            rc = "timeout"
+    if rc != 0:
+        why = "it ran out of memory" if rc in (-9, 137) else ("it took over 40 minutes" if rc == "timeout" else f"its process ended ({rc})")
+        key = jobs.current()
+        if key:
+            jobs.stop(key, why)
+        print(f"Lab worker: {kind} {arg}: {key or 'no build'} stopped, {why}.")
+    jobs.clear()
+    _lab_bytes["total"] = None  # (what it stored, counted again)
+
+
 def _worker_loop() -> None:
     turn = 0
     while True:
@@ -236,15 +294,13 @@ def _worker_loop() -> None:
             run_id = _active_run()
             if sid and (run_id is None or turn % 3):  # a running study gets two turns to a run's one
                 run_id = None
-                study_api.work_one(sid, _generation_lock)
-                _release_memory()
+                _run_job("study", sid)
                 time.sleep(0.3)
                 continue
             if run_id is None:
                 time.sleep(3)
                 continue
-            _work_one(run_id)
-            _release_memory()
+            _run_job("run", run_id)
             time.sleep(0.3)  # let a person's own Generate take the lock between combinations
         except Exception as exc:  # noqa: BLE001 - keep the worker alive whatever happens
             print(f"Lab worker error on {run_id or 'a study'}: {exc}")

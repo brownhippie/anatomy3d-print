@@ -28,6 +28,8 @@ from fastapi.responses import FileResponse
 
 from anatomy3d import knobs, study
 
+import jobs
+
 
 def _root() -> Path:
     env = os.environ.get("ANATOMY3D_STUDY_DIR")
@@ -96,7 +98,11 @@ def _repair(sid: str, st: dict, generation_lock: threading.Lock) -> bool:
         for p in st["photos"]:
             if (t / which / f"{p['id']}.png").exists():
                 continue
+            key = f"repair:{sid}:{which}:{p['id']}"
+            if jobs.stopped(key):
+                continue  # (took its process down before: left missing)
             d = STUDY_ROOT / sid
+            jobs.mark(key)
             try:
                 with generation_lock:
                     inputs = study.prepare(str(d / "p" / p["file"]), p["body"], CACHE_ROOT / sid / f"{p['id']}.pkl")
@@ -106,6 +112,8 @@ def _repair(sid: str, st: dict, generation_lock: threading.Lock) -> bool:
             except Exception as exc:  # noqa: BLE001 - leave it missing; the study goes on
                 print(f"Study {sid}: couldn't render {which} {p['id']}: {exc}")
                 return False
+            finally:
+                jobs.clear()
             return True
     return False
 
@@ -268,16 +276,24 @@ def work_one(sid: str, generation_lock: threading.Lock) -> None:
             return
     todo = [p for p in st["photos"] if p["id"] not in st["cand"]["results"]]
     p = todo[0]
-    try:
-        with generation_lock:
-            inputs = study.prepare(str(d / "p" / p["file"]), p["body"], CACHE_ROOT / sid / f"{p['id']}.pkl")
-            m, thumb = study.evaluate(inputs, st["cand"]["values"])
-        del inputs
-        which = "base" if st["best_obj"] is None else "cand"
-        (_renders(sid) / which).mkdir(parents=True, exist_ok=True)
-        thumb.save(_renders(sid) / which / f"{p['id']}.png", optimize=True)
-    except Exception as exc:  # noqa: BLE001 - a failed build scores as one
-        m = {"objective": -100.0, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    key = f"study:{sid}:{p['id']}:{jobs.digest(st['cand']['values'])}"
+    why = jobs.stopped(key)
+    if why:
+        # (it took its process down before: scored as a failed build, not built again)
+        m = {"objective": -100.0, "error": f"stopped: {why}"}
+    else:
+        jobs.mark(key)
+        try:
+            with generation_lock:
+                inputs = study.prepare(str(d / "p" / p["file"]), p["body"], CACHE_ROOT / sid / f"{p['id']}.pkl")
+                m, thumb = study.evaluate(inputs, st["cand"]["values"])
+            del inputs
+            which = "base" if st["best_obj"] is None else "cand"
+            (_renders(sid) / which).mkdir(parents=True, exist_ok=True)
+            thumb.save(_renders(sid) / which / f"{p['id']}.png", optimize=True)
+        except Exception as exc:  # noqa: BLE001 - a failed build scores as one
+            m = {"objective": -100.0, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        jobs.clear()
     st["cand"]["results"][p["id"]] = m
     line = None
     if len(st["cand"]["results"]) == len(st["photos"]) or study.trails(st):
