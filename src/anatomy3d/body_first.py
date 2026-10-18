@@ -629,6 +629,8 @@ _PUPIL_DEPTH = 0.003  # the pupil, drilled this much deeper than the iris round 
 _PUPIL_R = 0.5  # ... over this share of the iris's radius
 _BODY_EYE_GROOVE = 0.004  # round the eyes, a groove deeper than this (m on the person) is the fitted body's own lid slit
 _BODY_EYE_SPAN = 0.008  # ... and narrower than this
+_BODY_EYE_SOCKET = (0.012, 0.008, 0.05)  # its socket: this far round the slit, easing off over the next, this deep (m)
+_BODY_EYE_KEEP = 0.02  # what's left of the socket's depth, pressed flat (its order kept: nothing folds over)
 _IRIS_EDGE = 0.12  # the iris's and pupil's rims, steep over this share of their radius (a soft funnel read as a blank eye)
 _EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
 _EYE_DOME = 0.5  # an open eye's ball domes up to this share of its set-back in the middle
@@ -1372,15 +1374,19 @@ def _garment_views(V, F, part_w, names, found, J: dict, ppm: float):
 
 
 def _close_body_eyes(V, F, fm, shape, ppm: float):
-    """The fitted body's own eyelid slits filled level with the skin round
-    them. They are the reference figure's eyes, not the photo's -- left where
-    its eyes sat (on the Obama photo a centimetre below the photo's, on the
-    bags under them), deep grooves into its eye sockets that read as the
-    eyes, while the photo's own eyes, carved above them, didn't show. Filled,
-    the photo's eyes are the only ones."""
+    """The fitted body's own eyes closed over, level with the skin round
+    them. They are the reference figure's eyes, not the photo's: their
+    eyeballs are pieces of their own, dropped when the body is made one
+    solid, which left each eye a slit into an empty socket -- a groove a
+    few centimetres deep where the reference's eyes sat (on the Obama photo
+    a centimetre below the photo's, on the bags under them), reading as the
+    eyes while the photo's own, carved above, didn't show. Everything of the
+    socket behind the slit, seen or not, is pressed flat onto the skin
+    filled across it (in order, so nothing folds over), and the photo's eyes
+    are the only ones."""
     if fm is None:
         return V
-    from scipy.ndimage import binary_dilation, grey_closing
+    from scipy.ndimage import grey_closing
 
     f = np.asarray(fm)[:, :2]
     corners = f[[33, 133, 362, 263]]
@@ -1400,12 +1406,19 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     groove = band & (hc - h > _BODY_EYE_GROOVE * ppm)
     if not groove.any():
         return V
-    groove = binary_dilation(groove, iterations=1) & band
-    lift = np.where(groove, np.clip(hc - h, 0.0, None), 0.0)
+    hc = np.maximum(gaussian_filter(hc, 0.002 * ppm), h)  # (the filling smoothed: square plateaus otherwise)
+    # over the socket (it runs on under the lids round the slit), easing off
+    # round it; to the socket's depth, easing off behind it
+    dist = distance_transform_edt(~groove)
+    w_lat = np.clip(1.0 - (dist - _BODY_EYE_SOCKET[0] * ppm) / (_BODY_EYE_SOCKET[1] * ppm), 0.0, 1.0) * gaussian_filter(band.astype(np.float64), 0.004 * ppm)
+    deep = _BODY_EYE_SOCKET[2] * ppm
     px_, py_ = V[:, 0], V[:, 1]
-    vis = V[:, 2] <= map_coordinates(np.where(have, near, 1e9), [py_, px_], order=0, mode="nearest") + 1.5
+    zc = -map_coordinates(hc, [py_, px_], order=1, mode="nearest")  # the filled skin (depth runs toward the back)
+    wl = map_coordinates(w_lat, [py_, px_], order=1, mode="nearest")
+    dz = V[:, 2] - zc
+    wd = np.clip((deep - dz) / (0.3 * deep), 0.0, 1.0) * (dz > -1.5)
     V = V.copy()
-    V[:, 2] -= np.where(vis, map_coordinates(lift, [py_, px_], order=0, mode="nearest"), 0.0)  # (toward the camera)
+    V[:, 2] -= wl * wd * (1.0 - _BODY_EYE_KEEP) * np.clip(dz, 0.0, None)
     return V
 
 
