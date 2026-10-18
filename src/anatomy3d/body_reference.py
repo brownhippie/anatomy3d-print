@@ -458,6 +458,12 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
 
 
 _NECK_WEIGHT = 3.0  # the bare neck's breadth, against the keypoints' (1 each)
+_HAND_WEIGHT = 0.0  # a hand's breadth across, in the fit: off -- the figure's hands are cut from the photo's own hand
+#   skin (body_first._hand_solids), the body's are drawn into the wrists; fitted to it, a folded hand grew into the arm
+#   and the joined solid came apart (business photo). The hands' skin is still read (step 2's checks)
+_FOREARM_WEIGHT = 2.0  # a bare forearm's breadth
+_FOREARM_BAND = (0.35, 0.85)  # the forearm measured over this stretch from the elbow toward the wrist
+_BARE_SHARE = 0.6  # a forearm counts as bare when this share of it shows skin
 
 
 def read_skin(parts: Optional[dict], face_mesh: Optional[np.ndarray], pose: Optional[dict], photo_mask: np.ndarray) -> dict:
@@ -465,8 +471,9 @@ def read_skin(parts: Optional[dict], face_mesh: Optional[np.ndarray], pose: Opti
     the body's build comes from skin rather than the clothes over it: the
     neck's breadth (px) where its skin shows between the chin and the
     collar, row by row from the face's middle out, the median of rows that
-    look like a neck (between 0.45 and 1.3 of the face's breadth). {} when
-    there is no skin to measure."""
+    look like a neck (between 0.45 and 1.3 of the face's breadth); each
+    hand's breadth across, from its skin past the wrist; each forearm's
+    breadth where it shows bare. {} when there is no skin to measure.""" 
     out = {}
     cl = (parts or {}).get("clothes")
     if not cl or face_mesh is None:
@@ -499,6 +506,51 @@ def read_skin(parts: Optional[dict], face_mesh: Optional[np.ndarray], pose: Opti
         out["neck_px"] = float(np.median(widths))
         out["neck_rows"] = len(widths)
         out["neck_over_face"] = round(out["neck_px"] / fw, 3)
+    # the hands and any bare forearm: their breadth across (the spread of
+    # their skin across the hand's or the forearm's own direction, as the
+    # breadth of an even band: 2 sqrt(3) x its standard deviation -- the same
+    # measure the fit takes of the body)
+    P = {k: np.asarray(v, dtype=np.float64)[:2] for k, v in (pose or {}).items()}
+    if "left_shoulder" not in P or "right_shoulder" not in P:
+        return out
+    from scipy.ndimage import label as cc_label
+
+    sw = float(np.linalg.norm(P["left_shoulder"] - P["right_shoulder"]))
+    yy, xx = np.mgrid[0:H, 0:W]
+    face_zone = (yy < chin + 0.05 * fh) & (np.abs(xx - cx) < 0.7 * fw)
+    for side in ("left", "right"):
+        tips = [P[f"{side}_{t}"] for t in ("index", "pinky", "thumb") if f"{side}_{t}" in P]
+        if tips and f"{side}_wrist" in P:
+            c = np.mean(tips, axis=0)
+            wr = P[f"{side}_wrist"]
+            u = c - wr
+            if np.linalg.norm(u) > 1e-6:
+                u /= np.linalg.norm(u)
+                v = np.array([-u[1], u[0]])
+                near = skin & ~face_zone & (np.hypot(xx - c[0], yy - c[1]) < 0.22 * sw) & (((xx - wr[0]) * u[0] + (yy - wr[1]) * u[1]) > -0.02 * sw)
+                comps, n = cc_label(near)
+                if n:
+                    ys_, xs_ = np.nonzero(near)
+                    i0 = int(np.argmin(np.hypot(xs_ - c[0], ys_ - c[1])))
+                    hand = comps == comps[ys_[i0], xs_[i0]]
+                    if hand.sum() >= (0.05 * sw) ** 2:
+                        hy, hx = np.nonzero(hand)
+                        across = (hx - c[0]) * v[0] + (hy - c[1]) * v[1]
+                        out.setdefault("hand_px", {})[side] = round(float(2.0 * np.sqrt(3.0) * across.std()), 1)
+                        out.setdefault("hand_across", {})[side] = [float(v[0]), float(v[1])]
+        if f"{side}_elbow" in P and f"{side}_wrist" in P:
+            e, w_ = P[f"{side}_elbow"], P[f"{side}_wrist"]
+            L = float(np.linalg.norm(w_ - e))
+            if L > 0.1 * sw:
+                u = (w_ - e) / L
+                v = np.array([-u[1], u[0]])
+                t = (xx - e[0]) * u[0] + (yy - e[1]) * u[1]
+                q = (xx - e[0]) * v[0] + (yy - e[1]) * v[1]
+                band = (t > _FOREARM_BAND[0] * L) & (t < _FOREARM_BAND[1] * L) & (np.abs(q) < 0.15 * sw) & photo_mask & ~face_zone
+                if band.sum() > 50 and (skin & band).sum() / band.sum() > _BARE_SHARE:
+                    sk = skin & band
+                    out.setdefault("forearm_px", {})[side] = round(float(2.0 * np.sqrt(3.0) * q[sk].std()), 1)
+                    out.setdefault("forearm_across", {})[side] = [float(v[0]), float(v[1])]
     return out
 
 
@@ -578,6 +630,23 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
             lo_, hi_ = np.quantile(xs_, [0.1, 0.9])
             neck_sides = (ring[xs_ <= lo_], ring[xs_ >= hi_])
     neck_extra = [] if neck_sides is None else [neck_sides[0], neck_sides[1]]
+    # the hands and bare forearms the skin showed: the body's own, measured
+    # across the photo's direction for each
+    width_sets = []  # (name, rest vertices, photo breadth px, across (2,), weight)
+    for s_, side in (("L", "left"), ("R", "right")):
+        if _HAND_WEIGHT > 0 and side in (skin_read.get("hand_px") or {}) and len(hand_v[s_]) > 20:
+            hv_ = rng.choice(hand_v[s_], min(200, len(hand_v[s_])), replace=False)
+            width_sets.append((f"hand.{s_}", hv_, skin_read["hand_px"][side], np.asarray(skin_read["hand_across"][side]), _HAND_WEIGHT))
+        if side in (skin_read.get("forearm_px") or {}):
+            fa = np.flatnonzero(dom_part == pn.index(f"forearm.{s_}"))
+            je, jw = body["joints"][labels.index(f"lowerarm01.{s_}")], body["joints"][labels.index(f"wrist.{s_}")]
+            ax = jw - je
+            tt = (body["verts"][fa] - je) @ ax / max(float(ax @ ax), 1e-9)
+            fa = fa[(tt > _FOREARM_BAND[0]) & (tt < _FOREARM_BAND[1])]
+            if len(fa) > 20:
+                fa = rng.choice(fa, min(200, len(fa)), replace=False)
+                width_sets.append((f"forearm.{s_}", fa, skin_read["forearm_px"][side], np.asarray(skin_read["forearm_across"][side]), _FOREARM_WEIGHT))
+    neck_extra += [ws_[1] for ws_ in width_sets]
     sub = np.unique(np.concatenate([kp_idx.ravel(), lkp_idx.ravel(), spread, tf_s, *fore_s.values(), *[hand_v[s] for s in hand_tgt], *neck_extra]))
     pos = {v: i for i, v in enumerate(sub)}
 
@@ -586,6 +655,7 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
 
     kp_sub, spread_sub, tf_sub, lkp_sub = at(kp_idx), at(spread), at(tf_s), at(lkp_idx)
     neck_sub = None if neck_sides is None else (at(neck_sides[0]), at(neck_sides[1]))
+    width_subs = [(nm, at(vs_), px_, ac_, wt_) for nm, vs_, px_, ac_, wt_ in width_sets]
     fore_sub = {s: at(fore_s[s]) for s in "LR"}
     hand_sub = {s: at(hand_v[s]) for s in hand_tgt}
     dist_out = distance_transform_edt(~photo_mask)
@@ -736,6 +806,18 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
             (np.einsum("kn,knij->kij", kp_w, Jp[kp_sub]) * sq[:, :, None] / sw_px).reshape(-1, NW) if jac else None)
         for sd, t in hand_tgt.items():
             add((p2[hand_sub[sd]].mean(0) - t) / sw_px, Jp[hand_sub[sd]].mean(0) / sw_px if jac else None)
+        for _nm, idx_, target_, ac_, wt_ in width_subs:
+            # a hand's or bare forearm's breadth across, as its skin shows it:
+            # 2 sqrt(3) x the spread of its points across that direction
+            x_ = p2[idx_] @ ac_
+            m_ = x_.mean()
+            sd_ = max(float(np.sqrt(((x_ - m_) ** 2).mean())), 1e-6)
+            kw_ = np.sqrt(wt_) / sw_px
+            r_ = kw_ * (2.0 * np.sqrt(3.0) * sd_ - target_)
+            if jac:
+                dxd = ac_[0] * Jp[idx_, 0, :] + ac_[1] * Jp[idx_, 1, :]
+                Jw_ = kw_ * 2.0 * np.sqrt(3.0) * ((x_ - m_)[:, None] * dxd).sum(0) / (len(x_) * sd_)
+            add(r_, Jw_[None] if jac else None)
         if neck_sub is not None:
             # the neck as broad as its bare skin in the photo
             da = p2[neck_sub[1], 0].mean() - p2[neck_sub[0], 0].mean()
@@ -918,6 +1000,9 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
     report["skin"] = skin_read
     if neck_sides is not None:
         report["skin"]["neck_body_px"] = round(abs(float(px[neck_sides[1], 0].mean() - px[neck_sides[0], 0].mean())), 1)
+    for nm, vs_, px_, ac_, wt_ in width_sets:
+        x_ = px[vs_][:, :2] @ ac_
+        report["skin"].setdefault("body_px", {})[nm] = round(float(2.0 * np.sqrt(3.0) * x_.std()), 1)
     if parts is not None:
         report["head_has"] = [k for k, v in parts.get("found", {}).items() if v]
     return {"matched": report["matched"], "report": report, "skin": skin_read, "vertices": px, "joints_px": joints_px, "core_depth": core_depth, "faces": body["faces"], "part_w": body["part_w"],

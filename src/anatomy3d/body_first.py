@@ -617,7 +617,9 @@ _CHK_FACE_M = (0.10, 0.20)  # the face's breadth at the photo's scale, metres (p
 _CHK_FOREARM_LR = (0.97, 1.03)  # left forearm over right
 _CHK_FOREARM_UPPER = (0.65, 0.95)  # forearm over upper arm (radius / humerus ~0.78)
 _CHK_NECK_FACE = (0.45, 1.3)  # the bare neck's breadth over the face's, as a person's is
-_CHK_NECK_MATCH = (0.85, 1.15)  # the posed body's neck over the bare neck's breadth
+_CHK_NECK_MATCH = (0.85, 1.15)
+_CHK_LIMB_MATCH = (0.8, 1.25)  # the posed body's hand or bare forearm over its skin's breadth (hands fold and hide)
+_CHK_FOREARM_SW = (0.08, 0.3)  # a bare forearm's breadth over the shoulders' width, as a person's is  # the posed body's neck over the bare neck's breadth
 _CHK_HAND_SW = (0.10, 0.40)  # a hand's breadth over the shoulders' width (a hand half hidden shows less)
 _CHK_OUTLINE = 0.90  # the front's outline against the photo's (overlap)
 _CHK_SECTION = (0.85, 1.15)  # a section's depth for its width against the human figure's, after the plan
@@ -1497,6 +1499,8 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             sum(f"{sd}_{j}" in Pp for sd in ("left", "right") for j in ("shoulder", "elbow", "wrist", "hip")), lo=4)
     chk.add("1 photo read", "face points found", 1.0 if fm0 is not None else 0.0, lo=1)
     chk.add("1 photo read", "outline's share of the photo", float(mask.mean()), 0.05, 0.95)
+    sw0 = float(np.linalg.norm(np.subtract(Pp["left_shoulder"][:2], Pp["right_shoulder"][:2]))) \
+        if "left_shoulder" in Pp and "right_shoulder" in Pp else None
     # 2. skin first: the bare body the photo shows, read before the body is
     # posed -- the neck's breadth (the body's build is fitted to it, with the
     # joints: body_reference.read_skin) and each hand (from its skin, split
@@ -1504,6 +1508,9 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     skin_read = ref.get("skin") or {}
     if "neck_over_face" in skin_read:
         chk.add("2 skin read", "bare neck's breadth over the face's", skin_read["neck_over_face"], *_CHK_NECK_FACE)
+    for side_, fpx in (skin_read.get("forearm_px") or {}).items():
+        if sw0:
+            chk.add("2 skin read", f"{side_} bare forearm's breadth over shoulder width", fpx / sw0, *_CHK_FOREARM_SW)
     hand_regions, hands_read = _skin_hands(names, inputs)
     for sd in ("left", "right"):
         h_ = hands_read.get(sd)
@@ -1513,8 +1520,6 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
 
     # 3. the body, shaped and posed on the photo's points and its bare skin
     Jr = ref.get("joints_px") or {}
-    sw0 = float(np.linalg.norm(np.subtract(Pp["left_shoulder"][:2], Pp["right_shoulder"][:2]))) \
-        if "left_shoulder" in Pp and "right_shoulder" in Pp else None
     both = [k for k in Pp if k in Jr]
     if sw0 and both:
         miss = np.mean([np.hypot(*np.subtract(Pp[k][:2], np.asarray(Jr[k])[:2])) for k in both]) / sw0
@@ -1523,6 +1528,12 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         chk.add("3 body posed", "face breadth at the photo's scale", float(np.ptp(np.asarray(fm0)[:468, 0])) / ppm, *_CHK_FACE_M, unit=" m")
     if skin_read.get("neck_px") and skin_read.get("neck_body_px"):
         chk.add("3 body posed", "neck as broad as its bare skin (body over photo)", skin_read["neck_body_px"] / skin_read["neck_px"], *_CHK_NECK_MATCH)
+    for nm, bpx in (skin_read.get("body_px") or {}).items():
+        part_, s_ = nm.split(".")
+        side_ = "left" if s_ == "L" else "right"
+        ppx = (skin_read.get(f"{part_}_px") or {}).get(side_)
+        if ppx:
+            chk.add("3 body posed", f"{side_} {part_} as broad as its skin (body over photo)", bpx / ppx, *_CHK_LIMB_MATCH)
 
     locks = _Locks(chk)
     clothes = (inputs.parts or {}).get("clothes")
