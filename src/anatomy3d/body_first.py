@@ -627,6 +627,8 @@ _CHK_CLOTH_HOLLOW_MM = 6.0  # under clothes, no hollow deeper than this in the f
 _IRIS_CUT = 0.002  # the iris, a flat disc cut this deep into the eyeball (m on the person), its rim sharp
 _PUPIL_DEPTH = 0.003  # the pupil, drilled this much deeper than the iris round it (m), as a sculptor does
 _PUPIL_R = 0.5  # ... over this share of the iris's radius
+_BODY_EYE_GROOVE = 0.004  # round the eyes, a groove deeper than this (m on the person) is the fitted body's own lid slit
+_BODY_EYE_SPAN = 0.008  # ... and narrower than this
 _IRIS_EDGE = 0.12  # the iris's and pupil's rims, steep over this share of their radius (a soft funnel read as a blank eye)
 _EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
 _EYE_DOME = 0.5  # an open eye's ball domes up to this share of its set-back in the middle
@@ -1369,6 +1371,44 @@ def _garment_views(V, F, part_w, names, found, J: dict, ppm: float):
     return V + off[:, None] * n_s, made
 
 
+def _close_body_eyes(V, F, fm, shape, ppm: float):
+    """The fitted body's own eyelid slits filled level with the skin round
+    them. They are the reference figure's eyes, not the photo's -- left where
+    its eyes sat (on the Obama photo a centimetre below the photo's, on the
+    bags under them), deep grooves into its eye sockets that read as the
+    eyes, while the photo's own eyes, carved above them, didn't show. Filled,
+    the photo's eyes are the only ones."""
+    if fm is None:
+        return V
+    from scipy.ndimage import binary_dilation, grey_closing
+
+    f = np.asarray(fm)[:, :2]
+    corners = f[[33, 133, 362, 263]]
+    eye_w = float(np.ptp(corners[:, 0])) / 2.0
+    top = float(f[[105, 334], 1].min())
+    bot = float(f[1, 1])  # down to the nose's tip
+    x0, x1 = float(corners[:, 0].min()) - 0.4 * eye_w, float(corners[:, 0].max()) + 0.4 * eye_w
+    near, _ = _raster_front(V, F, shape)
+    have = np.isfinite(near)
+    yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+    band = have & (yy >= top) & (yy <= bot) & (xx >= x0) & (xx <= x1)
+    if not band.any():
+        return V
+    h = np.where(have, -near, np.nanmin(np.where(have, -near, np.inf)))
+    k = max(int(round(_BODY_EYE_SPAN * ppm)) | 1, 5)
+    hc = grey_closing(h, size=(k, k))
+    groove = band & (hc - h > _BODY_EYE_GROOVE * ppm)
+    if not groove.any():
+        return V
+    groove = binary_dilation(groove, iterations=1) & band
+    lift = np.where(groove, np.clip(hc - h, 0.0, None), 0.0)
+    px_, py_ = V[:, 0], V[:, 1]
+    vis = V[:, 2] <= map_coordinates(np.where(have, near, 1e9), [py_, px_], order=0, mode="nearest") + 1.5
+    V = V.copy()
+    V[:, 2] -= np.where(vis, map_coordinates(lift, [py_, px_], order=0, mode="nearest"), 0.0)  # (toward the camera)
+    return V
+
+
 def _set_eyes_back(V, F, face_read: dict, shape, ppm: float):
     from scipy.ndimage import binary_dilation
 
@@ -1714,6 +1754,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         part_w, ear_w9 = pw_all[:, :part_w.shape[1]], pw_all[:, part_w.shape[1]:]
     else:
         V, F, part_w = _subdivide(V, F, part_w)
+    V = _close_body_eyes(V, F, inputs.face_mesh, shape, ppm)
     st = {"V": V, "F": F, "pw": part_w}
     before = st
     locks.lock("9 detail", "no new spikes", _spike_pct, lambda m, m0: m <= m0 + _LOCK_SPIKES, st)
