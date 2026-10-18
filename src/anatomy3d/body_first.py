@@ -630,6 +630,8 @@ _PUPIL_R = 0.5  # ... over this share of the iris's radius
 _BODY_EYE_GROOVE = 0.004  # round the eyes, a groove deeper than this (m on the person) is the fitted body's own lid slit
 _BODY_EYE_SPAN = 0.008  # ... and narrower than this
 _BODY_EYE_SOCKET = (0.012, 0.008, 0.05)  # its socket: this far round the slit, easing off over the next, this deep (m)
+_EYE_ALIGN_MAX = 1.5  # a slit is the body's eye if its middle is within this many eye widths of the photo's
+_EYE_ALIGN_SPREAD = 1.0  # ... the face carried along with it out to about this many eye widths
 _BODY_EYE_KEEP = 0.02  # what's left of the socket's depth, pressed flat (its order kept: nothing folds over)
 _IRIS_EDGE = 0.12  # the iris's and pupil's rims, steep over this share of their radius (a soft funnel read as a blank eye)
 _EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
@@ -1373,6 +1375,45 @@ def _garment_views(V, F, part_w, names, found, J: dict, ppm: float):
     return V + off[:, None] * n_s, made
 
 
+def _body_eyes_onto_photo(V, F, f, groove, near, have, ppm: float):
+    """The fitted body's eye slits (`groove`, photo px) moved onto the
+    photo's eyes (face landmarks `f`), the face round them carried along."""
+    from scipy.ndimage import label as cc_label
+
+    lab, n = cc_label(groove)
+    if n == 0:
+        return V
+    cy, cx = np.nonzero(groove)
+    ids = lab[cy, cx]
+    moves = []
+    for a, b in ((33, 133), (362, 263)):
+        pe = (f[a] + f[b]) / 2.0
+        ew = float(np.hypot(*(f[a] - f[b])))
+        best = None
+        for i in range(1, n + 1):
+            sel = ids == i
+            g = np.array([cx[sel].mean(), cy[sel].mean()])
+            dd = float(np.hypot(*(g - pe)))
+            if dd < _EYE_ALIGN_MAX * ew and sel.sum() >= 4 and (best is None or dd < best[0]):
+                best = (dd, g)
+        if best is not None:
+            moves.append((best[1], pe - best[1], ew))
+    if not moves:
+        return V
+    sigma = _EYE_ALIGN_SPREAD * float(np.mean([m[2] for m in moves]))
+    xy = V[:, :2]
+    D = np.zeros((len(V), 2))
+    for g, d, _ in moves:
+        D += np.exp(-np.sum((xy - g) ** 2, axis=1) / (2.0 * sigma * sigma))[:, None] * d[None, :]
+    # (to the depth of the face: the back of the head stays)
+    zf = map_coordinates(np.where(have, near, np.nanmax(np.where(have, near, -np.inf))), [V[:, 1], V[:, 0]], order=1, mode="nearest")
+    deep = _BODY_EYE_SOCKET[2] * ppm
+    wd = np.clip((2.0 * deep - (V[:, 2] - zf)) / deep, 0.0, 1.0)
+    V = V.copy()
+    V[:, :2] += D * wd[:, None]
+    return V
+
+
 def _close_body_eyes(V, F, fm, shape, ppm: float):
     """The fitted body's own eyes closed over, level with the skin round
     them. They are the reference figure's eyes, not the photo's: their
@@ -1402,6 +1443,20 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
         return V
     h = np.where(have, -near, np.nanmin(np.where(have, -near, np.inf)))
     k = max(int(round(_BODY_EYE_SPAN * ppm)) | 1, 5)
+    hc = grey_closing(h, size=(k, k))
+    groove = band & (hc - h > _BODY_EYE_GROOVE * ppm)
+    if not groove.any():
+        return V
+    # first the body's eyes moved onto the photo's: the fit puts them where
+    # the nose, eyes and ears agree best, which left them a centimetre off
+    # (below, on the bags under the photo's eyes) -- the reference's eye
+    # bulges stood there as a second pair of eyes. Each slit's middle onto
+    # the photo's eye, the face round it carried along, easing off a few
+    # eye widths out and to the head's back
+    V = _body_eyes_onto_photo(V, F, f, groove, near, have, ppm)
+    near, _ = _raster_front(V, F, shape)
+    have = np.isfinite(near)
+    h = np.where(have, -near, np.nanmin(np.where(have, -near, np.inf)))
     hc = grey_closing(h, size=(k, k))
     groove = band & (hc - h > _BODY_EYE_GROOVE * ppm)
     if not groove.any():
