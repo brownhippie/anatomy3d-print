@@ -4,37 +4,31 @@ on it, the photo's own detail on its surface, out as one closed solid.
 The outline builder (silhouette_relief) samples the posed body into one
 front and one back depth per point of the photo and builds from those, so
 whatever overlaps in the photo (an arm across the chest, a hand on an arm,
-an ear against the head) is one column. Here the posed body *is* the model:
+an ear against the head) is one column. Here the posed body *is* the model.
+In order, each step checked and locked before the next (_Checks, _Locks):
 
 1. the photo, read: pose and face points, outline, depth, clothes, hair
    (lab.prepare_inputs);
-2. the 3D body: the Anny body (body_reference) shaped to the photo -- build,
-   head size, bone lengths kept to human proportions -- and posed onto its
-   points (fitted when the inputs are prepared);
-3. cut where the photo is cut (a bust) -- the first thing done with the 3D
-   body, so nothing after it spends time on legs, or trousers, that won't
-   be there;
-4. fitted out to the photo's outline along smoothed normals (the room
-   clothes and hair take; the face held to its own points; what
-   reaches below the cut trimmed off at the end), hands closed to mittens;
-5. all four sides understood before anything is built on them
-   (plan_four_sides): the front against the photo's outline and depth, each
-   section's depth from the side against the human figure's (corrected
-   toward it, within limits), the posture from the side, what the clothes
-   and hair will cover round the back;
-6. the clothes and hair on it: a part the photo shows mostly under clothes
-   clothed all round (smooth as cloth lies, with a cloth's thickness), hair
-   over the back of the head, each garment stepping over the one under it
-   where they meet;
-7. the photo's detail on the surface the camera sees: face shaping, the
-   face's parts, clothes' steps and fine depth detail, pushed toward the
-   camera on the vertices that are frontmost (an arm across the chest gets
-   the sleeve's folds, the chest under it nothing);
-8. out, scaled to the figure's height.
-
-Hands come out as mittens (the body's are open with the fingers spread);
-the hair is the body grown to the outline over the head (thick hair and
-buns are the outline builder's still).
+2. skin first: the bare body the photo shows, read before anything is posed
+   -- the neck's breadth where its skin shows (body_reference.read_skin) and
+   each hand from its own skin;
+3. the body: the Anny body shaped and posed to the photo's points and its
+   bare skin -- its build fitted to the bare neck as well as the joints, head
+   size and bone lengths kept to human proportions;
+4. cut where the photo is cut (a bust), before anything is built on it;
+5. the arms follow the hands: each forearm to where the photo's hand begins,
+   the two the same length, folded as the photo has them;
+6. grown out to the photo's outline (the face held to its own points);
+7. all four sides understood (plan_four_sides): each section's depth
+   against the human figure's, the posture, what clothes and hair cover;
+8. the clothes and hair: tailored against the bare body (room, layers), the
+   chest under a jacket spanned, the unseen sides covered;
+9. the photo's detail on the surface the camera sees (face, its parts, the
+   clothes' folds, the hair's pattern), then what is placed by measure: the
+   eyes behind their lids, the side whiskers, the garments made all round
+   from how they are sewn (garment_designs);
+10. the pieces: each garment and each hand a solid of its own, joined;
+11. out: one closed solid, scaled to the figure's height.
 """
 from typing import Optional
 
@@ -622,6 +616,8 @@ _CHK_JOINT_MISS = 0.08  # the posed body's joints off the photo's, at most this 
 _CHK_FACE_M = (0.10, 0.20)  # the face's breadth at the photo's scale, metres (people: ~0.13-0.15)
 _CHK_FOREARM_LR = (0.97, 1.03)  # left forearm over right
 _CHK_FOREARM_UPPER = (0.65, 0.95)  # forearm over upper arm (radius / humerus ~0.78)
+_CHK_NECK_FACE = (0.45, 1.3)  # the bare neck's breadth over the face's, as a person's is
+_CHK_NECK_MATCH = (0.85, 1.15)  # the posed body's neck over the bare neck's breadth
 _CHK_HAND_SW = (0.10, 0.40)  # a hand's breadth over the shoulders' width (a hand half hidden shows less)
 _CHK_OUTLINE = 0.90  # the front's outline against the photo's (overlap)
 _CHK_SECTION = (0.85, 1.15)  # a section's depth for its width against the human figure's, after the plan
@@ -1501,21 +1497,38 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             sum(f"{sd}_{j}" in Pp for sd in ("left", "right") for j in ("shoulder", "elbow", "wrist", "hip")), lo=4)
     chk.add("1 photo read", "face points found", 1.0 if fm0 is not None else 0.0, lo=1)
     chk.add("1 photo read", "outline's share of the photo", float(mask.mean()), 0.05, 0.95)
+    # 2. skin first: the bare body the photo shows, read before the body is
+    # posed -- the neck's breadth (the body's build is fitted to it, with the
+    # joints: body_reference.read_skin) and each hand (from its skin, split
+    # from the face and neck and the other hand)
+    skin_read = ref.get("skin") or {}
+    if "neck_over_face" in skin_read:
+        chk.add("2 skin read", "bare neck's breadth over the face's", skin_read["neck_over_face"], *_CHK_NECK_FACE)
+    hand_regions, hands_read = _skin_hands(names, inputs)
+    for sd in ("left", "right"):
+        h_ = hands_read.get(sd)
+        if isinstance(h_, dict):
+            chk.add("2 skin read", f"{sd} hand breadth over shoulder width", h_["breadth_sw"], *_CHK_HAND_SW)
+            chk.add("2 skin read", f"{sd} hand clear of the face", h_["on_face"], hi=0.02)
+
+    # 3. the body, shaped and posed on the photo's points and its bare skin
     Jr = ref.get("joints_px") or {}
     sw0 = float(np.linalg.norm(np.subtract(Pp["left_shoulder"][:2], Pp["right_shoulder"][:2]))) \
         if "left_shoulder" in Pp and "right_shoulder" in Pp else None
     both = [k for k in Pp if k in Jr]
     if sw0 and both:
         miss = np.mean([np.hypot(*np.subtract(Pp[k][:2], np.asarray(Jr[k])[:2])) for k in both]) / sw0
-        chk.add("2 body posed", "joints off the photo's (x shoulder width)", miss, hi=_CHK_JOINT_MISS)
+        chk.add("3 body posed", "joints off the photo's (x shoulder width)", miss, hi=_CHK_JOINT_MISS)
     if fm0 is not None:
-        chk.add("2 body posed", "face breadth at the photo's scale", float(np.ptp(np.asarray(fm0)[:468, 0])) / ppm, *_CHK_FACE_M, unit=" m")
+        chk.add("3 body posed", "face breadth at the photo's scale", float(np.ptp(np.asarray(fm0)[:468, 0])) / ppm, *_CHK_FACE_M, unit=" m")
+    if skin_read.get("neck_px") and skin_read.get("neck_body_px"):
+        chk.add("3 body posed", "neck as broad as its bare skin (body over photo)", skin_read["neck_body_px"] / skin_read["neck_px"], *_CHK_NECK_MATCH)
 
     locks = _Locks(chk)
     clothes = (inputs.parts or {}).get("clothes")
     Jn = {k: np.asarray(v, dtype=np.float64) for k, v in Jr.items()}
 
-    # 3. cut where the photo is cut (a bust) -- the first thing done with the
+    # 4. cut where the photo is cut (a bust) -- the first thing done with the
     # 3D body, so everything after works only on the torso the figure will
     # be: no time on legs (or trousers) that won't be there
     rows = np.flatnonzero(mask.any(axis=1))
@@ -1526,16 +1539,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         part_w = kept["part_w"]
         part_w = part_w / np.maximum(part_w.sum(axis=1, keepdims=True), 1e-9)
         body_ref = dict(body_ref, part_w=part_w, core_depth=kept["core"], ear_w=kept["ear_w"])
-        chk.add("3 cut", "closed solid after the cut", float(trimesh.Trimesh(V, F, process=False).is_watertight), lo=1)
-
-    # 4. skin first: the hands the photo shows, read from its skin (the face
-    # is held to its own points when the body grows, step 6)
-    hand_regions, hands_read = _skin_hands(names, inputs)
-    for sd in ("left", "right"):
-        h_ = hands_read.get(sd)
-        if isinstance(h_, dict):
-            chk.add("4 skin first", f"{sd} hand breadth over shoulder width", h_["breadth_sw"], *_CHK_HAND_SW)
-            chk.add("4 skin first", f"{sd} hand clear of the face", h_["on_face"], hi=0.02)
+        chk.add("4 cut", "closed solid after the cut", float(trimesh.Trimesh(V, F, process=False).is_watertight), lo=1)
 
     # 5. the arms follow: each forearm reaching to where the photo's hand
     # begins (its wrist), the two the same length, folded arms one over the

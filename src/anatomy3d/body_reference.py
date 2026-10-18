@@ -457,6 +457,51 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
     return out
 
 
+_NECK_WEIGHT = 3.0  # the bare neck's breadth, against the keypoints' (1 each)
+
+
+def read_skin(parts: Optional[dict], face_mesh: Optional[np.ndarray], pose: Optional[dict], photo_mask: np.ndarray) -> dict:
+    """The bare body the photo shows, measured before the body is posed, so
+    the body's build comes from skin rather than the clothes over it: the
+    neck's breadth (px) where its skin shows between the chin and the
+    collar, row by row from the face's middle out, the median of rows that
+    look like a neck (between 0.45 and 1.3 of the face's breadth). {} when
+    there is no skin to measure."""
+    out = {}
+    cl = (parts or {}).get("clothes")
+    if not cl or face_mesh is None:
+        return out
+    from .clothes import NAMES
+
+    if "skin" not in NAMES:
+        return out
+    skin = (cl["labels"] == NAMES.index("skin") + 1) & photo_mask
+    f = np.asarray(face_mesh)[:468, :2]
+    fw, fh = float(np.ptp(f[:, 0])), float(np.ptp(f[:, 1]))
+    chin = float(np.asarray(face_mesh)[152, 1])
+    cx = int(round(float(f[:, 0].mean())))
+    H, W = skin.shape
+    widths = []
+    for r in range(int(chin + 0.12 * fh), int(min(chin + 0.6 * fh, H - 1))):
+        row = skin[r]
+        if not (0 <= cx < W) or not row[cx]:
+            continue
+        a = cx
+        while a > 0 and row[a - 1]:
+            a -= 1
+        b = cx
+        while b < W - 1 and row[b + 1]:
+            b += 1
+        w = b - a + 1
+        if 0.45 * fw <= w <= 1.3 * fw:
+            widths.append(w)
+    if len(widths) >= 4:
+        out["neck_px"] = float(np.median(widths))
+        out["neck_rows"] = len(widths)
+        out["neck_over_face"] = round(out["neck_px"] / fw, 3)
+    return out
+
+
 def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], photo_mask: np.ndarray,
                        gender: str = "male", parts: Optional[dict] = None) -> Optional[dict]:
     """The body posed onto the photo, in photo pixels: x right, y down, depth
@@ -519,13 +564,28 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
     leg_names += [f"{sd}_{j}" for sd in ("left", "right") for j in ("shoulder", "elbow", "wrist")]
     leg_rows = [body["kp_names"].index(n) for n in leg_names]
     lkp_idx, lkp_w = body["kp_idx"][leg_rows], body["kp_w"][leg_rows]
-    sub = np.unique(np.concatenate([kp_idx.ravel(), lkp_idx.ravel(), spread, tf_s, *fore_s.values(), *[hand_v[s] for s in hand_tgt]]))
+    # the bare neck, read from the photo's skin first: the body's build is
+    # fitted to it (its girth there), not only to the joints
+    skin_read = read_skin(parts, face_mesh, pose, photo_mask)
+    neck_sides = None
+    if "neck_px" in skin_read and "neck" in pn:
+        nv_ = np.flatnonzero(dom_part == pn.index("neck"))
+        if len(nv_) > 30:
+            zz = body["verts"][nv_, 2]
+            midz = (zz.min() + zz.max()) / 2.0
+            ring = nv_[np.abs(zz - midz) < 0.15 * np.ptp(zz)]
+            xs_ = body["verts"][ring, 0]
+            lo_, hi_ = np.quantile(xs_, [0.1, 0.9])
+            neck_sides = (ring[xs_ <= lo_], ring[xs_ >= hi_])
+    neck_extra = [] if neck_sides is None else [neck_sides[0], neck_sides[1]]
+    sub = np.unique(np.concatenate([kp_idx.ravel(), lkp_idx.ravel(), spread, tf_s, *fore_s.values(), *[hand_v[s] for s in hand_tgt], *neck_extra]))
     pos = {v: i for i, v in enumerate(sub)}
 
     def at(vs):
         return np.array([pos[v] for v in np.ravel(vs)]).reshape(np.shape(vs))
 
     kp_sub, spread_sub, tf_sub, lkp_sub = at(kp_idx), at(spread), at(tf_s), at(lkp_idx)
+    neck_sub = None if neck_sides is None else (at(neck_sides[0]), at(neck_sides[1]))
     fore_sub = {s: at(fore_s[s]) for s in "LR"}
     hand_sub = {s: at(hand_v[s]) for s in hand_tgt}
     dist_out = distance_transform_edt(~photo_mask)
@@ -676,6 +736,13 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
             (np.einsum("kn,knij->kij", kp_w, Jp[kp_sub]) * sq[:, :, None] / sw_px).reshape(-1, NW) if jac else None)
         for sd, t in hand_tgt.items():
             add((p2[hand_sub[sd]].mean(0) - t) / sw_px, Jp[hand_sub[sd]].mean(0) / sw_px if jac else None)
+        if neck_sub is not None:
+            # the neck as broad as its bare skin in the photo
+            da = p2[neck_sub[1], 0].mean() - p2[neck_sub[0], 0].mean()
+            sg = 1.0 if da >= 0 else -1.0
+            kn = np.sqrt(_NECK_WEIGHT) / sw_px
+            add(kn * (sg * da - skin_read["neck_px"]),
+                (kn * sg * (Jp[neck_sub[1], 0].mean(0) - Jp[neck_sub[0], 0].mean(0)))[None] if jac else None)
         pr = np.sqrt(0.02 * prior)
         add((pr[:, None] * rv).ravel(), None)
         if jac:
@@ -847,7 +914,11 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
     # for turning the ears; the ears as the photo shows them
     head_axes = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]) @ Rw[body["head_bone"]]
     ears, report["ears"] = measure_ears(photo_mask, face_mesh, s, parts=parts)
+    # the bare skin read first, and how broad the posed body's neck came out
+    report["skin"] = skin_read
+    if neck_sides is not None:
+        report["skin"]["neck_body_px"] = round(abs(float(px[neck_sides[1], 0].mean() - px[neck_sides[0], 0].mean())), 1)
     if parts is not None:
         report["head_has"] = [k for k, v in parts.get("found", {}).items() if v]
-    return {"matched": report["matched"], "report": report, "vertices": px, "joints_px": joints_px, "core_depth": core_depth, "faces": body["faces"], "part_w": body["part_w"],
+    return {"matched": report["matched"], "report": report, "skin": skin_read, "vertices": px, "joints_px": joints_px, "core_depth": core_depth, "faces": body["faces"], "part_w": body["part_w"],
             "part_names": np.array(body["part_names"]), "px_per_m": s, "ear_w": body["ear_w"], "head_axes": head_axes, "ears": ears, "parts": parts}
