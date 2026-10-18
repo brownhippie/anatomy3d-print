@@ -1522,13 +1522,7 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float, pocket=None):
         # opened up for a figure: a smiling or narrowed eye's slit, at a
         # figure's size, left no room for its iris to show -- its height
         # taken _EYE_OPEN_SHOW times, over its own width only
-        if op.any():
-            gap = int(op.sum(axis=0).max())
-            k = max(int(round((_EYE_OPEN_SHOW - 1.0) * gap / 2.0)), 0)
-            if k:
-                cols = op.any(axis=0)
-                grown = binary_dilation(op, structure=np.ones((2 * k + 1, 1), dtype=bool))
-                op = grown & cols[None, :] & have
+        op = _eye_opened(op) & have
         lids = binary_dilation(op, iterations=max(int(0.003 * ppm), 2)) & ~op & have
         if op.sum() < 6 or lids.sum() < 6:
             continue
@@ -1561,6 +1555,22 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float, pocket=None):
     return V
 
 
+def _eye_opened(op):
+    """An open eye's opening (photo px mask) as the figure shows it: its
+    height taken _EYE_OPEN_SHOW times, over its own width only (a smiling or
+    narrowed eye's slit, at a figure's size, left no room for its iris)."""
+    from scipy.ndimage import binary_dilation
+
+    if not op.any():
+        return op
+    gap = int(op.sum(axis=0).max())
+    k = max(int(round((_EYE_OPEN_SHOW - 1.0) * gap / 2.0)), 0)
+    if not k:
+        return op
+    cols = op.any(axis=0)
+    return binary_dilation(op, structure=np.ones((2 * k + 1, 1), dtype=bool)) & cols[None, :]
+
+
 def _eyes_set_back_mm(st: dict, face_read: dict, shape, ppm: float) -> Optional[float]:
     """How far (mm, on the person) the open eyes sit behind the lids round
     them on the model's front -- the smaller of the two eyes (closed eyes
@@ -1582,6 +1592,7 @@ def _eyes_set_back_mm(st: dict, face_read: dict, shape, ppm: float) -> Optional[
         h_, w_ = mk.shape
         ys_, xs_ = slice(max(by0, 0), min(by0 + h_, shape[0])), slice(max(bx0, 0), min(bx0 + w_, shape[1]))
         op[ys_, xs_] = mk[ys_.start - by0:ys_.stop - by0, xs_.start - bx0:xs_.stop - bx0]
+        op = _eye_opened(op)  # (as _set_eyes_back opened it)
         lids = binary_dilation(op, iterations=max(int(0.003 * ppm), 2)) & ~op
         a, b = op & np.isfinite(n), lids & np.isfinite(n)
         if a.sum() >= 4 and b.sum() >= 4:
