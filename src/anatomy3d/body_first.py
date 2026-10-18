@@ -626,18 +626,19 @@ _CHK_SECTION = (0.85, 1.15)  # a section's depth for its width against the human
 _CHK_CLOTH_HOLLOW_MM = 6.0  # under clothes, no hollow deeper than this in the front (the body showing through)
 _IRIS_CUT = 0.002  # the iris, a flat disc cut this deep into the eyeball (m on the person), its rim sharp
 _PUPIL_DEPTH = 0.003  # the pupil, drilled this much deeper than the iris round it (m), as a sculptor does
-_PUPIL_R = 0.5  # ... over this share of the iris's radius
+_PUPIL_R = 0.38  # ... a drilled cup this share of the iris's radius across (a pupil of 4.5 mm in an iris of 11.7)
 _BODY_EYE_GROOVE = 0.004  # round the eyes, a groove deeper than this (m on the person) is the fitted body's own lid slit
 _BODY_EYE_SPAN = 0.008  # ... and narrower than this
 _BODY_EYE_SOCKET = (0.012, 0.008, 0.05)  # its socket: this far round the slit, easing off over the next, this deep (m)
 _EYE_ALIGN_MAX = 1.5  # a slit is the body's eye if its middle is within this many eye widths of the photo's
-_EYE_ALIGN_KEEP = 0.6  # a body's eye within this many of the photo's eye heights of it is the photo's: kept as it is
+_EYE_ALIGN_KEEP = 0.6  # a body's eye within this many of the photo's eye heights of it is left where it is (closed all the same)
 _EYE_ALIGN_SPREAD = 1.0  # ... the face carried along with it out to about this many eye widths
 _EYE_CARRY = 0.006  # ... those within this of the skin (m) carried with it when it is carved
 _SLIT_LEFT = 0.0  # a body's eye slit squeezed to this share of its height
 _SLIT_EASE = 0.008  # ... the skin round it following, easing off over this (m)
 _BODY_EYE_SMOOTH = 8  # the closed slit's seam smoothed over this many rounds
 _BODY_EYE_KEEP = 0.02  # what's left of the socket's depth, pressed flat (its order kept: nothing folds over)
+_IRIS_OF_EYE = (0.17, 0.23)  # an iris's radius over its eye's width, corner to corner (11.7 mm in about 30, as eyes are)
 _IRIS_EDGE = 0.12  # the iris's and pupil's rims, steep over this share of their radius (a soft funnel read as a blank eye)
 _EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
 _EYE_DOME = 0.5  # an open eye's ball domes up to this share of its set-back in the middle
@@ -1506,10 +1507,11 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     # bulges stood there as a second pair of eyes. Each slit's middle onto
     # the photo's eye, the face round it carried along, easing off a few
     # eye widths out and to the head's back
+    # (already on the photo's eyes: left where they are -- but closed all
+    # the same: an empty socket is never an eye)
     V_ = _body_eyes_onto_photo(V, F, f, groove, near, have, ppm)
-    if V_ is None:
-        return V, None
-    V = V_
+    if V_ is not None:
+        V = V_
     near, _ = _raster_front(V, F, shape)
     have = np.isfinite(near)
     h = np.where(have, -near, np.nanmin(np.where(have, -near, np.inf)))
@@ -1556,6 +1558,32 @@ def _pocket_carry(V, pocket, near_v, ppm: float):
     return at & (V[:, 2] <= near_v + _EYE_CARRY * ppm)
 
 
+def _eye_iris(op, e):
+    """Where the iris sits in an open eye's opening (`op`, photo px) and how
+    big it and its pupil are: ((x, y), iris radius, pupil radius), or None.
+    There is little play in it: an iris is about 11.7 mm across in an eye
+    about 30 mm from corner to corner (so its radius a fifth of the eye's
+    width, _IRIS_OF_EYE), the photo's own iris reading kept to that; it
+    looks where the photo's does, across the opening, its middle between
+    the lids (the lids cover its top and bottom, never its middle); the
+    pupil a share of it (_PUPIL_R)."""
+    if e.get("iris") is None or not op.any():
+        return None
+    ys, xs = np.nonzero(op)
+    x0, x1 = float(xs.min()), float(xs.max())
+    eye_w = x1 - x0 + 1.0
+    ri = float(e.get("iris_r_px") or 0.0)
+    lo, hi = _IRIS_OF_EYE[0] * eye_w, _IRIS_OF_EYE[1] * eye_w
+    ri = float(np.clip(ri, lo, hi)) if ri > 0 else 0.5 * (lo + hi)
+    cx = float(np.clip(float(e["iris"][0]), x0 + 0.7 * ri, x1 - 0.7 * ri)) if x1 - x0 > 1.4 * ri else 0.5 * (x0 + x1)
+    col = op[:, int(round(cx))]
+    if not col.any():
+        return None
+    top, bot = np.flatnonzero(col)[[0, -1]]
+    cy = float(np.clip(float(e["iris"][1]), top, bot)) if bot > top else float(top)
+    return (cx, cy), ri, _PUPIL_R * ri
+
+
 def _set_eyes_back(V, F, face_read: dict, shape, ppm: float, pocket=None):
     from scipy.ndimage import binary_dilation
 
@@ -1588,21 +1616,23 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float, pocket=None):
         d = distance_transform_edt(op)
         dome = np.sqrt(np.clip(d / max(float(d.max()), 1e-6), 0.0, 1.0))
         target = float(np.mean(surf[lids])) - sr._EYE_INSET * ppm * (1.0 - _EYE_DOME * dome)
-        # the iris and its pupil carved into the eyeball itself: pushed back
-        # onto a plain dome, the eye had been left blank (the iris carved
-        # earlier went with it)
-        if e.get("iris") is not None:
+        # the eye as eyes are made: an eyeball behind the lids (the dome
+        # above), the iris on it and the pupil in the iris (_eye_iris), the
+        # lids over both -- the only eye there (the face's detail had carved
+        # an iris of its own: the two read as rings)
+        model = _eye_iris(op, e)
+        if model is not None:
+            (cx, cy), ri, rp = model
             ys_o, xs_o = np.nonzero(op)
-            rr = np.hypot(xs_o - float(e["iris"][0]), ys_o - float(e["iris"][1]))
-            ri = max(float(e.get("iris_r_px") or 0.0), 1.0)
+            rr = np.hypot(xs_o - cx, ys_o - cy)
             cut = np.zeros(shape)
             cut[ys_o, xs_o] = (_IRIS_CUT * np.clip((1.0 - rr / ri) / _IRIS_EDGE, 0.0, 1.0)
-                               + _PUPIL_DEPTH * np.clip((1.0 - rr / (_PUPIL_R * ri)) / _IRIS_EDGE, 0.0, 1.0)) * ppm
+                               + _PUPIL_DEPTH * np.sqrt(np.clip(1.0 - (rr / rp) ** 2, 0.0, 1.0))) * ppm
             cuts = np.where(op, cut, cuts)
-        # the eyeball onto its dome; the iris and pupil cut into it after,
-        # on top of wherever the ball ends up and kept out of the smoothing
-        # (smoothed with it, the rims ran into one funnel: a blank eye)
-        off = np.where(op, np.clip(np.nan_to_num(surf) - target, 0.0, None), off)
+        # the eyeball onto its dome, whatever was there before; the iris and
+        # pupil cut into it after, kept out of the smoothing (smoothed with
+        # it, the rims ran into one funnel: a blank eye)
+        off = np.where(op, np.nan_to_num(surf) - target, off)
     if not off.any():
         return V
     off = gaussian_filter(off, 0.7) + cuts
