@@ -204,6 +204,17 @@ def _release_memory() -> None:
     import ctypes
     import gc
 
+    # the models only reading a photo needs (cut-out, depth, the parts'
+    # reader) and their working memory: 1.2 GB held between builds that never
+    # use them -- loaded again when the next photo is read
+    try:
+        from anatomy3d import depth_source, head_parts, person_segmenter
+
+        depth_source._session = None
+        person_segmenter._birefnet_session = None
+        head_parts._clipseg_sess = None
+    except Exception:  # noqa: BLE001
+        pass
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
