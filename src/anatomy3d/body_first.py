@@ -624,10 +624,10 @@ _CHK_HAND_SW = (0.10, 0.40)  # a hand's breadth over the shoulders' width (a han
 _CHK_OUTLINE = 0.90  # the front's outline against the photo's (overlap)
 _CHK_SECTION = (0.85, 1.15)  # a section's depth for its width against the human figure's, after the plan
 _CHK_CLOTH_HOLLOW_MM = 6.0  # under clothes, no hollow deeper than this in the front (the body showing through)
-_IRIS_CUT = 0.003  # the iris, cut this deep into the eyeball (m on the person; 1.5 mm came out a quarter of a millimetre on a figure: blank)
-_PUPIL_DEPTH = 0.004  # the pupil, drilled this much deeper than the iris round it (m), as a sculptor does
+_IRIS_CUT = 0.002  # the iris, a flat disc cut this deep into the eyeball (m on the person), its rim sharp
+_PUPIL_DEPTH = 0.003  # the pupil, drilled this much deeper than the iris round it (m), as a sculptor does
 _PUPIL_R = 0.5  # ... over this share of the iris's radius
-_IRIS_EDGE = 0.25  # the iris's and pupil's rims, steep over this share of their radius (a soft bowl read as a blank eye)
+_IRIS_EDGE = 0.12  # the iris's and pupil's rims, steep over this share of their radius (a soft funnel read as a blank eye)
 _EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
 _EYE_DOME = 0.5  # an open eye's ball domes up to this share of its set-back in the middle
 _CHK_EYE_MM = 1.0  # an open eye sits at least this far behind the lids round it (mm, on the person)
@@ -1383,6 +1383,7 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float):
     surf = np.where(have, -near, np.nan)
     bx0, by0 = int(box[0]), int(box[1])
     off = np.zeros(shape)
+    cuts = np.zeros(shape)
     for e in eyes:
         mk = np.asarray(e["opening"], dtype=bool)
         op = np.zeros(shape, dtype=bool)
@@ -1416,15 +1417,14 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float):
             cut = np.zeros(shape)
             cut[ys_o, xs_o] = (_IRIS_CUT * np.clip((1.0 - rr / ri) / _IRIS_EDGE, 0.0, 1.0)
                                + _PUPIL_DEPTH * np.clip((1.0 - rr / (_PUPIL_R * ri)) / _IRIS_EDGE, 0.0, 1.0)) * ppm
-        else:
-            cut = 0.0
-        # the eyeball onto its dome, then the iris and pupil cut into it --
-        # on top of wherever the ball ends up, so a ball already sitting
-        # behind its dome still shows them
-        off = np.where(op, np.clip(np.nan_to_num(surf) - target, 0.0, None) + cut, off)
+            cuts = np.where(op, cut, cuts)
+        # the eyeball onto its dome; the iris and pupil cut into it after,
+        # on top of wherever the ball ends up and kept out of the smoothing
+        # (smoothed with it, the rims ran into one funnel: a blank eye)
+        off = np.where(op, np.clip(np.nan_to_num(surf) - target, 0.0, None), off)
     if not off.any():
         return V
-    off = gaussian_filter(off, 0.7)
+    off = gaussian_filter(off, 0.7) + cuts
     px_, py_ = V[:, 0], V[:, 1]
     vis = V[:, 2] <= map_coordinates(np.where(have, near, 1e9), [py_, px_], order=0, mode="nearest") + 1.5
     V = V.copy()
