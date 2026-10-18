@@ -631,6 +631,7 @@ _BODY_EYE_GROOVE = 0.004  # round the eyes, a groove deeper than this (m on the 
 _BODY_EYE_SPAN = 0.008  # ... and narrower than this
 _BODY_EYE_SOCKET = (0.012, 0.008, 0.05)  # its socket: this far round the slit, easing off over the next, this deep (m)
 _EYE_ALIGN_MAX = 1.5  # a slit is the body's eye if its middle is within this many eye widths of the photo's
+_EYE_ALIGN_KEEP = 0.6  # a body's eye within this many of the photo's eye heights of it is the photo's: kept as it is
 _EYE_ALIGN_SPREAD = 1.0  # ... the face carried along with it out to about this many eye widths
 _EYE_CARRY = 0.006  # ... those within this of the skin (m) carried with it when it is carved
 _BODY_EYE_KEEP = 0.02  # what's left of the socket's depth, pressed flat (its order kept: nothing folds over)
@@ -1376,6 +1377,12 @@ def _garment_views(V, F, part_w, names, found, J: dict, ppm: float):
     return V + off[:, None] * n_s, made
 
 
+def _eye_h(f, corner: int) -> float:
+    """An eye's open height (photo px) from the face landmarks, by its corner."""
+    up, lo = (159, 145) if corner == 33 else (386, 374)
+    return max(abs(float(f[lo, 1] - f[up, 1])), 1.0)
+
+
 def _body_eyes_onto_photo(V, F, f, groove, near, have, ppm: float):
     """The fitted body's eye slits (`groove`, photo px) moved onto the
     photo's eyes (face landmarks `f`), the face round them carried along."""
@@ -1398,13 +1405,13 @@ def _body_eyes_onto_photo(V, F, f, groove, near, have, ppm: float):
             if dd < _EYE_ALIGN_MAX * ew and sel.sum() >= 4 and (best is None or dd < best[0]):
                 best = (dd, g)
         if best is not None:
-            moves.append((best[1], pe - best[1], ew))
-    if not moves:
-        return V
+            moves.append((best[1], pe - best[1], ew, _eye_h(f, a)))
+    if not moves or all(float(np.hypot(*m[1])) <= _EYE_ALIGN_KEEP * m[3] for m in moves):
+        return None  # (already on the photo's eyes: kept as they are)
     sigma = _EYE_ALIGN_SPREAD * float(np.mean([m[2] for m in moves]))
     xy = V[:, :2]
     D = np.zeros((len(V), 2))
-    for g, d, _ in moves:
+    for g, d, _, _ in moves:
         D += np.exp(-np.sum((xy - g) ** 2, axis=1) / (2.0 * sigma * sigma))[:, None] * d[None, :]
     # (to the depth of the face: the back of the head stays)
     zf = map_coordinates(np.where(have, near, np.nanmax(np.where(have, near, -np.inf))), [V[:, 1], V[:, 0]], order=1, mode="nearest")
@@ -1454,7 +1461,10 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     # bulges stood there as a second pair of eyes. Each slit's middle onto
     # the photo's eye, the face round it carried along, easing off a few
     # eye widths out and to the head's back
-    V = _body_eyes_onto_photo(V, F, f, groove, near, have, ppm)
+    V_ = _body_eyes_onto_photo(V, F, f, groove, near, have, ppm)
+    if V_ is None:
+        return V, None
+    V = V_
     near, _ = _raster_front(V, F, shape)
     have = np.isfinite(near)
     h = np.where(have, -near, np.nanmin(np.where(have, -near, np.inf)))
