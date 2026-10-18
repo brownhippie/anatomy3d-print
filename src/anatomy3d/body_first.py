@@ -632,6 +632,7 @@ _BODY_EYE_SPAN = 0.008  # ... and narrower than this
 _BODY_EYE_SOCKET = (0.012, 0.008, 0.05)  # its socket: this far round the slit, easing off over the next, this deep (m)
 _EYE_ALIGN_MAX = 1.5  # a slit is the body's eye if its middle is within this many eye widths of the photo's
 _EYE_ALIGN_SPREAD = 1.0  # ... the face carried along with it out to about this many eye widths
+_EYE_CARRY = 0.006  # ... those within this of the skin (m) carried with it when it is carved
 _BODY_EYE_KEEP = 0.02  # what's left of the socket's depth, pressed flat (its order kept: nothing folds over)
 _IRIS_EDGE = 0.12  # the iris's and pupil's rims, steep over this share of their radius (a soft funnel read as a blank eye)
 _EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
@@ -1426,7 +1427,7 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     filled across it (in order, so nothing folds over), and the photo's eyes
     are the only ones."""
     if fm is None:
-        return V
+        return V, None
     from scipy.ndimage import grey_closing
 
     f = np.asarray(fm)[:, :2]
@@ -1440,13 +1441,13 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
     band = have & (yy >= top) & (yy <= bot) & (xx >= x0) & (xx <= x1)
     if not band.any():
-        return V
+        return V, None
     h = np.where(have, -near, np.nanmin(np.where(have, -near, np.inf)))
     k = max(int(round(_BODY_EYE_SPAN * ppm)) | 1, 5)
     hc = grey_closing(h, size=(k, k))
     groove = band & (hc - h > _BODY_EYE_GROOVE * ppm)
     if not groove.any():
-        return V
+        return V, None
     # first the body's eyes moved onto the photo's: the fit puts them where
     # the nose, eyes and ears agree best, which left them a centimetre off
     # (below, on the bags under the photo's eyes) -- the reference's eye
@@ -1460,7 +1461,7 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     hc = grey_closing(h, size=(k, k))
     groove = band & (hc - h > _BODY_EYE_GROOVE * ppm)
     if not groove.any():
-        return V
+        return V, None
     hc = np.maximum(gaussian_filter(hc, 0.002 * ppm), h)  # (the filling smoothed: square plateaus otherwise)
     # over the socket (it runs on under the lids round the slit), easing off
     # round it; to the socket's depth, easing off behind it
@@ -1474,10 +1475,19 @@ def _close_body_eyes(V, F, fm, shape, ppm: float):
     wd = np.clip((deep - dz) / (0.3 * deep), 0.0, 1.0) * (dz > -1.5)
     V = V.copy()
     V[:, 2] -= wl * wd * (1.0 - _BODY_EYE_KEEP) * np.clip(dz, 0.0, None)
-    return V
+    return V, w_lat > 0.01  # (and where the socket was, pressed flat behind the skin)
 
 
-def _set_eyes_back(V, F, face_read: dict, shape, ppm: float):
+def _pocket_carry(V, pocket, near_v, ppm: float):
+    """Vertices of the body's eye sockets, pressed flat just behind the skin
+    (_close_body_eyes): carried with the skin when it is carved."""
+    if pocket is None:
+        return np.zeros(len(V), dtype=bool)
+    at = map_coordinates(pocket.astype(np.float32), [V[:, 1], V[:, 0]], order=0, mode="constant") > 0.5
+    return at & (V[:, 2] <= near_v + _EYE_CARRY * ppm)
+
+
+def _set_eyes_back(V, F, face_read: dict, shape, ppm: float, pocket=None):
     from scipy.ndimage import binary_dilation
 
     from . import silhouette_relief as sr
@@ -1534,7 +1544,8 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float):
         return V
     off = gaussian_filter(off, 0.7) + cuts
     px_, py_ = V[:, 0], V[:, 1]
-    vis = V[:, 2] <= map_coordinates(np.where(have, near, 1e9), [py_, px_], order=0, mode="nearest") + 1.5
+    near_v = map_coordinates(np.where(have, near, 1e9), [py_, px_], order=0, mode="nearest")
+    vis = (V[:, 2] <= near_v + 1.5) | _pocket_carry(V, pocket, near_v, ppm)
     V = V.copy()
     V[:, 2] += np.where(vis, map_coordinates(off, [py_, px_], order=1, mode="nearest"), 0.0)  # (depth runs toward the back)
     return V
@@ -1822,7 +1833,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         part_w, ear_w9 = pw_all[:, :part_w.shape[1]], pw_all[:, part_w.shape[1]:]
     else:
         V, F, part_w = _subdivide(V, F, part_w)
-    V = _close_body_eyes(V, F, inputs.face_mesh, shape, ppm)
+    V, eye_pocket = _close_body_eyes(V, F, inputs.face_mesh, shape, ppm)
     st = {"V": V, "F": F, "pw": part_w}
     before = st
     locks.lock("9 detail", "no new spikes", _spike_pct, lambda m, m0: m <= m0 + _LOCK_SPIKES, st)
@@ -1954,6 +1965,11 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     inb = (px >= 0) & (px < shape[1] - 1) & (py >= 0) & (py < shape[0] - 1)
     near_at = map_coordinates(np.where(np.isfinite(near), near, 1e9), [py, px], order=0, mode="nearest")
     visible = inb & (V[:, 2] <= near_at + 1.5)  # frontmost at its pixel (photo px)
+    # (where the body's eye sockets were pressed flat just behind the skin,
+    # those layers carried with it: left, they showed through the eyes)
+    carry = _pocket_carry(V, eye_pocket, near_at, ppm)
+    visible |= carry
+    facing = np.where(carry, 1.0, facing)  # (as the skin over them)
     off_v = map_coordinates(offset, [py, px], order=1, mode="nearest")
     V = V.copy()
     V[:, 2] = V[:, 2] - np.where(visible, off_v * facing, 0.0)
@@ -2034,7 +2050,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # against the lids themselves -- the body's own eyeballs stood in front
     # of them, so a set-back added on top left the eye level with its lids:
     # at the edge the eyeball's full set-back, doming up toward the middle
-    V = _set_eyes_back(V, F, parts.get("face") or {}, shape, ppm)
+    V = _set_eyes_back(V, F, parts.get("face") or {}, shape, ppm, eye_pocket)
     st = dict(st, V=V)
     hi_ = _head_iou(st, mask, fm)
     if hi_ is not None:
