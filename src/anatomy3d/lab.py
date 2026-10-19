@@ -534,7 +534,17 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
     m = {"watertight": bool(mesh.is_watertight), "faces": int(len(mesh.faces))}
 
     preview = mesh if len(mesh.faces) <= PREVIEW_FACES else mesh.simplify_quadric_decimation(face_count=PREVIEW_FACES)
-    m["min_wall_mm"] = round(float(estimate_min_wall_thickness(preview, sample_count=800)), 2)
+    # walls measured on the body: a garment's piece is a closed solid of its
+    # own sunk into it (printed together, the slicer joins them), so its own
+    # thinness isn't a wall of the print (body_first: the body's faces first)
+    nb = int((getattr(body, "report", None) or {}).get("body_faces") or 0)
+    if 0 < nb < len(mesh.faces):
+        wm = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces[:nb], process=False)
+        wm.remove_unreferenced_vertices()
+        wm = wm if len(wm.faces) <= PREVIEW_FACES else wm.simplify_quadric_decimation(face_count=PREVIEW_FACES)
+    else:
+        wm = preview
+    m["min_wall_mm"] = round(float(estimate_min_wall_thickness(wm, sample_count=800)), 2)
 
     keep = preview.vertices[preview.faces][:, :, 1].min(axis=1) > floor + 0.5
     adj, ang = preview.face_adjacency, preview.face_adjacency_angles

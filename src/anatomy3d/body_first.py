@@ -27,8 +27,10 @@ In order, each step checked and locked before the next (_Checks, _Locks):
    clothes' folds, the hair's pattern), then what is placed by measure: the
    eyes behind their lids, the side whiskers, the garments made all round
    from how they are sewn (garment_designs);
-10. the pieces: each garment and each hand a solid of its own, joined;
-11. out: one closed solid, scaled to the figure's height.
+10. the pieces: each hand a solid of its own, joined; each garment a closed
+    solid of its own, kept apart, sunk into the body under it;
+11. out: the body, one closed solid, and the garments' pieces with it,
+    scaled to the figure's height.
 """
 from typing import Optional
 
@@ -2202,29 +2204,36 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
 
     # 10. the pieces of their own: the clothes the photo shows (each standing
     # over what is under it by its tailored height) and the hands (on what
-    # they lie on) -- kept only if the whole stays one closed solid
+    # they lie on). The hands are joined to the body; the garments stay
+    # pieces of their own, each its own closed solid sunk into the body under
+    # it (a slicer prints them together) -- joined into one solid, a union
+    # that came apart dropped every garment, and the figure came out with
+    # its clothes painted on
     garments, made = ([], []) if pop_lift is None else _garment_pieces(V, F, clothes, pop_lift[0], pop_lift[1], ppm, nr)
     hands = _hand_solids(V, F, hand_regions, ppm) if hand_regions else []
     report["garment_pieces"] = made
     joined = None
-    for parts_, what in ((garments + hands, "garments and hands"), (hands, "hands")):
-        if not parts_:
-            continue
+    if hands:
         try:
-            Vj, Fj = sr._join_solids(V, F, parts_)
+            Vj, Fj = sr._join_solids(V, F, hands)
             if trimesh.Trimesh(Vj, Fj, process=False).is_watertight:
-                joined = what
+                joined = "hands"
                 V, F = Vj, Fj
-                break
-        except Exception as exc:  # noqa: BLE001 - try with fewer pieces
-            print(f"Note: {what} not joined ({exc}).")
+        except Exception as exc:  # noqa: BLE001 - the body goes on without them
+            print(f"Note: hands not joined ({exc}).")
+    kept = []
+    for (gv, gf), m_ in zip(garments, made):
+        closed = trimesh.Trimesh(gv, gf, process=False).is_watertight
+        m_["closed"] = bool(closed)
+        if closed:
+            kept.append((np.asarray(gv, dtype=np.float64), np.asarray(gf, dtype=np.int64)))
     if garments:
         chk.add("10 pieces", "garment pieces made", float(len(garments)), lo=1)
         for m_ in made:
             chk.add("10 pieces", f"{m_['garment']} piece stands", m_["height_mm"], *_CHK_PIECE_MM, unit=" mm")
-        chk.add("10 pieces", "garment pieces joined, one closed solid", float(joined == "garments and hands"), lo=1)
-        if joined != "garments and hands" and pop_off is not None:
-            # (the pieces couldn't be joined: the clothes' soft steps instead)
+        chk.add("10 pieces", "garment pieces each a closed solid", len(kept) / len(garments), lo=1)
+        if not kept and pop_off is not None:
+            # (no piece came out closed: the clothes' soft steps instead)
             px_, py_ = V[:, 0], V[:, 1]
             nz = map_coordinates(np.where(np.isfinite(near), near, 1e9), [py_, px_], order=0, mode="nearest")
             vis = V[:, 2] <= nz + 1.5
@@ -2237,12 +2246,25 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # went below onto it folded triangles over each other -- thin walls)
     if cut_row is not None:
         V, F, _ = _cut_below(V, F, cut_row, {})
+        cut_kept = []
+        for gv, gf in kept:  # (the garments cut at the same row)
+            if float(gv[:, 1].min()) >= cut_row:
+                continue
+            try:
+                gv2, gf2, _ = _cut_below(gv, gf, cut_row, {}) if float(gv[:, 1].max()) > cut_row else (gv, gf, None)
+            except Exception:  # noqa: BLE001 - (a piece the cut left nothing of)
+                continue
+            if len(gf2) and trimesh.Trimesh(gv2, gf2, process=False).is_watertight:
+                cut_kept.append((gv2, gf2))
+        kept = cut_kept
     mesh = trimesh.Trimesh(V, F, process=False)
     pieces = mesh.split(only_watertight=False)
     if len(pieces) > 1:
         mesh = max(pieces, key=lambda p: len(p.faces))
     chk.add("11 out", "closed solid", float(mesh.is_watertight), lo=1)
     chk.add("11 out", "pieces dropped", float(len(pieces) - 1), hi=0)
+    report["garment_pieces_out"] = len(kept)
+    report["body_faces"] = int(len(mesh.faces))  # (the body first; the garments' pieces after it)
     from .print_prep import estimate_min_wall_thickness
 
     mm_ = mesh.copy()
@@ -2254,6 +2276,14 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             hi=_CHK_SPIKES, unit=" %")
     report["checks"] = chk.rows
     report["checks_failed"] = chk.failed()
+    if kept:
+        # the garments' pieces put with the body, each still its own closed solid
+        Vs, Fs, n = [np.asarray(mesh.vertices)], [np.asarray(mesh.faces)], len(mesh.vertices)
+        for gv, gf in kept:
+            Vs.append(gv)
+            Fs.append(gf + n)
+            n += len(gv)
+        mesh = trimesh.Trimesh(np.vstack(Vs), np.vstack(Fs), process=False)
     P = np.asarray(mesh.vertices)
     xyz = np.column_stack([P[:, 0] - (P[:, 0].min() + P[:, 0].max()) / 2.0, -P[:, 1], -P[:, 2]])
     xyz[:, 1] -= xyz[:, 1].min()
