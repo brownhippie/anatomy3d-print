@@ -345,8 +345,29 @@ def build(code: str, inputs: LabInputs):
                                 depth_strength=None if o["depth"] == "off" else float(o["depth"]),
                                 face_strength={"off": 0.0, "half": 0.45, "full": 1.0}[o["face"]],
                                 clothes_steps=o["clothes"] == "on")
-        out = add_base_disk(body, HEIGHT_MM)
-        out.report = getattr(body, "report", None)  # (the reality checks of each step)
+        rep = getattr(body, "report", None) or {}
+        nb = int(rep.get("body_faces") or 0)
+        if 0 < nb < len(body.faces):
+            # the base under the body alone; the garments' pieces kept as
+            # pieces of their own on it (put into one union with the body,
+            # overlapping shells in one mesh, they were fused back in -- or
+            # lost)
+            from .mesh_types import BodyMesh
+
+            used = np.unique(body.faces[:nb])
+            remap = np.full(len(body.vertices), -1, dtype=np.int64)
+            remap[used] = np.arange(len(used))
+            base = add_base_disk(BodyMesh(vertices=body.vertices[used], faces=remap[body.faces[:nb]]), HEIGHT_MM)
+            rest = body.faces[nb:]
+            used_g = np.unique(rest)
+            remap_g = np.full(len(body.vertices), -1, dtype=np.int64)
+            remap_g[used_g] = np.arange(len(used_g)) + len(base.vertices)
+            out = BodyMesh(vertices=np.vstack([base.vertices, body.vertices[used_g]]),
+                           faces=np.vstack([base.faces, remap_g[rest]]))
+            rep["body_faces"] = int(len(base.faces))
+        else:
+            out = add_base_disk(body, HEIGHT_MM)
+        out.report = rep or None  # (the reality checks of each step)
         return out
     if fam == "O" and o["rescue"] == "on" and inputs.animal_frac <= _RESCUE_ANIMAL_MIN:
         # (its depth bands on a person are lines of equal estimated depth,
