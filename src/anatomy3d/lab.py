@@ -539,6 +539,30 @@ def _procrustes_nme(src: np.ndarray, dst: np.ndarray) -> float:
     return 100.0 * float(np.linalg.norm(aligned - b, axis=1).mean() / np.linalg.norm(dst[33] - dst[263]))
 
 
+def _preview(mesh: trimesh.Trimesh, body_faces: int = 0) -> trimesh.Trimesh:
+    """A light copy of a model (PREVIEW_FACES), for its scores, thumbnail and
+    stored preview. A body-first model is the body (its first `body_faces`
+    faces) and the garments' pieces apart on it: each lightened on its own,
+    its share of the faces by its area -- lightened all together, the pieces'
+    dense layers took half the faces and their edges came out squashed (the
+    clothes scored 78 where the full model scores 89)."""
+    if len(mesh.faces) <= PREVIEW_FACES:
+        return mesh
+    if not 0 < body_faces < len(mesh.faces):
+        return mesh.simplify_quadric_decimation(face_count=PREVIEW_FACES)
+    parts = [trimesh.Trimesh(mesh.vertices, mesh.faces[:body_faces], process=False)]
+    rest = trimesh.Trimesh(mesh.vertices, mesh.faces[body_faces:], process=False)
+    parts += rest.split(only_watertight=False)
+    for p in parts:
+        p.remove_unreferenced_vertices()
+    areas = np.array([max(float(p.area), 1e-9) for p in parts])
+    out = []
+    for p, a in zip(parts, areas):
+        n = max(int(PREVIEW_FACES * a / areas.sum()), 200)
+        out.append(p if len(p.faces) <= n else p.simplify_quadric_decimation(face_count=n))
+    return trimesh.util.concatenate(out)
+
+
 def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (480, 320)) -> "tuple[dict, trimesh.Trimesh, Image.Image]":
     """Metrics, a light preview mesh (keeps vertex colours when small enough)
     and a thumbnail for one built combination."""
@@ -554,11 +578,11 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
     floor = mesh.vertices[:, 1].min() + disk
     m = {"watertight": bool(mesh.is_watertight), "faces": int(len(mesh.faces))}
 
-    preview = mesh if len(mesh.faces) <= PREVIEW_FACES else mesh.simplify_quadric_decimation(face_count=PREVIEW_FACES)
+    nb = int((getattr(body, "report", None) or {}).get("body_faces") or 0)
+    preview = _preview(mesh, nb)
     # walls measured on the body: a garment's piece is a closed solid of its
     # own sunk into it (printed together, the slicer joins them), so its own
     # thinness isn't a wall of the print (body_first: the body's faces first)
-    nb = int((getattr(body, "report", None) or {}).get("body_faces") or 0)
     if 0 < nb < len(mesh.faces):
         wm = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces[:nb], process=False)
         wm.remove_unreferenced_vertices()
