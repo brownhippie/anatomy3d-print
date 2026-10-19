@@ -638,8 +638,9 @@ _SLIT_LEFT = 0.0  # a body's eye slit squeezed to this share of its height
 _SLIT_EASE = 0.008  # ... the skin round it following, easing off over this (m)
 _BODY_EYE_SMOOTH = 8  # the closed slit's seam smoothed over this many rounds
 _BODY_EYE_KEEP = 0.02  # what's left of the socket's depth, pressed flat (its order kept: nothing folds over)
+_EYE_PRESS = 0.012  # inside an open eye, everything this far behind the skin goes onto the eyeball, in order (m)
 _IRIS_OF_EYE = (0.17, 0.23)  # an iris's radius over its eye's width, corner to corner (11.7 mm in about 30, as eyes are)
-_IRIS_EDGE = 0.12  # the iris's and pupil's rims, steep over this share of their radius (a soft funnel read as a blank eye)
+_IRIS_EDGE = 0.2  # the iris's rim, steep over this share of its radius (a soft funnel read as a blank eye; sharper, a staircase)
 _EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
 _EYE_DOME = 0.5  # an open eye's ball domes up to this share of its set-back in the middle
 _CHK_EYE_MM = 1.0  # an open eye sits at least this far behind the lids round it (mm, on the person)
@@ -1597,8 +1598,9 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float, pocket=None):
     have = np.isfinite(near)
     surf = np.where(have, -near, np.nan)
     bx0, by0 = int(box[0]), int(box[1])
-    off = np.zeros(shape)
-    cuts = np.zeros(shape)
+    tgt = np.full(shape, np.nan)  # the eyeballs' depth, where they show
+    wgt = np.zeros(shape)
+    irises = []  # ((centre, iris radius, pupil radius), opening) per eye
     for e in eyes:
         mk = np.asarray(e["opening"], dtype=bool)
         op = np.zeros(shape, dtype=bool)
@@ -1622,42 +1624,68 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float, pocket=None):
         # an iris of its own: the two read as rings)
         model = _eye_iris(op, e)
         if model is not None:
-            (cx, cy), ri, rp = model
-            ys_o, xs_o = np.nonzero(op)
-            rr = np.hypot(xs_o - cx, ys_o - cy)
-            cut = np.zeros(shape)
-            cut[ys_o, xs_o] = (_IRIS_CUT * np.clip((1.0 - rr / ri) / _IRIS_EDGE, 0.0, 1.0)
-                               + _PUPIL_DEPTH * np.sqrt(np.clip(1.0 - (rr / rp) ** 2, 0.0, 1.0))) * ppm
-            cuts = np.where(op, cut, cuts)
-        # the eyeball onto its dome, whatever was there before; the iris and
-        # pupil cut into it after, kept out of the smoothing (smoothed with
-        # it, the rims ran into one funnel: a blank eye)
-        off = np.where(op, np.nan_to_num(surf) - target, off)
-    if not off.any():
+            irises.append((model, op))
+        # the eyeball on its dome, whatever was there before (the dents
+        # left where the body's own eye was closed, taken along when it was
+        # measured off the surface, came out as streaks across the eye)
+        tgt = np.where(op, -target, tgt)  # (as depth: toward the back)
+        wgt = np.maximum(wgt, op.astype(np.float64))
+    if not wgt.any():
         return V
-    off = gaussian_filter(off, 0.7) + cuts
     px_, py_ = V[:, 0], V[:, 1]
     near_v = map_coordinates(np.where(have, near, 1e9), [py_, px_], order=0, mode="nearest")
     vis = (V[:, 2] <= near_v + 1.5) | _pocket_carry(V, pocket, near_v, ppm)
+    # each point set where the dome puts it (a layer of the body's closed
+    # eye behind the skin kept as far behind as it was), eased in at the lids
+    filled = tgt.copy()
+    holes = ~np.isfinite(filled)
+    if holes.any():
+        idx = distance_transform_edt(holes, return_distances=False, return_indices=True)
+        filled = filled[tuple(idx)]
+    w = np.clip(map_coordinates(gaussian_filter(wgt, 0.7), [py_, px_], order=1, mode="constant"), 0.0, 1.0)
+    zt = map_coordinates(filled, [py_, px_], order=1, mode="nearest")
+    # everything there to a little past the eyeball's depth (the backs of
+    # the lids, the body's closed eye) pressed onto it in order, just behind
+    # it: left where it was, it showed through the eye as speckle
+    gap = np.clip(V[:, 2] - near_v, 0.0, None)
+    deep = _EYE_PRESS * ppm
+    wd = np.clip((1.3 * deep - gap) / (0.3 * deep), 0.0, 1.0)
+    dz = w * wd * (zt + _BODY_EYE_KEEP * gap - V[:, 2])
+    # the iris and pupil cut at each point where it is, not on the photo's
+    # pixels (cut there, their sharp rims came out as staircases: crooked
+    # rings), inside the opening as the lids leave it
+    for ((cx, cy), ri, rp), op in irises:
+        rr = np.hypot(px_ - cx, py_ - cy)
+        near_eye = rr < ri + 2.0
+        if not near_eye.any():
+            continue
+        inside = map_coordinates(op.astype(np.float64), [py_[near_eye], px_[near_eye]], order=1, mode="constant")
+        r = rr[near_eye]
+        cut = (_IRIS_CUT * np.clip((1.0 - r / ri) / _IRIS_EDGE, 0.0, 1.0)
+               + _PUPIL_DEPTH * np.sqrt(np.clip(1.0 - (r / rp) ** 2, 0.0, 1.0))) * ppm
+        dz[near_eye] += cut * np.clip(inside, 0.0, 1.0) * wd[near_eye]
     V = V.copy()
-    V[:, 2] += np.where(vis, map_coordinates(off, [py_, px_], order=1, mode="nearest"), 0.0)  # (depth runs toward the back)
+    V[:, 2] += dz  # (depth runs toward the back)
     return V
 
 
 def _eye_opened(op):
-    """An open eye's opening (photo px mask) as the figure shows it: its
-    height taken _EYE_OPEN_SHOW times, over its own width only (a smiling or
-    narrowed eye's slit, at a figure's size, left no room for its iris)."""
-    from scipy.ndimage import binary_dilation
-
+    """An open eye's opening (photo px mask) as the figure shows it: each
+    column of it taken _EYE_OPEN_SHOW times as tall about its own middle (a
+    smiling or narrowed eye's slit, at a figure's size, left no room for its
+    iris) -- the eye's own almond, its corners still coming to points (grown
+    by the same rows everywhere, it came out a box: crooked)."""
     if not op.any():
         return op
-    gap = int(op.sum(axis=0).max())
-    k = max(int(round((_EYE_OPEN_SHOW - 1.0) * gap / 2.0)), 0)
-    if not k:
-        return op
-    cols = op.any(axis=0)
-    return binary_dilation(op, structure=np.ones((2 * k + 1, 1), dtype=bool)) & cols[None, :]
+    out = op.copy()
+    rows = np.arange(op.shape[0])[:, None]
+    cols = np.flatnonzero(op.any(axis=0))
+    sub = op[:, cols]
+    top = np.argmax(sub, axis=0).astype(np.float64)
+    bot = (op.shape[0] - 1 - np.argmax(sub[::-1], axis=0)).astype(np.float64)
+    mid, half = (top + bot) / 2.0, (bot - top + 1.0) / 2.0 * _EYE_OPEN_SHOW
+    out[:, cols] |= np.abs(rows - mid[None, :]) <= half[None, :] - 0.5
+    return out
 
 
 def _eyes_set_back_mm(st: dict, face_read: dict, shape, ppm: float) -> Optional[float]:
