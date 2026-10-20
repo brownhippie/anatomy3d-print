@@ -355,6 +355,21 @@ _PLAN_TOLERANCE = 0.08  # a section's depth within this share of the human figur
 _PLAN_MAX_FIX = 0.25  # ... and moved at most this share toward it
 
 
+def _face_over_body(fm, near, cov):
+    """The face landmarks with their depth taken as the photo's face over the
+    body's own front at each of them (photo px; _face_relief then keeps only
+    the features): what the photo's face adds to or takes from the body's."""
+    f = np.array(fm, dtype=np.float64, copy=True)
+    have = cov & np.isfinite(near)
+    if have.sum() < 100:
+        return f
+    _, (iy, ix) = distance_transform_edt(~have, return_indices=True)
+    front = np.where(have, -near, -near[iy, ix])  # (toward the camera, filled out to the nearest seen)
+    body = map_coordinates(front, [f[:, 1], f[:, 0]], order=1, mode="nearest")
+    f[:, 2] = f[:, 2] + body  # (landmark z runs away from the camera)
+    return f
+
+
 def _views(V, F, res: float):
     """Depth maps of the body seen from the front, back, left and right
     (orthographic, photo px; nearer is larger), and each view's outline."""
@@ -1990,7 +2005,13 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     if fm is not None:
         strength = face_strength if face_strength is not None else (sr._FACE_RELIEF_WITH_DEPTH if depth_strength else 1.0)
         if strength > 0:
-            fr = sr._face_relief(fm, shape, 0, 0, 1.0, 0) * strength
+            # the photo's face in place of the body's own, not on top of it:
+            # the relief is the face's features over its overall curve, made
+            # for a smooth head; the body here has a face of its own (the
+            # reference figure's nose, lips, brow) and, added to it, the nose
+            # came out twice its size. The body's own features at the same
+            # landmarks taken off first
+            fr = sr._face_relief(_face_over_body(fm, near, cov), shape, 0, 0, 1.0, 0) * strength
             if labels is not None:
                 from .head_parts import BODY_SKIN, FACE_SKIN
 
