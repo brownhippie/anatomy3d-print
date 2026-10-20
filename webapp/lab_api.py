@@ -131,13 +131,18 @@ def _active_run() -> Optional[str]:
     return best
 
 
+_INPUTS_READING = "r2"
+
+
 def _inputs(run_id: str, d: Path):
     if run_id not in _inputs_cache:
         _inputs_cache.clear()
         # read from the photo once and kept with the run: each build runs in
         # a process of its own (lab_job.py) and loads it instead of reading
         # the photo again (a minute and the photo-reading models each time)
-        p = d / "inputs.pkl"
+        # (named for what reads it: when the reading changes -- the tie read
+        # whole, 20 Oct -- a run reads its photo again once)
+        p = d / f"inputs_{_INPUTS_READING}.pkl"
         inputs = None
         if p.exists():
             try:
