@@ -679,6 +679,12 @@ _HAND_THICK_RATIO = 0.35  # a palm is this thick for its breadth (hand thickness
 _HAND_THICK_MIN = 0.015  # ... and never thinner than this (m)
 _HAND_MIN_W = 0.008  # a hand's solid has nothing narrower than this (m)
 _HAND_STUB = 0.15  # the body's own hand goes into the wrist, drawn to this share of its size
+_HAND_RELIEF_SPAN = 0.025  # the hand's own shape from the photo's depth: what is finer than this (m) -- fingers, knuckles, the gaps between
+_HAND_RELIEF_MAX = 0.012  # ... standing at most this far either way (m: about a finger's thickness)
+_HAND_RELIEF_AROUND = 0.12  # ... in the depth's scale, read off the body round the hand within this far (m)
+_HAND_WALL_MARGIN = 1.5  # a hand's solid no thinner than this many times the thinnest wall a print holds
+_HAND3D_COVER = 0.8  # a hand placed on its skin counts when it covers at least this share of it
+_HAND_UNDER = 1.0  # a hand's underside reaches what it lies on when that is within this many more of its thickness (else its own)
 
 
 def _skin_hands(names, inputs):
@@ -783,7 +789,92 @@ def _tuck_hands(V, part_w, names):
     return V, held, wrist_z
 
 
-def _hand_solids(V, F, regions, ppm):
+def _hands_3d(V, F, regions, hand_names, ref, inputs, ppm, print_px=0.0):
+    """Each hand the photo shows as a hand (hands3d): the body's own, placed
+    on its skin; one that can't be placed there the outline's solid
+    (_hand_solids) instead. ([(vertices, faces)], what was made of each)."""
+    from . import hands3d
+
+    near, _ = _raster_front(V, F, regions[0][0].shape)
+    have = np.isfinite(near)
+    _, (iy, ix) = distance_transform_edt(~have, return_indices=True)
+    rest = -near[iy, ix]
+    P = inputs.pose or {}
+    sw = float(np.linalg.norm(np.subtract(P["left_shoulder"][:2], P["right_shoulder"][:2]))) if "left_shoulder" in P and "right_shoulder" in P else 0.4 * ppm
+    person = np.asarray(inputs.photo_mask, dtype=bool)
+    out, info, rest_regions = [], {}, []
+
+    def place(H, side, scale=None):
+        wr = (ref.get("joints_px") or {}).get(("left" if side == "L" else "right") + "_wrist")
+        got = hands3d.place(ref.get("report") or {}, side, H, person, wr[:2] if wr else None, ppm, sw, scale)
+        return (None, None) if got is None else (got[:2], got[2])
+
+    # the two hands are the same size: the size from the hand that shows the
+    # most skin (a hand half hidden under an arm fits a smaller one as well)
+    size = None
+    try:
+        H_most, n_most = max(zip([H for H, _ in regions], hand_names), key=lambda z: int(z[0].sum()))
+        _, p_most = place(H_most, n_most.split(".")[-1])
+        if p_most is not None and p_most["cover"] >= _HAND3D_COVER:
+            size = p_most["scale"]
+    except Exception:  # noqa: BLE001 - each its own size then
+        size = None
+    for (H, wz), n in zip(regions, hand_names):
+        side = n.split(".")[-1]
+        try:
+            tpl, placed = place(H, side, size)
+            laid = None
+            if placed is not None and placed["cover"] >= _HAND3D_COVER:
+                laid = hands3d.lay(tpl[0], tpl[1], placed, H, rest, have, ppm, wz, print_px)
+            if laid is not None:
+                out.append(laid)
+                info[n] = {k: placed[k] for k in ("scale", "cover", "spread", "palm")}
+                continue
+            info[n] = {"fallback": "not placed" if placed is None else f"covers {placed['cover']}"}
+        except Exception as exc:  # noqa: BLE001 - the outline's solid instead
+            info[n] = {"fallback": str(exc)[:80]}
+        rest_regions.append((H, wz))
+    if rest_regions:
+        out += _hand_solids(V, F, rest_regions, ppm, _hand_relief(inputs.depth, rest_regions, near, ppm))
+    return out, info
+
+
+def _hand_relief(depth, regions, near, ppm):
+    """Each hand's own shape from the photo's depth (its fingers, knuckles,
+    the gaps between the fingers -- the outline alone is a flat mitten):
+    what is finer than _HAND_RELIEF_SPAN, in photo px toward the camera.
+    The depth estimate has no scale of its own: it is read off the body
+    round the hand (the body's height there against the estimate's, the
+    slope of the one on the other); none where they don't agree in sign."""
+    from scipy.ndimage import binary_dilation
+
+    from . import silhouette_relief as sr
+
+    have = np.isfinite(near)
+    if depth is None or not regions or not have.any():
+        return None
+    shape = near.shape
+    d = np.asarray(depth, dtype=np.float64)
+    rr, cc = np.mgrid[0:shape[0], 0:shape[1]]
+    d = map_coordinates(d, [rr * (d.shape[0] / shape[0]), cc * (d.shape[1] / shape[1])], order=1, mode="nearest")
+    body = np.where(have, -near, 0.0)
+    out = np.zeros(shape)
+    span = max(_HAND_RELIEF_SPAN * ppm, 2.0)
+    around_px = max(int(round(_HAND_RELIEF_AROUND * ppm)), 3)
+    for H, _ in regions:
+        ring = binary_dilation(H, iterations=around_px) & ~H & have
+        if ring.sum() < 200:
+            continue
+        a = np.polyfit(d[ring], body[ring], 1)[0]  # (px of height per unit of the estimate)
+        if not np.isfinite(a) or a <= 0.0:
+            continue
+        fine = d - sr._masked_blur(d, H, span)
+        m = _HAND_RELIEF_MAX * ppm
+        out = np.where(H, m * np.tanh(a * fine / m), out)
+    return out
+
+
+def _hand_solids(V, F, regions, ppm, relief=None):
     """The hands the photo shows, each a closed solid: the photo's hand for its
     outline, its thickness from its own widths, lying on what is under it
     (sunk a little into it, so they join) or beside the body at its wrist's
@@ -833,7 +924,14 @@ def _hand_solids(V, F, regions, ppm):
         # the arms with gaps under it left tunnels through the joined
         # model); beside it, round about its own wrist's depth
         front = top + Rc + half
-        back = rest - sr._HAND_SINK * ppm
+        if relief is not None:
+            front = front + gaussian_filter(np.where(H, relief, 0.0), 0.7)
+        # (its underside: down to what it lies on where that is within
+        # another hand's thickness -- no tunnels under it -- else its own
+        # thickness under its face: down to whatever lay under it, a hand
+        # stood as a column into the chest)
+        thick = 2.0 * np.maximum(half, Rc)
+        back = np.where(front - rest < (1.0 + _HAND_UNDER) * thick, rest, front - thick) - sr._HAND_SINK * ppm
         if wz is not None:
             over = gaussian_filter(have.astype(np.float64), 2.0)
             front = over * front + (1.0 - over) * (-wz + half)
@@ -1887,6 +1985,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     V, arms = _fold_arms(V, F, part_w, names, inputs, ref)
     arms["hands"] = hands_read
     V, hand_held, wrist_z = _tuck_hands(V, part_w, names)
+    hand_names = [n for _, n in hand_regions]
     hand_regions = [(H, wrist_z.get(n)) for H, n in hand_regions]
     fl = arms.get("forearm_px") or {}
     if len(fl) == 2:
@@ -2256,7 +2355,11 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # that came apart dropped every garment, and the figure came out with
     # its clothes painted on
     garments, made = ([], []) if pop_lift is None else _garment_pieces(V, F, clothes, pop_lift[0], pop_lift[1], ppm, nr)
-    hands = _hand_solids(V, F, hand_regions, ppm) if hand_regions else []
+    hands = []
+    if hand_regions:
+        # (as thin as a print holds at the figure's size, no thinner)
+        print_px = _CHK_WALL_MM * _HAND_WALL_MARGIN * float(np.ptp(V[:, 1])) / max(target_height_mm, 1e-6)
+        hands, report["hands_3d"] = _hands_3d(V, F, hand_regions, hand_names, ref, inputs, ppm, print_px)
     report["garment_pieces"] = made
     joined = None
     if hands:
