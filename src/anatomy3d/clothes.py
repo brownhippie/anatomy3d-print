@@ -72,6 +72,10 @@ _COLLAR_PROMPT = [49406, 320, 2523, 13497, 49407]  # "a shirt collar"
 _COLLAR_BAND = 0.9  # ... a collar only this many face heights below the chin
 _LAPEL_W = 0.55  # a lapel's width at its top, face widths (a jacket's lapels run along its opening, narrowing to the button)
 _TIE_MARGIN = 0.3  # ... where "a necktie" outscores the other garments by this much (logits)
+_TIE_SMOOTH = 0.02  # the tie's whole length: its colour, a pattern's dots averaged over this many face widths ...
+_TIE_MATCH = 1.5  # ... within this many times its own colour spread (Lab, the 90th percentile over what was read) ...
+_TIE_MATCH_MIN = 8.0  # ... (never tighter than this, Lab units)
+_TIE_REACH = 0.6  # ... joined to it, this many face widths either side of its middle at most
 _MIN_SHARE = {"tie": 0.003, "belt": 0.003, "watch": 0.0005, "strap": 0.003, "gloves": 0.002, "shoes": 0.003, "necklace": 0.001,
               "buttons": 0.0005, "pocket": 0.002, "badge": 0.001, "lanyard": 0.002, "zip": 0.001, "socks": 0.002, "boots": 0.003,
               "backpack": 0.003, "bracelet": 0.0005, "collar": 0.001, "lapel": 0.003}
@@ -138,8 +142,9 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
             tie[sy0:sy1, sx0:sx1] |= (sc["tie"] > others + _TIE_MARGIN) & (sc["tie"] > 0.0)
             collar[sy0:sy1, sx0:sx1] |= (sc["collar"] > np.maximum(others, sc["tie"]) + _TIE_MARGIN) & (sc["collar"] > 0.0)
         labels[tie & worn] = NAMES.index("tie") + 1
+        labels[tie_whole(labels, rgb, face_mesh) & worn] = NAMES.index("tie") + 1
         rows = np.arange(H)[:, None]
-        collar &= worn & ~tie & (rows > chin) & (rows < chin + _COLLAR_BAND * fh)
+        collar &= worn & (labels != NAMES.index("tie") + 1) & (rows > chin) & (rows < chin + _COLLAR_BAND * fh)
         labels[person & np.isin(seg, (BODY_SKIN, FACE_SKIN))] = NAMES.index("skin") + 1
     labels[person & (seg == HAIR)] = NAMES.index("hair") + 1
     labels[collar & (labels > 0) & (labels <= len(GARMENTS))] = NAMES.index("collar") + 1
@@ -165,6 +170,33 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
         except Exception:  # noqa: BLE001 - unnamed then
             out["neckline"] = None
     return out
+
+
+def tie_whole(labels: np.ndarray, rgb: np.ndarray, face_mesh) -> np.ndarray:
+    """The whole tie, from how a tie is made: one strip of one cloth from the
+    knot down. Close up, CLIPSeg finds it where it is wide (under the knot);
+    the knot it calls the shirt's collar, and where the tie narrows between
+    the jacket's fronts it calls it the jacket. Grown from what was read
+    through what is joined to it and has its colour (a pattern averaged
+    out); nothing when no tie was read."""
+    from scipy.ndimage import binary_propagation, gaussian_filter
+    from skimage.color import rgb2lab
+
+    tie = labels == NAMES.index("tie") + 1
+    if tie.sum() < 50:
+        return tie
+    fm = np.asarray(face_mesh)[:468, :2]
+    fw = float(np.ptp(fm[:, 0]))
+    chin = float(np.asarray(face_mesh)[152, 1])
+    L = rgb2lab(np.asarray(rgb)[..., :3] / 255.0)
+    L = np.stack([gaussian_filter(L[..., i], _TIE_SMOOTH * fw) for i in range(3)], axis=-1)
+    d = np.linalg.norm(L - np.median(L[tie], axis=0), axis=-1)
+    reach = max(_TIE_MATCH * float(np.percentile(d[tie], 90)), _TIE_MATCH_MIN)
+    rows = np.arange(labels.shape[0])[:, None]
+    cols = np.arange(labels.shape[1])[None, :]
+    mid = float(np.median(np.nonzero(tie)[1]))
+    like = (d < reach) & (labels > 0) & (rows > chin) & (np.abs(cols - mid) < _TIE_REACH * fw)
+    return binary_propagation(tie & like, mask=like) | tie
 
 
 def lapels(labels: np.ndarray, face_mesh) -> np.ndarray:

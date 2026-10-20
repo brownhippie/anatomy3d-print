@@ -75,6 +75,7 @@ _POP_FINE = 1.6  # the clothes' folds, seams and creases deepened this much
 _HOLLOW_SCALE = 0.01  # the body showing through the clothes is a hollow this broad or more (a fold is narrower)
 _DETAIL_MAX = 0.008  # the photo's depth detail stands at most about this far (m), easing in
 _DETAIL_FACING = (0.25, 0.7)  # detail fades in between these shares of facing the camera
+_DETAIL_PREFILTER = 0.5  # the detail eased, at each point of the mesh, over this many of its longest edges there
 _SUBDIVIDE = 2
 _GROW_NORMAL_SMOOTH = 30  # smoothing passes for the directions the body grows along
 _CLOTHED = 0.5  # a part the photo shows at least this much under garments is clothed all round
@@ -1028,7 +1029,8 @@ def _measure_fit(V_bare, V_dressed, F, pw, names, clothes, J: dict, ppm: float, 
         t = lab == NAMES.index("tie") + 1
         ys = np.flatnonzero(t.any(axis=1))
         if len(ys):
-            m["tie_width_cm"] = float(np.median(t.sum(axis=1)[ys])) / ppm * 100.0
+            # (at its widest, the blade under the knot: lower down it narrows between the jacket's fronts)
+            m["tie_width_cm"] = float(np.percentile(t.sum(axis=1)[ys], 90)) / ppm * 100.0
             m["tie_length_cm"] = float(np.ptp(ys)) / ppm * 100.0
     m = {k: (round(v, 2) if v is not None else None) for k, v in m.items()}
 
@@ -1763,6 +1765,29 @@ def _brows_stand_mm(st: dict, face_read: dict, shape, ppm: float) -> Optional[fl
     return float(np.mean(-n[ok_b]) - np.mean(-n[ok_r])) / ppm * 1000.0
 
 
+def _sample_eased(img, V, F, px, py, cov):
+    """`img` at each vertex, eased over the mesh's own spacing there (its
+    longest edge across the photo, x _DETAIL_PREFILTER): the body's
+    triangles are as coarse as 1 cm on the torso, and detail finer than them
+    taken at their corners alone came out a staircase of the triangles --
+    the jacket and the arms in blocks."""
+    from . import silhouette_relief as sr
+
+    e = np.column_stack([np.linalg.norm((V[F[:, a]] - V[F[:, b]])[:, :2], axis=1) for a, b in ((0, 1), (1, 2), (2, 0))]).max(axis=1)
+    reach = np.zeros(len(V))
+    for j in range(3):
+        np.maximum.at(reach, F[:, j], e)
+    sig = _DETAIL_PREFILTER * reach
+    levels = [0.0, 1.0, 2.0, 4.0, 8.0, 16.0]
+    samples = np.column_stack([map_coordinates(img if s_ == 0.0 else sr._masked_blur(img, cov, s_), [py, px], order=1, mode="nearest")
+                               for s_ in levels])
+    t = np.interp(np.clip(sig, 0.0, levels[-1]), levels, np.arange(len(levels)))
+    i0 = np.clip(np.floor(t).astype(int), 0, len(levels) - 2)
+    w = t - i0
+    rows = np.arange(len(V))
+    return samples[rows, i0] * (1.0 - w) + samples[rows, i0 + 1] * w
+
+
 def _subdivide(V, F, pw):
     """The finer surface for the detail, the part weights carried with it
     (Loop's new points are fixed blends of the old: the weights blend the
@@ -2131,7 +2156,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     carry = _pocket_carry(V, eye_pocket, near_at, ppm)
     visible |= carry
     facing = np.where(carry, 1.0, facing)  # (as the skin over them)
-    off_v = map_coordinates(offset, [py, px], order=1, mode="nearest")
+    off_v = _sample_eased(offset, V, F, px, py, cov)
     V = V.copy()
     V[:, 2] = V[:, 2] - np.where(visible, off_v * facing, 0.0)
     if labels is not None and fm is not None:
