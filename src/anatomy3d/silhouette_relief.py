@@ -888,6 +888,7 @@ _CHIN_PROUD = 0.0  # the chin's pad, with half as deep a groove above it (a stud
 _MOUTH_LINE = 0.0008  # a closed mouth's line between the lips
 _MOUTH_DEPTH = 0.008  # an open mouth's dark, this far in
 _TEETH_INSET = 0.002  # teeth sit this far behind the lips
+_TOOTH_LINE = 0.0006  # the lines between teeth this deep
 _TONGUE_INSET = 0.004  # the tongue this far
 _SCAR_DEPTH = 0.0005  # a scar's groove
 _BEARD_THICK = 0.004  # a beard or moustache stands this proud
@@ -2109,6 +2110,9 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
             depth = np.where(sample(mouth["tongue"]) > 0.5, m(_TONGUE_INSET), depth)
             depth = np.where(sample(mouth["teeth"]) > 0.5, m(_TEETH_INSET), depth)
             rel -= inside * gaussian_filter(depth, 0.8)
+            if "teeth_lines" in mouth:
+                # the lines between the teeth: shallow, each tooth its own
+                rel -= inside * m(_TOOTH_LINE) * gaussian_filter(sample(mouth["teeth_lines"]), 0.6)
         else:
             rel -= m(_MOUTH_LINE) * line(f[INNER_LIPS[:11]], 0.006 * size)
     # scars

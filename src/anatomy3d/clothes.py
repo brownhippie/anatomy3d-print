@@ -70,6 +70,8 @@ ON_TOP = ("buttons", "pocket", "badge", "zip")
 _TIE_CROP = (3.2, 4.5)  # the close looks for a tie and a collar: squares this many face widths across, from the chin down
 _COLLAR_PROMPT = [49406, 320, 2523, 13497, 49407]  # "a shirt collar"
 _COLLAR_BAND = 0.9  # ... a collar only this many face heights below the chin
+_COLLAR_REACH = 0.35  # ... and within this many face heights of the neck's skin
+_COLLAR_MIN_W = 0.12  # ... and nothing of it narrower than this many face widths (a wing, not the shirt's strip by the tie)
 _LAPEL_W = 0.55  # a lapel's width at its top, face widths (a jacket's lapels run along its opening, narrowing to the button)
 _TIE_MARGIN = 0.3  # ... where "a necktie" outscores the other garments by this much (logits)
 _TIE_SMOOTH = 0.02  # the tie's whole length: its colour, a pattern's dots averaged over this many face widths ...
@@ -116,8 +118,20 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
     labels = np.zeros((H, W), np.uint8)
     worn = person & (cnt > 0) & np.isin(seg, (CLOTHES, ACCESSORY))
     if face_mesh is not None:
-        # the head's own wear (cap, mask, glasses) is head_parts' to name
-        worn &= np.arange(H)[:, None] > float(np.asarray(face_mesh)[152, 1])
+        # the head's own wear (cap, mask, glasses) is head_parts' to name:
+        # nothing on the face or above the eyes (cut at the chin's row, a
+        # collar rising round the neck lost its top: a straight edge across
+        # the throat that stood as a wall)
+        from skimage.draw import polygon as _polygon
+
+        from .face_parts import FACE_OVAL
+
+        fmf = np.asarray(face_mesh)
+        face = np.zeros((H, W), dtype=bool)
+        rr, cc = _polygon(fmf[FACE_OVAL, 1], fmf[FACE_OVAL, 0], (H, W))
+        face[rr, cc] = True
+        eyes_y = float(fmf[[33, 263], 1].mean())
+        worn &= ~face & (np.arange(H)[:, None] > eyes_y)
     labels[worn] = win[worn] + 1
     collar = np.zeros((H, W), bool)
     if face_mesh is not None and "tie" in GARMENTS:
@@ -144,7 +158,25 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
         labels[tie & worn] = NAMES.index("tie") + 1
         labels[tie_whole(labels, rgb, face_mesh) & worn] = NAMES.index("tie") + 1
         rows = np.arange(H)[:, None]
-        collar &= worn & (labels != NAMES.index("tie") + 1) & (rows > chin) & (rows < chin + _COLLAR_BAND * fh)
+        # a collar is made round the neck: the shirt where it meets the
+        # neck's skin, down to the collar's band (what "a shirt collar" names
+        # away from the neck is the shirt's front beside the tie)
+        from scipy import ndimage
+        from scipy.ndimage import distance_transform_edt as _edt
+
+        neck = person & np.isin(seg, (BODY_SKIN, FACE_SKIN)) & (rows > chin) & ~face
+        near_neck = _edt(~neck) <= _COLLAR_REACH * fh if neck.any() else np.zeros((H, W), dtype=bool)
+        shirt = labels == NAMES.index("shirt") + 1 if "shirt" in NAMES else np.zeros((H, W), dtype=bool)
+        collar = (collar | shirt) & near_neck
+        collar &= worn & (labels != NAMES.index("tie") + 1) & (rows < chin + _COLLAR_BAND * fh)
+        # (a collar's wings are broad: the shirt's narrow strips beside the
+        # tie below the knot are its front -- taken as collar, they hung
+        # from it as two legs down the tie)
+        r_c = max(1, int(round(_COLLAR_MIN_W / 2.0 * fw)))
+        disk_c = np.hypot(*np.mgrid[-r_c:r_c + 1, -r_c:r_c + 1]) <= r_c
+        # (its own outline kept near its broad parts: opened alone, the wings
+        # came out round)
+        collar = collar & ndimage.binary_dilation(ndimage.binary_opening(collar, structure=disk_c), structure=disk_c)
         labels[person & np.isin(seg, (BODY_SKIN, FACE_SKIN))] = NAMES.index("skin") + 1
     labels[person & (seg == HAIR)] = NAMES.index("hair") + 1
     labels[collar & (labels > 0) & (labels <= len(GARMENTS))] = NAMES.index("collar") + 1
@@ -156,9 +188,13 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
     for k in WORN:
         i = NAMES.index(k)
         share = float((labels == i + 1).sum()) / total
+        enough = _MIN_SHARE.get(k, _MIN_SHARE_DEFAULT)
         if k in ("shirt", "tshirt"):
-            share += float((labels == NAMES.index("collar") + 1).sum()) / total
-        if share >= _MIN_SHARE.get(k, _MIN_SHARE_DEFAULT):
+            c_share = float((labels == NAMES.index("collar") + 1).sum()) / total
+            share += c_share
+            if k == "shirt" and c_share >= _MIN_SHARE["collar"]:
+                enough = 0.0  # (a collar is a shirt's: with its collar taken out, what shows of a shirt is little)
+        if share >= enough and share > 0:
             found[k] = round(share, 4)
         else:
             labels[labels == i + 1] = 0  # too little to trust

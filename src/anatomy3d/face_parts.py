@@ -36,6 +36,7 @@ FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365
              149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
 
 _MOUTH_OPEN = 0.08  # inner-lip gap over mouth width
+_TEETH_GAP = 0.03  # the lines between teeth and along the gums: no wider than this share of the mouth's width
 _EYE_CLOSED = 0.12  # lid gap over eye width
 _SCAR_MIN_LEN = 0.08  # x the face's size
 _SCAR_MIN_CONTRAST = 12.0  # ridge response over the skin's median
@@ -127,6 +128,19 @@ def read_face(rgb: np.ndarray, face_mesh: np.ndarray, labels: Optional[np.ndarra
             chroma = np.hypot(a, bb)
             teeth = inside & (L > max(0.85 * skin_L, 45.0)) & (chroma < 22)
             teeth = ndimage.binary_opening(teeth, iterations=1)
+            if teeth.any():
+                # the teeth as a row: the shadow lines between them and along
+                # the gums are no hollows (taken as the mouth's dark, each
+                # tooth stood alone in a slot a centimetre deep)
+                r = max(1, int(round(_TEETH_GAP * width)))
+                disk = np.hypot(*np.mgrid[-r:r + 1, -r:r + 1]) <= r
+                seen_teeth = teeth.copy()
+                teeth = ndimage.binary_fill_holes(ndimage.binary_closing(teeth, structure=disk)) & inside
+                # (the lines between them kept, as lines: each tooth its own)
+                mouth_lines = teeth & ~seen_teeth
+                dark_ = inside & ~teeth
+                wide = ndimage.binary_opening(dark_, structure=disk)
+                teeth |= dark_ & ~wide & ndimage.binary_dilation(teeth, structure=disk)
             # the tongue: a red mass low in the mouth, below the teeth (red
             # along the teeth's edges is gums and lips)
             ys_in = np.nonzero(inside)[0]
@@ -141,6 +155,7 @@ def read_face(rgb: np.ndarray, face_mesh: np.ndarray, labels: Optional[np.ndarra
                          tongue_share=round(float(tongue.sum() / inside.sum()), 3),
                          dark_share=round(float(dark.sum() / inside.sum()), 3))
             mouth["inside"], mouth["teeth"], mouth["tongue"] = inside, teeth, tongue
+            mouth["teeth_lines"] = mouth_lines if teeth.any() else np.zeros_like(teeth)
     out["mouth"] = mouth
 
     # eyes

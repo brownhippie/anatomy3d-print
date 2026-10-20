@@ -75,6 +75,17 @@ _POP_FINE = 1.6  # the clothes' folds, seams and creases deepened this much
 _HOLLOW_SCALE = 0.01  # the body showing through the clothes is a hollow this broad or more (a fold is narrower)
 _DETAIL_MAX = 0.008  # the photo's depth detail stands at most about this far (m), easing in
 _DETAIL_FACING = (0.25, 0.7)  # detail fades in between these shares of facing the camera
+_EAR_OWN = (0.3, 0.8)  # an ear keeps its own shape from this much ear (none) to this (all): no photo detail, no hair laid on it
+_FACE_FOLD = 0.02  # the body's folds in the face (its lips' seam) this far behind its skin move with the skin (m)
+_FACE_DETAIL_MIN = 0.002  # ... and nothing finer than this (m)
+_FACE_DETAIL = 0.008  # on skin the photo's depth adds only what is finer than this (m: skin's soft folds, not features)
+_SKIN_DETAIL_SHARE = 0.5  # ... at this share of what it adds elsewhere (skin is smooth)
+_SKIN_EASE = 0.012  # ... easing in over this at the skin's edge (m: as broad as what it leaves out)
+_FACE_FLAT = 0.015  # the body's own face smoothed over this before the photo's goes on (m: wider than a nose's wing)
+_FACE_FLAT_STEEP = 2.0  # ... not across where the surface turns away more steeply than this (depth per px: about 63 degrees)
+_FACE_FLAT_EASE = 0.02  # ... in full only this far inside the face's outline, easing out to none at it (m)
+_DETAIL_EDGE_PX = 3.0  # where the camera sees the body, no edge longer than this (photo px: its detail is no finer than a few)
+_DETAIL_SEEN_PX = 3.0  # (seen: within this of the frontmost surface at its pixel)
 _DETAIL_PREFILTER = 0.5  # the detail eased, at each point of the mesh, over this many of its longest edges there
 _SUBDIVIDE = 2
 _GROW_NORMAL_SMOOTH = 30  # smoothing passes for the directions the body grows along
@@ -356,6 +367,59 @@ _PLAN_TOLERANCE = 0.08  # a section's depth within this share of the human figur
 _PLAN_MAX_FIX = 0.25  # ... and moved at most this share toward it
 
 
+def _flatten_body_face(fm, near, cov, ppm: float):
+    """The body's own face smoothed away over the photo's face outline
+    (its nose, lips, brow and creases: the photo's face takes their place),
+    easing out at the outline. (the body's front with its face smoothed;
+    the smoothed surface's height toward the camera and how much each pixel
+    goes to it -- applied to each vertex by its own height, not as a change
+    per pixel: at the lips' seam the pixel's change was the groove's whole
+    depth, and the lips in front of it, moved by it, stood out of the mouth
+    as a blade; photo px)."""
+    from skimage.draw import polygon
+
+    from . import silhouette_relief as sr
+    from .face_parts import FACE_OVAL
+
+    have = cov & np.isfinite(near)
+    if have.sum() < 100:
+        return near, np.zeros(near.shape)
+    o = np.asarray(fm, dtype=np.float64)[FACE_OVAL, :2]
+    face = np.zeros(near.shape, dtype=bool)
+    rr, cc = polygon(o[:, 1], o[:, 0], near.shape)
+    face[rr, cc] = True
+    # (full well inside the face, where its features are, none at its
+    # outline: eased out over a few millimetres, the face's own curve under
+    # the jaw was smoothed too and stood as a ring round it)
+    _, (iy, ix) = distance_transform_edt(~have, return_indices=True)
+    h = np.where(have, -near, -near[iy, ix])
+    # (the body's face as the camera sees it, reached from the nose without
+    # crossing a cliff: the photo's face outline can reach below the body's
+    # own jaw, over the neck under it a few centimetres back; smoothed with
+    # the face, the chin was pulled in and the neck under it pushed out -- a
+    # ring round the jaw)
+    from scipy.ndimage import label as _cc
+
+    gy, gx = np.gradient(h)
+    gentle = face & have & (np.hypot(gx, gy) < _FACE_FLAT_STEEP)
+    comps, _n = _cc(gentle)
+    tip = np.asarray(fm, dtype=np.float64)[1, :2]
+    k = comps[int(np.clip(round(tip[1]), 0, near.shape[0] - 1)), int(np.clip(round(tip[0]), 0, near.shape[1] - 1))]
+    if k > 0:
+        from scipy.ndimage import binary_fill_holes
+
+        # (with what it closes round: the nose's own steep sides are in it)
+        face = binary_fill_holes(comps == k) & face
+    w = np.clip(distance_transform_edt(face) / max(_FACE_FLAT_EASE * ppm, 1.0), 0.0, 1.0)
+    w = w * w * (3.0 - 2.0 * w) * have
+    # (averaged over the face alone: with the neck in, a centimetre or more
+    # further back, the chin and jaw were pulled in and a groove ran inside
+    # the jaw's line)
+    h_s = sr._masked_blur(h, have & face, _FACE_FLAT * ppm)
+    change = w * (h_s - h)
+    return np.where(have, -(h + change), near), (h_s, w)
+
+
 def _face_over_body(fm, near, cov):
     """The face landmarks with their depth taken as the photo's face over the
     body's own front at each of them (photo px; _face_relief then keeps only
@@ -513,7 +577,8 @@ def plan_four_sides(V, F, part_w, names, inputs, ref):
     return V, plan
 
 
-_JACKET_DETAIL = 0.015  # under a jacket the photo's depth adds only detail finer than this share of the photo
+_JACKET_DETAIL = 0.014  # under a jacket the photo's depth adds only detail finer than this (m)
+_DETAIL_SPAN = 0.045  # ... elsewhere, finer than this (m)
 _BUST_DRAPE = 0.2  # a bust under a jacket: the cloth spans it as one form (a ball this size, m, rolled over it)
 _STIFF = ("suit", "jacket", "coat", "hoodie", "sweater", "kimono")  # garments a bust doesn't show through
 _CLOTH_HANG = 0.12  # down the back cloth comes in at most this much per unit it falls (a jacket hangs nearly straight)
@@ -683,6 +748,7 @@ _HAND_RELIEF_SPAN = 0.025  # the hand's own shape from the photo's depth: what i
 _HAND_RELIEF_MAX = 0.012  # ... standing at most this far either way (m: about a finger's thickness)
 _HAND_RELIEF_AROUND = 0.12  # ... in the depth's scale, read off the body round the hand within this far (m)
 _HAND_WALL_MARGIN = 1.5  # a hand's solid no thinner than this many times the thinnest wall a print holds
+_WRIST_WEAR = 0.03  # a watch or bracelet within this of a hand's skin is on its wrist (m)
 _HAND3D_COVER = 0.8  # a hand placed on its skin counts when it covers at least this share of it
 _HAND_UNDER = 1.0  # a hand's underside reaches what it lies on when that is within this many more of its thickness (else its own)
 
@@ -802,11 +868,24 @@ def _hands_3d(V, F, regions, hand_names, ref, inputs, ppm, print_px=0.0):
     P = inputs.pose or {}
     sw = float(np.linalg.norm(np.subtract(P["left_shoulder"][:2], P["right_shoulder"][:2]))) if "left_shoulder" in P and "right_shoulder" in P else 0.4 * ppm
     person = np.asarray(inputs.photo_mask, dtype=bool)
+    # what is worn on the wrist shows where the wrist is (not something over
+    # the hand that hides it: fitted as hidden, the wrist went in under the
+    # watch)
+    cl = (inputs.parts or {}).get("clothes")
+    wear = np.zeros(person.shape, dtype=bool)
+    if cl is not None:
+        from .clothes import NAMES as CN
+
+        wear = np.isin(cl["labels"], [CN.index(k) + 1 for k in ("watch", "bracelet") if k in CN])
+    if wear.any():
+        regions = [(H | (wear & (distance_transform_edt(~H) <= _WRIST_WEAR * ppm)), wz) for H, wz in regions]
     out, info, rest_regions = [], {}, []
+
+    wz_of = {n.split(".")[-1]: wz for (_, wz), n in zip(regions, hand_names)}
 
     def place(H, side, scale=None):
         wr = (ref.get("joints_px") or {}).get(("left" if side == "L" else "right") + "_wrist")
-        got = hands3d.place(ref.get("report") or {}, side, H, person, wr[:2] if wr else None, ppm, sw, scale)
+        got = hands3d.place(ref.get("report") or {}, side, H, person, wr[:2] if wr else None, ppm, sw, scale, rest, have, wz_of.get(side))
         return (None, None) if got is None else (got[:2], got[2])
 
     # the two hands are the same size: the size from the hand that shows the
@@ -825,10 +904,10 @@ def _hands_3d(V, F, regions, hand_names, ref, inputs, ppm, print_px=0.0):
             tpl, placed = place(H, side, size)
             laid = None
             if placed is not None and placed["cover"] >= _HAND3D_COVER:
-                laid = hands3d.lay(tpl[0], tpl[1], placed, H, rest, have, ppm, wz, print_px)
+                laid = hands3d.lay(tpl[0], tpl[1], placed, H, rest, have, ppm, wz, print_px, search=True)
             if laid is not None:
                 out.append(laid)
-                info[n] = {k: placed[k] for k in ("scale", "cover", "spread", "palm")}
+                info[n] = {k: placed.get(k) for k in ("scale", "cover", "spread", "bend", "palm", "shown", "floating")}
                 continue
             info[n] = {"fallback": "not placed" if placed is None else f"covers {placed['cover']}"}
         except Exception as exc:  # noqa: BLE001 - the outline's solid instead
@@ -970,7 +1049,11 @@ class _Locks:
         for step, what, measure, ok, m0 in self.items:
             m = measure(st)
             if m is not None and not ok(m, m0):
-                out.append(f"{what} (locked at {step}: {round(float(m0), 3)}, now {round(float(m), 3)})")
+                if np.ndim(m0) or np.ndim(m):
+                    gap = float(np.abs(np.asarray(m) - np.asarray(m0)).max()) if np.shape(m) == np.shape(m0) else float("nan")
+                    out.append(f"{what} (locked at {step}: moved {round(gap, 3)})")
+                else:
+                    out.append(f"{what} (locked at {step}: {round(float(m0), 3)}, now {round(float(m), 3)})")
         return out
 
     def hold(self, step: str, before: dict, after: dict) -> dict:
@@ -994,13 +1077,20 @@ def _outline_iou(st: dict, mask) -> float:
 
 
 def _part_centres(st: dict, names, parts) -> Optional[np.ndarray]:
-    """Where each of `parts` is (the centre of its vertices, photo px)."""
+    """Where each of `parts` is (the centre of its surface, photo px: by
+    area, so the same however finely the mesh is cut -- by its vertices, a
+    finer front moved it)."""
+    V, F = st["V"], st["F"]
+    fa = 0.5 * np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1)
+    va = np.zeros(len(V))
+    for j in range(3):
+        np.add.at(va, F[:, j], fa / 3.0)
     out = []
     for n in parts:
         if n in names:
             on = st["pw"][:, names.index(n)] > 0.5
-            if on.sum() >= 10:
-                out.append(st["V"][on].mean(axis=0))
+            if on.sum() >= 10 and va[on].sum() > 0:
+                out.append((V[on] * va[on, None]).sum(axis=0) / va[on].sum())
     return np.asarray(out) if out else None
 
 
@@ -1255,6 +1345,7 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
     from .study import _OUTER
 
     names = [g for g in dict.fromkeys(list(WORN) + ["belt", "watch", "bracelet"]) if g in NAMES]
+    built = rest.copy()  # the surface as built so far: the body, then each piece over it
     rows_ = np.arange(shape[0])[:, None]
     neck_skin = (lab == NAMES.index("skin") + 1) & ((rows_ >= neck_rows[0]) & (rows_ <= neck_rows[1]) if neck_rows else False)
     for g in names:
@@ -1262,7 +1353,14 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
         inner_names = [i for i in _OUTER.get(g, ()) + (("neck",) if g in ("shirt", "tshirt", "dress") else ()) if i in NAMES or i == "neck"]
         inner = np.isin(lab, [NAMES.index(i) + 1 for i in inner_names if i in NAMES]) | (neck_skin if "neck" in inner_names else False)
         own = lab == NAMES.index(g) + 1
-        clear = _over_neighbour(np.where(have, rest, 0.0), own, inner & have, _POP_SPAN * ppm,
+        # (over what lies beside it as built so far -- the pieces under it
+        # too, not only the body: measured off the body, a tie sat below the
+        # shirt's raised collar beside it)
+        # (each over the body: what the piece beside it stands, not how far
+        # forward the body is there -- measured as heights, a lapel beside
+        # the neck, which stands nearer the camera than the shoulder, was
+        # raised to the neck's height and stood as a fin)
+        clear = _over_neighbour(np.where(have, built - rest, 0.0), own, inner & have, _POP_SPAN * ppm,
                                 np.where(own, np.maximum(lift, _PIECE_MIN_H * ppm), 0.0))
         lift_g = np.minimum(np.maximum(lift, clear), _POP_MAX * ppm)  # (clearing a raised arm beside it, a piece climbed 3 cm)
         reg = own & have & (lift_g * facing > _PIECE_MIN_H * ppm) & (facing > _PIECE_MIN_FACING)
@@ -1291,6 +1389,7 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
                 pf = pf[:, ::-1]
             out.append((pv, pf))
             made.append({"garment": g, "px": int(P.sum()), "height_mm": round(float(np.median(h[P])) / ppm * 1000.0, 1)})
+            built = np.where(P, np.maximum(built, front), built)
     return out, made
 
 
@@ -1886,6 +1985,24 @@ def _sample_eased(img, V, F, px, py, cov):
     return samples[rows, i0] * (1.0 - w) + samples[rows, i0 + 1] * w
 
 
+def _refine_front(V, F, part_w, ear_w, shape):
+    """The faces the camera sees, split until no edge is longer than
+    _DETAIL_EDGE_PX (refine.refine: no cracks), the per-vertex parts
+    carried along."""
+    from .refine import refine
+
+    near, _ = _raster_front(V, F, shape)
+    c = V[F].mean(1)
+    nz = map_coordinates(np.where(np.isfinite(near), near, 1e9), [c[:, 1], c[:, 0]], order=0, mode="nearest")
+    nrm = trimesh.Trimesh(V, F, process=False).face_normals
+    mark = (c[:, 2] <= nz + _DETAIL_SEEN_PX) & (-nrm[:, 2] > _DETAIL_FACING[0])
+    vals = [part_w] + ([ear_w] if ear_w is not None else [])
+    V, F, out = refine(V, F, mark, _DETAIL_EDGE_PX, vals)
+    part_w = out.pop(0)
+    ear_w = out.pop(0) if ear_w is not None else None
+    return V, F, part_w, ear_w
+
+
 def _subdivide(V, F, pw):
     """The finer surface for the detail, the part weights carried with it
     (Loop's new points are fixed blends of the old: the weights blend the
@@ -2113,6 +2230,11 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     else:
         V, F, part_w = _subdivide(V, F, part_w)
     V, eye_pocket = _close_body_eyes(V, F, inputs.face_mesh, shape, ppm)
+    # (and finer still where the camera sees it, down to the photo's own
+    # detail: the body's torso and arm triangles are up to a centimetre
+    # across, each a flat facet -- the jacket and the arms came out crooked,
+    # its folds and edges a staircase of them)
+    V, F, part_w, ear_w9 = _refine_front(V, F, part_w, ear_w9, shape)
     st = {"V": V, "F": F, "pw": part_w}
     before = st
     locks.lock("9 detail", "no new spikes", _spike_pct, lambda m, m0: m <= m0 + _LOCK_SPIKES, st)
@@ -2121,6 +2243,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     front = np.where(cov, -near, 0.0)  # toward the camera
     report = {"plan": plan}
     offset = np.zeros(shape)
+    flat = None  # (the body's own face smoothed: _flatten_body_face)
     depth_detail = np.zeros(shape)
     pop_off, pop_lift, nr = None, None, None
     parts = inputs.parts or {}
@@ -2135,7 +2258,11 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             # reference figure's nose, lips, brow) and, added to it, the nose
             # came out twice its size. The body's own features at the same
             # landmarks taken off first
-            fr = sr._face_relief(_face_over_body(fm, near, cov), shape, 0, 0, 1.0, 0) * strength
+            # ... and between them: the body's face smoothed out first (its
+            # nose's sides and creases fall between the face points, and
+            # left there, a groove ran beside the photo's own nose)
+            near_face, flat = _flatten_body_face(fm, near, cov, ppm)
+            fr = sr._face_relief(_face_over_body(fm, near_face, cov), shape, 0, 0, 1.0, 0) * strength
             if labels is not None:
                 from .head_parts import BODY_SKIN, FACE_SKIN
 
@@ -2182,8 +2309,11 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         vals = sampled[cov]
         if vals.size and vals.std() > 1e-9:
             dn = (sampled - vals.mean()) / vals.std()
-            dn_fine = dn - sr._masked_blur(dn, cov, max(_JACKET_DETAIL * max(shape), 1.0))
-            dn = dn - sr._masked_blur(dn, cov, max(0.05 * max(shape), 1.0))  # fine detail only: the body has the big shapes
+            # (in metres, not the photo's pixels: a full-length photo's
+            # twentieth was a head's width, and the head against the neck
+            # passed as "detail", standing out to its limit)
+            dn_fine = dn - sr._masked_blur(dn, cov, max(_JACKET_DETAIL * ppm, 1.0))
+            dn = dn - sr._masked_blur(dn, cov, max(_DETAIL_SPAN * ppm, 1.0))  # fine detail only: the body has the big shapes
             if clothes:
                 from .clothes import GARMENTS, NAMES, WORN
 
@@ -2195,6 +2325,36 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
                     if stiff else np.zeros(shape)
                 gm = gaussian_filter(np.isin(clothes["labels"], [NAMES.index(g) + 1 for g in WORN]).astype(np.float64), 3.0)
                 dn = (1.0 + (_POP_FINE - 1.0) * gm) * (jk * dn_fine + (1.0 - jk) * dn)
+            # skin is smooth: on it (the face, the neck, the hands) the
+            # photo's depth adds only skin's own soft folds -- a smile's
+            # lines -- and gently; not the features (the face's are the face
+            # points': kept as coarse as elsewhere the nose came twice, its
+            # wings a cliff along each side) and nothing finer (below that
+            # the estimate has a grid of its own, its patches, that came out
+            # as speckles and crinkles)
+            skin_z = np.zeros(shape)
+            if fm is not None and (face_strength is None or face_strength > 0):
+                from skimage.draw import polygon as _poly_d
+
+                from .face_parts import FACE_OVAL
+
+                o_ = np.asarray(fm, dtype=np.float64)[FACE_OVAL, :2]
+                rr_, cc_ = _poly_d(o_[:, 1], o_[:, 0], shape)
+                skin_z[rr_, cc_] = 1.0
+            if labels is not None:
+                from .head_parts import BODY_SKIN as _BS, FACE_SKIN as _FSK
+
+                skin_z = np.maximum(skin_z, np.isin(labels, (_BS, _FSK)).astype(np.float64))
+            from .clothes import NAMES as _CN
+
+            if clothes and "skin" in _CN:
+                skin_z = np.maximum(skin_z, (clothes["labels"] == _CN.index("skin") + 1).astype(np.float64))
+            if skin_z.any():
+                skin_z = np.clip(gaussian_filter(skin_z, _SKIN_EASE * ppm) * 2.0 - 0.5, 0.0, 1.0)
+                sn = (sampled - vals.mean()) / vals.std()
+                dn_skin = _SKIN_DETAIL_SHARE * (sr._masked_blur(sn, cov, max(_FACE_DETAIL_MIN * ppm, 0.5))
+                                                - sr._masked_blur(sn, cov, max(_FACE_DETAIL * ppm, 1.0)))
+                dn = skin_z * dn_skin + (1.0 - skin_z) * dn
             half = np.where(cov, (far - near) / 2.0, 0.0)
             # (as big as cloth's detail is -- folds, lapels, seams: scaled by
             # the body's thickness it reached 2-4 cm, cut flat at 1.5)
@@ -2255,7 +2415,46 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     carry = _pocket_carry(V, eye_pocket, near_at, ppm)
     visible |= carry
     facing = np.where(carry, 1.0, facing)  # (as the skin over them)
+    # (and the body's own folds in the face -- its closed lips' seam -- moved
+    # with the skin over them: left where the body's lips were while the
+    # lips round them moved back, the seam stood out of the mouth as a blade)
+    if fm is not None:
+        from skimage.draw import polygon as _poly_f
+
+        from .face_parts import FACE_OVAL
+
+        o_ = np.asarray(fm, dtype=np.float64)[FACE_OVAL, :2]
+        fz_ = np.zeros(shape, dtype=bool)
+        rr_, cc_ = _poly_f(o_[:, 1], o_[:, 0], shape)
+        fz_[rr_, cc_] = True
+        in_face = map_coordinates(fz_.astype(np.float32), [py, px], order=0, mode="constant") > 0.5
+        fold = inb & ~visible & in_face & (V[:, 2] <= near_at + _FACE_FOLD * ppm)
+        visible |= fold
+        # (in the face, in full whichever way the surface faces: the face's
+        # own shape is moved, not only its detail -- faded where it turns,
+        # the lips' seam, facing up and down, kept the body's lips and stood
+        # out of the mouth; eased in from the face's outline: switched at it,
+        # where the jaw turns under it stood as a step along the jaw)
+        fin = np.clip(distance_transform_edt(fz_) / max(_FACE_FLAT_EASE * ppm, 1.0), 0.0, 1.0)
+        fin = fin * fin * (3.0 - 2.0 * fin)
+        w_in = map_coordinates(fin.astype(np.float32), [py, px], order=1, mode="constant")
+        facing = np.where(visible, facing + w_in * (1.0 - facing), facing)
+        report["face_fold_vertices"] = int(fold.sum())
     off_v = _sample_eased(offset, V, F, px, py, cov)
+    # (not on the ears: theirs is the ear's own shape, sized to the photo's
+    # -- the photo's depth there is the head's outline, nothing of the ear's
+    # folds, and with the hair's grain laid over them they came out crumpled)
+    ear_keep = np.zeros(len(V))
+    if ear_w9 is not None and len(ear_w9) == len(V):
+        e_ = np.clip((np.asarray(ear_w9).max(axis=1) - _EAR_OWN[0]) / (_EAR_OWN[1] - _EAR_OWN[0]), 0.0, 1.0)
+        ear_keep = e_ * e_ * (3.0 - 2.0 * e_)
+    off_v = off_v * (1.0 - ear_keep)
+    if flat is not None:
+        # the body's own face to the smoothed surface, each point by its own
+        # height (toward the camera: -z)
+        hs_v = map_coordinates(flat[0], [py, px], order=1, mode="nearest")
+        w_v = map_coordinates(flat[1], [py, px], order=1, mode="constant")
+        off_v = off_v + np.where(visible, w_v * (hs_v + V[:, 2]) / np.maximum(facing, 1e-3), 0.0)
     V = V.copy()
     V[:, 2] = V[:, 2] - np.where(visible, off_v * facing, 0.0)
     if labels is not None and fm is not None:
@@ -2273,7 +2472,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         # (short hair only: longer hair's own volume is the outline's growth
         # -- pushed out along it too, its folds stood out as spikes)
         if hairy.max() > 0.5 and (hair_read or {}).get("kind") not in _LONG_HAIR:
-            hv = np.where(visible, map_coordinates(hairy, [py, px], order=1, mode="nearest"), 0.0)
+            hv = np.where(visible, map_coordinates(hairy, [py, px], order=1, mode="nearest"), 0.0) * (1.0 - ear_keep)
             # ... and over the scalp the front doesn't see (the crown, the
             # back of the head above the nape): left bare there, the layer
             # stopped where the front view does, a ridge over the top of the
@@ -2291,7 +2490,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
                     nape_t = np.clip((nape_y - V[:, 1]) / (_HAIRLINE_TAPER * ppm * 2.0), 0.0, 1.0)
                     hv = np.where(scalp, _HAIR_UNSEEN * (_HAIR_EDGE_SHARE + (1.0 - _HAIR_EDGE_SHARE) * nape_t), hv)
             lap_f = sr._mesh_laplacian(F, len(V))
-            hv = np.clip(sr._mesh_smooth(lap_f, hv, _HAIR_SEAM_SMOOTH), 0.0, 1.0)
+            hv = np.clip(sr._mesh_smooth(lap_f, hv * (1.0 - ear_keep), _HAIR_SEAM_SMOOTH), 0.0, 1.0) * (1.0 - ear_keep)
             # (along the surface's direction smoothed: along each vertex's own,
             # noisy on the fine mesh, the step broke into shards)
             nrm_h = sr._vertex_normals(V, F)
@@ -2354,13 +2553,15 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # it (a slicer prints them together) -- joined into one solid, a union
     # that came apart dropped every garment, and the figure came out with
     # its clothes painted on
-    garments, made = ([], []) if pop_lift is None else _garment_pieces(V, F, clothes, pop_lift[0], pop_lift[1], ppm, nr)
+    # (the hands first, joined, and the garments' pieces on the body with
+    # its hands: a watch is worn on a wrist -- laid on the body under it
+    # before the hand was there, it was a flat patch on the other arm and
+    # the wrist went in under it)
     hands = []
     if hand_regions:
         # (as thin as a print holds at the figure's size, no thinner)
         print_px = _CHK_WALL_MM * _HAND_WALL_MARGIN * float(np.ptp(V[:, 1])) / max(target_height_mm, 1e-6)
         hands, report["hands_3d"] = _hands_3d(V, F, hand_regions, hand_names, ref, inputs, ppm, print_px)
-    report["garment_pieces"] = made
     joined = None
     if hands:
         try:
@@ -2370,6 +2571,8 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
                 V, F = Vj, Fj
         except Exception as exc:  # noqa: BLE001 - the body goes on without them
             print(f"Note: hands not joined ({exc}).")
+    garments, made = ([], []) if pop_lift is None else _garment_pieces(V, F, clothes, pop_lift[0], pop_lift[1], ppm, nr)
+    report["garment_pieces"] = made
     kept = []
     for (gv, gf), m_ in zip(garments, made):
         closed = trimesh.Trimesh(gv, gf, process=False).is_watertight

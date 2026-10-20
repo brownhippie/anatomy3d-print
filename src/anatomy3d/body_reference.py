@@ -79,6 +79,7 @@ _EAR_STANDS = (0.08, 0.6)  # how far out of the head's line an ear can stand
 _EAR_LENGTH = (0.75, 1.3)  # how long an ear can be
 _EAR_TURN = (-0.35, 0.8)  # radians an ear may swing in toward / out from the head
 _EAR_SCALE = (0.8, 1.5)
+_EAR_FOLLOW = (0.6, 0.95)  # the skin round an ear goes with it from none (at this much ear) to all
 _EAR_UNDER_HAIR = 0.6  # an ear's place beside the face this much hair (or hat): under it
 # head_parts.py's labels (not imported: it pulls in the segmenters)
 _HP_HAIR, _HP_SKIN, _HP_FACE, _HP_HAT = 1, 2, 3, 6
@@ -417,6 +418,18 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
         # outward on the photo: only measurable when the head faces it
         u_img = float(np.sign(u * A[0, 0]))
         fit_turn = t.get("outer") is not None and abs(A[0, 0]) > 0.5
+        outer_x = t["outer"][0] if fit_turn else None
+        if fit_turn and t.get("stands_px") is not None:
+            # as far out of this head's own side as the photo's ear stands out
+            # of the photo's (to the photo's outer edge, on a head a little
+            # narrower than the photo's, it stood out twice as far)
+            ring = (w < 0.95) & (w > 0.0) & (np.abs(V[:, 1] - t["outer"][1]) <= 3.0)
+            if ring.any():
+                outer_x = float(u_img * (u_img * V[ring, 0]).max()) + u_img * float(t["stands_px"])
+        # (only the skin at its base goes with it: the skin further round,
+        # sized and swung with the ear partway, read as more ear)
+        follow = np.clip((w - _EAR_FOLLOW[0]) / (_EAR_FOLLOW[1] - _EAR_FOLLOW[0]), 0.0, 1.0)
+        follow = follow * follow * (3.0 - 2.0 * follow)
 
         def moved(p):
             kk, dz, phi = np.exp(p[0]), p[1], p[2] * bend
@@ -424,13 +437,13 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
             a = r[:, 0] * np.cos(phi) + u * r[:, 1] * np.sin(phi)
             bk = -u * r[:, 0] * np.sin(phi) + r[:, 1] * np.cos(phi)
             new = (np.column_stack([a, bk, r[:, 2] + dz]) + hinge) @ A.T
-            return V + w[:, None] * (new - V)
+            return V + follow[:, None] * (new - V)
 
         def resid(p):
             q = moved(p)[core]
             r = [q[:, 1].min() - t["top"], q[:, 1].max() - t["bottom"]]
             if fit_turn:
-                r.append(u_img * (q[:, 0] * u_img).max() - t["outer"][0])
+                r.append(u_img * (q[:, 0] * u_img).max() - outer_x)
             return np.array(r)
 
         height = float(np.ptp(lc[:, 2]))

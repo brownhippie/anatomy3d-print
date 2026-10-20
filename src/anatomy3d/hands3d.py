@@ -16,7 +16,12 @@ from typing import Optional
 
 import numpy as np
 
-_SPREADS = (0.25, 1.0, 1.8, 2.6)  # the fingers' spread tried, shares of the rest pose's (together; as at rest; apart; spread wide)
+_SPREADS = (0.25, 1.0, 1.8)  # the fingers' spread tried, shares of the rest pose's (together; as at rest; apart)
+_BENDS = (0.0, 0.35, 0.7)  # ... and their bend toward the palm at each joint (rad: straight; round an arm; out of sight under it)
+_SHOWN_COST = 0.5  # laid: what of it shows where the photo has no skin costs this much per skin's area ...
+_FLOAT_COST = 0.5  # ... and what of it stands clear of what it lies on, per its share of the skin
+_SUNK_COST = 4.0  # settling it: the skin the photo shows of it out of sight costs this many times what shows past it
+_FLOAT_GAP = 0.01  # (clear: its underside more than this above it, m)
 _PALM_MARGIN = 0.03  # the palm toward the camera only when it fits the skin better than the back by this much
 _CURL_KEEP = 0.25  # ... and straightened, keeping this share of its curl (a hand lying on something lies along it)
 _THUMBS = ((0.5, 0.5), (1.0, 0.6))  # the thumb tried in along the hand, or out: shares of its rest pose's spread, and of its turn under the palm
@@ -55,7 +60,7 @@ def _ph(report: dict) -> Optional[np.ndarray]:
 _TEMPLATES: dict = {}
 
 
-def template(report: dict, side: str, spread: float = _SPREADS[0], thumb=_THUMBS[0]):
+def template(report: dict, side: str, spread: float = _SPREADS[0], thumb=_THUMBS[0], curl: float = 0.0):
     """The body's own hand `side` ("L" or "R"), closed at the wrist, its
     fingers' spread `spread` of the rest pose's, straightened: (local
     vertices (u: wrist to the middle knuckle, v: across, w: out of its
@@ -63,13 +68,13 @@ def template(report: dict, side: str, spread: float = _SPREADS[0], thumb=_THUMBS
     ph = _ph(report)
     if ph is None:
         return None
-    key = (side, round(float(spread), 3), tuple(thumb), str(report.get("gender")), tuple(np.round(ph, 4)))
+    key = (side, round(float(spread), 3), tuple(thumb), round(float(curl), 3), str(report.get("gender")), tuple(np.round(ph, 4)))
     if key not in _TEMPLATES:
-        _TEMPLATES[key] = _template(report, side, spread, ph, thumb)
+        _TEMPLATES[key] = _template(report, side, spread, ph, thumb, curl)
     return _TEMPLATES[key]
 
 
-def _template(report, side, spread, ph, thumb):
+def _template(report, side, spread, ph, thumb, bend=0.0):
     import trimesh
 
     from . import body_reference as br
@@ -145,6 +150,15 @@ def _template(report, side, spread, ph, thumb):
             d = Jm[chain[i + 1]] - Jm[chain[i]]
             axis = np.cross(w, d - w * (d @ w))
             V = turn_about(V, bw(chain[i:3]), Jm[chain[i]], axis, pitch(d) - want[i], chain[i + 1:])
+    # ... then curled toward the palm `bend` at each joint (a hand round an
+    # arm, or its fingers out of sight under it)
+    if bend:
+        palm = -back
+        for k in (2, 3, 4, 5):
+            chain = [f"finger{k}-1", f"finger{k}-2", f"finger{k}-3", f"tip{k}"]
+            for i in range(3):
+                d = Jm[chain[i + 1]] - Jm[chain[i]]
+                V = turn_about(V, bw(chain[i:3]), Jm[chain[i]], np.cross(d, palm), bend, chain[i + 1:])
     Jm["tip1"] = tip_of(1)
     th_names = ["finger1-1", "finger1-2", "finger1-3"]
     d = Jm["tip1"] - Jm["finger1-1"]
@@ -330,15 +344,16 @@ def _palm_side(loc, faces=None, top: bool = False, mm: float = 1.0):
     return map_coordinates(g, [Vr[:, 1], Vr[:, 0]], order=1, mode="nearest")
 
 
-def place(report: dict, side: str, skin, person, wrist_px, ppm: float, sw_px: float, scale: Optional[float] = None):
+def place(report: dict, side: str, skin, person, wrist_px, ppm: float, sw_px: float, scale: Optional[float] = None,
+          rest=None, have=None, wrist_depth: Optional[float] = None):
     """The hand on its skin: each spread of the fingers (_SPREADS), its back
     or its palm toward the camera, fitted (fit); the one that fits best (the
     back unless the palm fits better by _PALM_MARGIN). (local vertices,
     faces, placement) or None."""
     best = None
 
-    def one(spread, thumb, palm):
-        tpl = template(report, side, spread, thumb)
+    def one(spread, thumb, bend, palm):
+        tpl = template(report, side, spread, thumb, bend)
         if tpl is None:
             return None
         loc, faces = tpl
@@ -347,27 +362,47 @@ def place(report: dict, side: str, skin, person, wrist_px, ppm: float, sw_px: fl
         p_ = fit(l_, faces, skin, person, wrist_px, ppm, sw_px, scale)
         if p_ is None:
             return None
-        return (p_["cost"] + (_PALM_MARGIN if palm else 0.0), l_, faces, dict(p_, spread=spread, thumb=list(thumb), palm=palm))
+        c_ = p_["cost"] + (_PALM_MARGIN if palm else 0.0)
+        if rest is not None:
+            # (in 3D too: laid on the body, what of it shows where the photo
+            # has no skin, and what of it stands clear of what it lies on)
+            laid = lay(l_, faces, p_, skin, rest, have, ppm, wrist_depth)
+            if laid is None:
+                return None
+            sh, fl = hidden_shown(laid[0], laid[1], skin, rest, ppm), floating(laid[0], laid[1], skin, rest, have, ppm)
+            p_ = dict(p_, shown=round(sh, 3), floating=round(fl, 3))
+            c_ += _SHOWN_COST * sh + _FLOAT_COST * fl
+        return (c_, l_, faces, dict(p_, spread=spread, thumb=list(thumb), bend=bend, palm=palm))
 
-    # (the fingers' spread and the thumb with its back toward the camera,
-    # then that hand turned palm forward)
-    for spread in _SPREADS:
-        for thumb in _THUMBS:
-            got = one(spread, thumb, False)
-            if got is not None and (best is None or got[0] < best[0]):
-                best = got
-    if best is not None:
-        got = one(best[3]["spread"], tuple(best[3]["thumb"]), True)
-        if got is not None and got[0] < best[0]:
+    def better(got):
+        nonlocal best
+        if got is not None and (best is None or got[0] < best[0]):
             best = got
+
+    # (the fingers' bend and the thumb, fingers together, back toward the
+    # camera; then that hand's fingers spread; then turned palm forward)
+    for bend in _BENDS:
+        for thumb in _THUMBS:
+            better(one(_SPREADS[0], thumb, bend, False))
+    if best is None:
+        return None
+    b_ = best[3]
+    for spread in _SPREADS[1:]:
+        better(one(spread, tuple(b_["thumb"]), b_["bend"], False))
+    b_ = best[3]
+    better(one(b_["spread"], tuple(b_["thumb"]), b_["bend"], True))
     return None if best is None else best[1:]
 
 
-def lay(loc, faces, placed: dict, skin, rest, have, ppm: float, wrist_depth: Optional[float] = None, print_px: float = 0.0):
-    """The hand laid where `fit` put it: its palm on what it rests on (across
-    gaps narrower than _REST_SPAN), its back its own thickness out; what the
-    photo doesn't show of it behind whatever covers it there. (vertices,
-    faces) in photo px (x right, y down, depth back), or None."""
+def lay(loc, faces, placed: dict, skin, rest, have, ppm: float, wrist_depth: Optional[float] = None, print_px: float = 0.0,
+        search: bool = False):
+    """The hand set down where `fit` put it, whole -- its own 3D shape kept
+    from every side (laid point by point it folded through itself, and as
+    its front and back filled between it was flat from above): turned in the
+    photo's plane as fitted, tilted to lie along what it rests on under the
+    skin the photo shows of it (a plane through that), its palm on it, sunk
+    _SINK in; beside the body, its middle at its own wrist's depth.
+    (vertices, faces) in photo px (x right, y down, depth back), or None."""
     import trimesh
     from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter
 
@@ -375,71 +410,112 @@ def lay(loc, faces, placed: dict, skin, rest, have, ppm: float, wrist_depth: Opt
     tx, ty = placed["t"]
     c, s_ = np.cos(th), np.sin(th)
     k = sc * ppm
-    x = tx + k * (loc[:, 0] * c + loc[:, 1] * s_)
-    y = ty + k * (loc[:, 0] * s_ - loc[:, 1] * c)
+    # (x right, y down, h toward the camera: the back of the hand up)
+    X = np.column_stack([tx + k * (loc[:, 0] * c + loc[:, 1] * s_), ty + k * (loc[:, 0] * s_ - loc[:, 1] * c), k * loc[:, 2]])
     span = max(int(round(_REST_SPAN * ppm)), 3)
     top = gaussian_filter(maximum_filter(rest, size=span), span / 2.0)
-    under = map_coordinates(top, [y, x], order=1, mode="nearest")
-    if wrist_depth is not None:
-        # (where nothing of the body is behind it -- a hand hanging beside
-        # it -- its middle at its own wrist's depth)
-        over = map_coordinates(gaussian_filter(have.astype(np.float64), 2.0), [y, x], order=1, mode="constant")
-        half_t = 0.5 * float(np.median(_palm_side(loc, faces, top=True) - _palm_side(loc, faces))) * k
-        under = over * under + (1.0 - over) * (-wrist_depth - half_t)
-    # (each part by its own palm side: the fingers slope from the knuckles,
-    # and laid off the hand's lowest point they stood clear of the arm)
-    low, high = _palm_side(loc, faces), _palm_side(loc, faces, top=True)
-    h = (loc[:, 2] - low) * k
-    z = under - _SINK * ppm + h  # toward the camera
-    # what the photo doesn't show of it: behind what covers it there -- each
-    # part of it moved back whole, its thickness kept (pressed flat point by
-    # point it crumpled), eased across where the photo stops showing it
-    H_, W_ = skin.shape
-    xi, yi = np.clip(np.rint(x).astype(int), 0, W_ - 1), np.clip(np.rint(y).astype(int), 0, H_ - 1)
-    front = gaussian_filter(np.where(have, rest, rest.min()), 1.5)
-    need = np.zeros(skin.shape)
-    cnt = np.zeros(skin.shape)
-    back_by = np.clip(under + (high - low) * k - _SINK * ppm - (map_coordinates(front, [y, x], order=1, mode="nearest") - _HIDDEN_BEHIND * ppm), 0.0, None)
-    np.maximum.at(need, (yi, xi), back_by)
-    np.add.at(cnt, (yi, xi), 1.0)
-    hidden = (cnt > 0) & ~skin
-    need = np.where(hidden, need, 0.0)
-    from scipy.ndimage import grey_dilation
-    need = gaussian_filter(grey_dilation(need, size=(5, 5)), 2.0)
-    z = z - map_coordinates(need, [y, x], order=1, mode="nearest")
-    V = np.column_stack([x, y, -z])
-    # (as a solid: its front and its back as the camera sees them, filled
-    # between -- laid over a curved arm the hand's own surface folded through
-    # itself in places, and it would not join)
-    from scipy.ndimage import binary_fill_holes, binary_opening
+    ys, xs = np.nonzero(skin & have)
+    over = len(xs) / max(float(skin.sum()), 1.0)
+    if over >= 0.5 and len(xs) >= 20:
+        # the plane it lies along: through what it rests on under its skin
+        A = np.column_stack([xs, ys, np.ones(len(xs))]).astype(np.float64)
+        a, b, _ = np.linalg.lstsq(A, top[ys, xs], rcond=None)[0]
+        n = np.array([-a, -b, 1.0])
+        n /= np.linalg.norm(n)
+        z = np.array([0.0, 0.0, 1.0])
+        ax = np.cross(z, n)
+        sa, ca = float(np.linalg.norm(ax)), float(z @ n)
+        if sa > 1e-9:
+            ax /= sa
+            K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+            R = np.eye(3) + sa * K + (1.0 - ca) * (K @ K)
+            ctr = X.mean(0)
+            X = (X - ctr) @ R.T + ctr
+        # its palm on it: the lowest of it over its skin touching, sunk in
+        on = map_coordinates(skin.astype(np.float64), [X[:, 1], X[:, 0]], order=1, mode="constant") > 0.5
+        sel = on if on.sum() >= 20 else np.ones(len(X), dtype=bool)
+        gap = X[sel, 2] - map_coordinates(top, [X[sel, 1], X[sel, 0]], order=1, mode="nearest")
+        X[:, 2] += -float(np.percentile(gap, 2)) - _SINK * ppm
+        if search:
+            X = _settle(X, faces, skin, rest, have, ppm, c, s_)
+    elif wrist_depth is not None:
+        X[:, 2] += -wrist_depth - float(np.median(X[:, 2]))
+    else:
+        X[:, 2] += float(np.median(map_coordinates(top, [X[:, 1], X[:, 0]], order=1, mode="nearest"))) - float(X[:, 2].min())
+    V = np.column_stack([X[:, 0], X[:, 1], -X[:, 2]])
+    m = trimesh.Trimesh(V, faces, process=False)
+    if not m.is_watertight:
+        return None
+    if m.volume < 0:
+        faces = faces[:, ::-1]
+    return V, faces
 
-    from . import silhouette_relief as sr
+
+def hidden_shown(V, faces, skin, rest, ppm: float) -> float:
+    """How much of the hand stands in front of the body where the photo shows
+    no skin (it should be out of sight there), over the skin's area."""
+    from .body_first import _raster_front
+
+    near, _ = _raster_front(V, faces, skin.shape)
+    front = np.isfinite(near) & (-near > rest + _HIDDEN_BEHIND * ppm)
+    return float((front & ~skin).sum()) / max(float(skin.sum()), 1.0)
+
+
+def floating(V, faces, skin, rest, have, ppm: float) -> float:
+    """The share of the hand's skin where its underside stands more than
+    _FLOAT_GAP clear of the body it lies on."""
     from .body_first import _raster_front
 
     near, far = _raster_front(V, faces, skin.shape)
-    P = np.isfinite(near)
-    r = max(int(round(max(_MIN_W * ppm, print_px) / 2.0)), 1)
-    P = binary_opening(binary_fill_holes(P), structure=np.hypot(*np.mgrid[-r:r + 1, -r:r + 1]) <= r)
-    if P.sum() < 20:
-        return None
-    from scipy.ndimage import distance_transform_edt
+    on = np.isfinite(far) & skin & have
+    if not on.any():
+        return 0.0
+    return float(((-far[on]) - rest[on] > _FLOAT_GAP * ppm).sum()) / max(float(skin.sum()), 1.0)
 
-    got = np.isfinite(near) & np.isfinite(far)
-    _, (iy, ix) = distance_transform_edt(~got, return_indices=True)  # (the holes filled in: their neighbours' depth)
-    fr = np.where(P, -near[iy, ix], 0.0)
-    bk = np.where(P, -far[iy, ix], 0.0)
-    # (no edge thinner than a print holds -- front and back meet at its
-    # outline -- and no thin gap between it and what it lies on: down to that
-    # where it is close)
-    bk = np.minimum(bk, fr - max(_MIN_THICK * ppm, print_px))
-    bk = np.where(P & (bk - rest < _FILL_DOWN * ppm), np.minimum(bk, rest - _SINK * ppm), bk)
-    h0 = float(bk[P].min()) - 3.0
-    zs = np.arange(0.0, float(fr[P].max()) - h0 + 3.0, 1.0)
-    piece = sr._layer_solid(fr - h0, bk - h0, P, zs, 1.0, 1.0, True)
-    if piece is None:
-        return None
-    pv, pf = piece
-    pv = np.column_stack([pv[:, 2], pv[:, 1], -(pv[:, 0] + h0)])
-    if trimesh.Trimesh(pv, pf, process=False).volume < 0:
-        pf = pf[:, ::-1]
-    return pv, pf
+
+def _rot(axis, ang):
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    return np.eye(3) + np.sin(ang) * K + (1.0 - np.cos(ang)) * (K @ K)
+
+
+def _settle(X, faces, skin, rest, have, ppm: float, c: float, s_: float):
+    """The hand tipped along its length and across it and moved in depth
+    (whole: it keeps its shape) so that what the photo shows of it lies on
+    what it rests on -- neither clear of it nor sunk into it -- and what the
+    photo doesn't show is out of sight: the wrist going on under a forearm
+    while the fingers lie over the arm beyond. X: x, y, h toward the camera."""
+    from .body_first import _raster_front
+
+    seen_px = max(float(skin.sum()), 1.0)
+    gap = _FLOAT_GAP * ppm
+    on_skin = skin & have
+
+    def score(Y):
+        near, far = _raster_front(np.column_stack([Y[:, 0], Y[:, 1], -Y[:, 2]]), faces, skin.shape)
+        got = np.isfinite(near)
+        front, under = -near, -far
+        shown = (got & ~skin & (front > rest + _HIDDEN_BEHIND * ppm)).sum()
+        sunk = (on_skin & ~(got & (front > rest))).sum()
+        clear = (on_skin & got & (under - rest > gap)).sum()
+        return (shown + _SUNK_COST * sunk + clear) / seen_px
+
+    ctr = X.mean(0)
+    along = np.array([c, s_, 0.0])
+    across = np.array([s_, -c, 0.0])
+    best = (score(X), X)
+    # (coarse, then fine: a hand tucked under an arm tips its fingers far
+    # back behind it)
+    for step_a, n_p, n_r, step_d in ((np.radians(15.0), 5, 2, 0.01 * ppm), (np.radians(5.0), 2, 1, 0.004 * ppm)):
+        base = best[1]
+        for pa in range(-n_p, n_p + 1):
+            for ra in range(-n_r, n_r + 1):
+                R = _rot(across, pa * step_a) @ _rot(along, ra * step_a)
+                Y0 = (base - ctr) @ R.T + ctr
+                for dz in range(-3, 4):
+                    Y = Y0.copy()
+                    Y[:, 2] += dz * step_d
+                    sc_ = score(Y)
+                    if sc_ < best[0]:
+                        best = (sc_, Y)
+    return best[1]
