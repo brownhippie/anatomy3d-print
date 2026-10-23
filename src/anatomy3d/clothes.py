@@ -72,6 +72,9 @@ _COLLAR_PROMPT = [49406, 320, 2523, 13497, 49407]  # "a shirt collar"
 _COLLAR_BAND = 0.9  # ... a collar only this many face heights below the chin
 _COLLAR_REACH = 0.35  # ... and within this many face heights of the neck's skin
 _COLLAR_MIN_W = 0.12  # ... and nothing of it narrower than this many face widths (a wing, not the shirt's strip by the tie)
+_SHIRT_SMOOTH = 0.01  # the shirt in a jacket's opening: colours averaged over this many face widths (the weave's noise) ...
+_SHIRT_NEARER = 0.5  # ... taken as the shirt where its colour is this much nearer the shirt's than the jacket's ...
+_SHIRT_REACH = 1.2  # ... within this many face widths of the face's middle
 _LAPEL_W = 0.55  # a lapel's width at its top, face widths (a jacket's lapels run along its opening, narrowing to the button)
 _TIE_MARGIN = 0.3  # ... where "a necktie" outscores the other garments by this much (logits)
 _TIE_SMOOTH = 0.02  # the tie's whole length: its colour, a pattern's dots averaged over this many face widths ...
@@ -181,6 +184,7 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
     labels[person & (seg == HAIR)] = NAMES.index("hair") + 1
     labels[collar & (labels > 0) & (labels <= len(GARMENTS))] = NAMES.index("collar") + 1
     if face_mesh is not None:
+        labels[shirt_whole(labels, rgb, face_mesh)] = NAMES.index("shirt") + 1
         lap = lapels(labels, face_mesh)
         labels[lap] = NAMES.index("lapel") + 1
     total = float(person.sum())
@@ -233,6 +237,37 @@ def tie_whole(labels: np.ndarray, rgb: np.ndarray, face_mesh) -> np.ndarray:
     mid = float(np.median(np.nonzero(tie)[1]))
     like = (d < reach) & (labels > 0) & (rows > chin) & (np.abs(cols - mid) < _TIE_REACH * fw)
     return binary_propagation(tie & like, mask=like) | tie
+
+
+def shirt_whole(labels: np.ndarray, rgb: np.ndarray, face_mesh) -> np.ndarray:
+    """The shirt showing in a jacket's opening, by its colour: between the
+    tie and the jacket's fronts the shirt shows as a narrow strip, and read
+    patch by patch it is called the jacket (the lapels were then laid over
+    it, and it stood as a wall beside the tie). The jacket's pixels joined to
+    the shirt, its collar or the tie, below the chin, that are much nearer
+    the shirt's colour than the jacket's. Nothing when no shirt or no jacket
+    is read."""
+    from scipy.ndimage import binary_propagation, gaussian_filter
+    from skimage.color import rgb2lab
+
+    none = np.zeros(labels.shape, bool)
+    sh = np.isin(labels, [NAMES.index(k) + 1 for k in ("shirt", "collar") if k in NAMES])
+    jacket = np.isin(labels, [NAMES.index(k) + 1 for k in ("suit", "jacket", "coat") if k in NAMES])
+    if sh.sum() < 50 or jacket.sum() < 200:
+        return none
+    fm = np.asarray(face_mesh)[:468, :2]
+    fw = float(np.ptp(fm[:, 0]))
+    cx = float(fm[:, 0].mean())
+    chin = float(np.asarray(face_mesh)[152, 1])
+    L = rgb2lab(np.asarray(rgb)[..., :3] / 255.0)
+    L = np.stack([gaussian_filter(L[..., i], _SHIRT_SMOOTH * fw) for i in range(3)], axis=-1)
+    d_s = np.linalg.norm(L - np.median(L[sh], axis=0), axis=-1)
+    d_j = np.linalg.norm(L - np.median(L[jacket], axis=0), axis=-1)
+    rows = np.arange(labels.shape[0])[:, None]
+    cols = np.arange(labels.shape[1])[None, :]
+    like = jacket & (d_s < _SHIRT_NEARER * d_j) & (rows > chin) & (np.abs(cols - cx) < _SHIRT_REACH * fw)
+    seed = sh | (labels == NAMES.index("tie") + 1)
+    return binary_propagation(seed, mask=like | seed) & like
 
 
 def lapels(labels: np.ndarray, face_mesh) -> np.ndarray:

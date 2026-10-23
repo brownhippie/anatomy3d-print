@@ -50,6 +50,11 @@ _FIT_THICK = {"inner": 0.0015, "outer": 0.003, "tie": 0.004, "collar": 0.004, "l
 _FIT_SHOW = 1.6  # ... shown up this much on a figure (on a person cloth keeps close; on a model the gap is what shows it)
 _HAIR_EDGE_SHARE = 0.35  # short hair at its hairline: this share of its layer ...
 _HAIRLINE_TAPER = 0.01  # ... the full layer this far in (m)
+_SHELL_TOPS = ("suit", "jacket", "coat")  # the tops made as a layer of their own over the body
+_SHELL_SLEEVES = {"suit": "long", "jacket": "long", "coat": "long"}  # ... down their sleeves this far
+_SHELL_FORM = 0.02  # ... laid along the body's form averaged over this much (m), not its creases
+_SHELL_EDGE = 3  # ... its edges a step eased over this many mesh steps
+_SHELL_LABEL_EASE = 0.003  # ... and the photo's names for it eased over this much (m): their pixel edges are ragged
 _GV_SMOOTH = 4  # the collars', seams' and hems' edges eased over this many mesh steps
 _GV_COLLAR_FRONT = 55.0  # degrees either side of the front: the collar there is the photo's
 _SB_JAW = 0.45  # the jaw's angle this many ear heights below the ear's bottom
@@ -365,6 +370,66 @@ _ANSUR = {"head": 1.2914, "chest": 0.611, "waist": 0.572}
 _CLOTHED_DEPTH = 1.06  # the clothes' room on top of a bare body's depth
 _PLAN_TOLERANCE = 0.08  # a section's depth within this share of the human figure's is left as it is
 _PLAN_MAX_FIX = 0.25  # ... and moved at most this share toward it
+
+
+_EYE_RINGS = ([33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246],
+              [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466])
+_FACE_PIT = 0.006  # the face points' relief: pits narrower than twice this (m) filled ...
+_FACE_PIT_EYE = 0.004  # ... away from the eyes by this much (m): their sockets and lids are their own
+
+
+def _mend_face_relief(fr, fm, mouth_open: bool, ppm: float):
+    """The face points' relief (photo px) where the points mislead: the
+    points round the nose's wings sit far back, and between them the relief
+    sank a pit beside each wing (a groove either side of the nose, seen from
+    the front); the points along an open mouth's inner lips sit far back too,
+    and across the opening it fell into a trough the teeth were then set
+    into, 1 cm behind the lips. Narrow pits are filled (not round the eyes),
+    and an open mouth is bridged from its lips' edge, so the teeth sit just
+    behind the lips, following them."""
+    from scipy.ndimage import binary_dilation, distance_transform_edt, grey_closing
+    from skimage.draw import polygon as _polygon
+
+    from .face_parts import FACE_OVAL, INNER_LIPS
+
+    f = np.asarray(fm)[:, :2]
+    H, W = fr.shape
+    face = np.zeros((H, W), dtype=bool)
+    rr, cc = _polygon(f[FACE_OVAL, 1], f[FACE_OVAL, 0], (H, W))
+    face[rr, cc] = True
+    if not face.any():
+        return fr
+    ys, xs = np.nonzero(face)
+    pad = int(np.ceil(_FACE_PIT * 2 * ppm)) + 2
+    y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, H)
+    x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, W)
+    sub = fr[y0:y1, x0:x1].astype(np.float64)
+    out = fr.copy()
+    keep = np.zeros(sub.shape, dtype=bool)  # (left as they are: the eyes, and an open mouth)
+    for ring in _EYE_RINGS:
+        rr, cc = _polygon(f[ring, 1] - y0, f[ring, 0] - x0, sub.shape)
+        keep[rr, cc] = True
+    keep = distance_transform_edt(~keep) <= _FACE_PIT_EYE * ppm
+    mouth = np.zeros(sub.shape, dtype=bool)
+    if mouth_open:
+        rr, cc = _polygon(f[INNER_LIPS, 1] - y0, f[INNER_LIPS, 0] - x0, sub.shape)
+        mouth[rr, cc] = True
+    if mouth.any():
+        # bridged from its edge: each point the mean of the lips' edge round
+        # it, weighted by nearness (smooth across, the edge kept)
+        edge = binary_dilation(mouth, iterations=2) & ~mouth
+        ey, ex = np.nonzero(edge)
+        my, mx = np.nonzero(mouth)
+        d2 = (my[:, None] - ey[None, :]) ** 2 + (mx[:, None] - ex[None, :]) ** 2
+        wgt = 1.0 / np.maximum(d2, 1.0) ** 2
+        sub[my, mx] = (wgt * sub[ey, ex][None, :]).sum(axis=1) / wgt.sum(axis=1)
+    r = max(int(round(_FACE_PIT * ppm)), 1)
+    disk = np.hypot(*np.mgrid[-r:r + 1, -r:r + 1]) <= r
+    closed = grey_closing(sub, footprint=disk)
+    fsub = face[y0:y1, x0:x1] & ~keep & ~mouth
+    sub = np.where(fsub, closed, sub)
+    out[y0:y1, x0:x1] = sub
+    return out
 
 
 def _flatten_body_face(fm, near, cov, ppm: float):
@@ -1250,6 +1315,9 @@ def _measure_fit(V_bare, V_dressed, F, pw, names, clothes, J: dict, ppm: float, 
     return m
 
 
+_ON_GARMENT = ("tie", "scarf", "belt", "necklace", "collar", "lapel")  # pieces lying on a garment, never what one is worn on
+
+
 def _clothes_pop(clothes: dict, front, cov, ppm: float, H: dict, neck_rows=None, sharp: bool = False):
     """Offsets (photo px, toward the camera) for the clothes as tailored
     (_measure_fit): each piece -- a tie, a collar, a lapel, a jacket's front
@@ -1280,6 +1348,20 @@ def _clothes_pop(clothes: dict, front, cov, ppm: float, H: dict, neck_rows=None,
     base = gaussian_filter(minimum_filter(np.where(cov, Hf, np.inf), size=span), span / 4.0)
     base = np.where(np.isfinite(base), base, Hf)
     lift = np.clip(Hf - base, 0.0, _POP_MAX * ppm)
+    # and no more over what is beside it than its own step over the garment
+    # it lies on (a lapel by a jacket's opening was measured against the
+    # shirt there, and stood 11 mm proud of the jacket as a wall by the tie)
+    from .study import _OUTER
+
+    step = np.full(len(NAMES) + 1, np.inf)
+    for k in H:
+        if k not in NAMES or not (lab == NAMES.index(k) + 1).any():
+            continue
+        on = [H[i] for i in _OUTER.get(k, ()) if i in NAMES and i in H and i not in _ON_GARMENT
+              and (lab == NAMES.index(i) + 1).any()]
+        if on:
+            step[NAMES.index(k) + 1] = max(H[k] - max(on), 0.0)
+    lift = np.minimum(lift, step[lab])
     for k, t in (("belt", 0.004), ("watch", 0.006), ("bracelet", 0.003)):
         if k in NAMES:
             lift = lift + t * ppm * (lab == NAMES.index(k) + 1)
@@ -1451,7 +1533,64 @@ def _sideburns_3d(V, F, part_w, names, ear_w, head_axes, read: dict, fm, ppm: fl
                                              "thick_mm": round(thick / ppm * 1000.0, 2)}
 
 
-def _garment_views(V, F, part_w, names, found, J: dict, ppm: float):
+def _broad_normals(V, n, span: float):
+    """The surface's direction at each vertex averaged over `span` (same
+    units as V) round it: averaged on a grid of cells span/4 across, then
+    read back at each vertex from the cells round it."""
+    from scipy.spatial import cKDTree
+
+    cell = max(span / 4.0, 1e-6)
+    key = np.floor(V / cell).astype(np.int64)
+    uk, inv = np.unique(key, axis=0, return_inverse=True)
+    inv = inv.ravel()
+    c_pos = np.zeros((len(uk), 3))
+    c_n = np.zeros((len(uk), 3))
+    cnt = np.bincount(inv, minlength=len(uk)).astype(np.float64)
+    for j in range(3):
+        c_pos[:, j] = np.bincount(inv, V[:, j], minlength=len(uk)) / cnt
+        c_n[:, j] = np.bincount(inv, n[:, j], minlength=len(uk))
+    tree = cKDTree(c_pos)
+    nb = tree.query_ball_point(c_pos, span)
+    sm = np.zeros_like(c_n)
+    for i_, js in enumerate(nb):
+        cn = c_n[js]
+        sm[i_] = cn[cn @ c_n[i_] > 0].sum(axis=0)  # (only cells facing its way)
+    # (only cells facing the same way: an arm's other side, or the chest
+    # under a sleeve, within reach is not this surface)
+    out = np.zeros((len(V), 3))
+    d, j = tree.query(V, k=4)
+    for k in range(j.shape[1]):
+        cand = sm[j[:, k]]
+        ok = np.einsum("ij,ij->i", cand, n) > 0
+        out += np.where(ok[:, None], cand / (1.0 + d[:, k:k + 1]), 0.0)
+    nrm = np.linalg.norm(out, axis=1, keepdims=True)
+    return np.where(nrm > 1e-9, out / np.maximum(nrm, 1e-12), n)
+
+
+def _facing_gap(V, n, reach: float, sel):
+    """How far each selected vertex can grow along its normal `n` before it
+    meets another stretch of the surface facing back at it (a sleeve lying on
+    the chest, the chest under it): looked for at a few steps out to `reach`
+    (`reach` where nothing is met)."""
+    from scipy.spatial import cKDTree
+
+    gap = np.full(len(V), float(reach))
+    idx = np.flatnonzero(sel)
+    if not len(idx) or reach <= 0:
+        return gap
+    tree = cKDTree(V)
+    for f in (0.25, 0.5, 0.75, 1.0):
+        s_ = f * reach
+        q = V[idx] + n[idx] * s_
+        d, j = tree.query(q)
+        to = V[j] - V[idx]
+        met = (d < 0.5 * s_) & (np.einsum("ij,ij->i", n[j], n[idx]) < -0.3) & (np.linalg.norm(to, axis=1) > 0.5 * s_)
+        hit = idx[met]
+        gap[hit] = np.minimum(gap[hit], np.maximum(np.einsum("ij,ij->i", to[met], n[idx][met]), 0.0))
+    return gap
+
+
+def _garment_views(V, F, part_w, names, found, J: dict, ppm: float, labels=None, shell=0.0):
     """The garments read on the front, made all round as they are sewn
     (garment_designs): the collars round the back and sides of the neck (a
     jacket's, the shirt's showing above it; a knitted band; a hood), the
@@ -1512,6 +1651,63 @@ def _garment_views(V, F, part_w, names, found, J: dict, ppm: float):
     back_w = 1.0 - off_front
     m = ppm  # px per metre
     off = np.zeros(len(V))
+
+    # the outer top as a layer of its own over the body: as thick as it was
+    # measured over what is under it (`shell`, px), over all it covers --
+    # where the camera sees the body, what the photo names there (the jacket,
+    # its lapels); round the sides and back, the torso above its hem and the
+    # sleeves to the wrist -- stepping down at its edges to the shirt and tie
+    # in its opening, the neck and the hands (left as the body, the jacket
+    # was only its edges' lines drawn on a bare torso)
+    shell_v = np.zeros(len(V))
+    if shell > 0 and labels is not None and wd["outer"] in _SHELL_TOPS:
+        from .clothes import NAMES as _CN
+
+        H_, W_ = labels.shape
+        ix = np.clip(np.round(V[:, 0]).astype(int), 0, W_ - 1)
+        iy = np.clip(np.round(V[:, 1]).astype(int), 0, H_ - 1)
+        inb = (V[:, 0] >= 0) & (V[:, 0] < W_) & (V[:, 1] >= 0) & (V[:, 1] < H_)
+        near = np.full((H_, W_), np.inf)
+        np.minimum.at(near, (iy[inb], ix[inb]), V[inb, 2])
+        from scipy.ndimage import minimum_filter as _minf
+
+        near = _minf(near, size=3)
+        seen = inb & (V[:, 2] <= near[iy, ix] + 1.5) & (off_front > 0.3)
+        from scipy.ndimage import gaussian_filter as _gf, map_coordinates as _mc
+        from .study import _OUTER as _OU
+
+        # what the photo names there: the top itself (1); what it is worn
+        # over, showing in its opening, or nothing (0); anything lying on it
+        # (a hand, a watch) says nothing of it -- there it goes by the body
+        top = np.isin(labels, [_CN.index(k) + 1 for k in (wd["outer"], "lapel") if k in _CN])
+        under = np.isin(labels, [_CN.index(k) + 1 for k in _OU.get(wd["outer"], ()) + ("collar",) if k in _CN]) | (labels == 0)
+        sig = _SHELL_LABEL_EASE * m
+        p_top = _mc(_gf(top.astype(np.float64), sig), [V[:, 1], V[:, 0]], order=1, mode="nearest")
+        p_und = _mc(_gf(under.astype(np.float64), sig), [V[:, 1], V[:, 0]], order=1, mode="nearest")
+        said = np.clip(p_top + p_und, 1e-6, None)
+        on_photo = p_top / said
+        sure = np.clip(said, 0.0, 1.0)
+        s_hip = float((mhip - msh) @ up)
+        hem_s = {"hip": s_hip - 0.08 * m, "waist": s_hip + 0.12 * m, "thigh": s_hip - 0.25 * m,
+                 "knee": s_hip - 0.5 * m}.get(wd["hem"] or "", -np.inf)
+        round_ = w_t * np.clip((s_up - hem_s) / (0.004 * m), 0.0, 1.0)
+        for part in {"long": ("upperarm", "forearm"), "short": ("upperarm",)}.get(_SHELL_SLEEVES.get(wd["outer"], ""), ()):
+            for sd in ("L", "R"):
+                if f"{part}.{sd}" in names:
+                    round_ = round_ + part_w[:, names.index(f"{part}.{sd}")]
+        round_ = np.clip(round_, 0.0, 1.0)
+        bare = np.zeros(len(V))
+        for nm_ in names:
+            if nm_.startswith(("hand", "head", "neck")) or nm_ in ("head", "neck"):
+                bare = bare + part_w[:, names.index(nm_)]
+        w_seen = seen.astype(np.float64) * sure
+        c = (w_seen * on_photo + (1.0 - w_seen) * round_) * np.clip(1.0 - bare, 0.0, 1.0)
+        shell_v = sr._mesh_smooth(lap, c, _SHELL_EDGE) * shell
+        # no thicker than half the gap to a surface facing it (a sleeve lying
+        # on the chest: grown into each other, the two made one solid with
+        # walls inside it 0.2 mm thick)
+        shell_v = np.minimum(shell_v, sr._mesh_smooth(lap, 0.5 * _facing_gap(V, n_s, 2.0 * shell, shell_v > 0.0), _SHELL_EDGE))
+        made["shell_mm"] = round(float(shell) / m * 1000.0, 1)
 
     # the collars: from the neck's base (the neck's lowest at each angle) up
     neck = w_n > 0.5
@@ -1595,7 +1791,13 @@ def _garment_views(V, F, part_w, names, found, J: dict, ppm: float):
         made["waistband"] = True
     off = sr._mesh_smooth(lap, off * back_w, _GV_SMOOTH)
     made["views"] = wd["views"]
-    return V + off[:, None] * n_s, made
+    out = V + off[:, None] * n_s
+    if shell_v.any():
+        # the layer laid along the body's broad form, not its every crease:
+        # pushed out along the surface's own direction, a crease tighter than
+        # the layer is thick folded over itself (walls 0.2 mm thick inside)
+        out = out + shell_v[:, None] * _broad_normals(V, n_s, _SHELL_FORM * m)
+    return out, made
 
 
 def _eye_h(f, corner: int) -> float:
@@ -2267,6 +2469,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
                 from .head_parts import BODY_SKIN, FACE_SKIN
 
                 fr = fr * gaussian_filter(np.isin(labels, (FACE_SKIN, BODY_SKIN)).astype(np.float32), 1.5)
+            fr = _mend_face_relief(fr, fm, bool(((parts.get("face") or {}).get("mouth") or {}).get("open")), ppm)
             offset += fr
             face_read = parts.get("face")
             if face_read:
@@ -2521,7 +2724,19 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     if clothes_steps and clothes and ref.get("joints_px"):
         try:
             J3 = {k_: np.asarray(v_, dtype=np.float64) for k_, v_ in (ref.get("joints_px") or {}).items()}
-            V, gv = _garment_views(V, F, part_w, names, (clothes or {}).get("found") or {}, J3, ppm)
+            shell_px = 0.0
+            if fit is not None and fit.get("_H"):
+                from . import garment_designs as _gd
+                from .study import _OUTER as _OU
+
+                _Hf = fit["_H"]
+                _outer = _gd.worn_designs((clothes or {}).get("found") or {})["outer"]
+                _found = (clothes or {}).get("found") or {}
+                _under = [_Hf[i] for i in _OU.get(_outer or "", ()) if i in _Hf and i in _found and i not in _ON_GARMENT]
+                if _outer in _Hf:
+                    shell_px = max(float(_Hf[_outer]) - (max(_under) if _under else 0.0), 0.0)
+            V, gv = _garment_views(V, F, part_w, names, (clothes or {}).get("found") or {}, J3, ppm,
+                                   labels=(clothes or {}).get("labels"), shell=shell_px)
             report["garment_views"] = {k_: v_ for k_, v_ in gv.items() if k_ != "views"}
             report["garment_designs"] = gv.get("views")
             if gv.get("outer"):
