@@ -34,6 +34,8 @@ _FIT_WRIST = 0.3  # ... its wrist away from the body's wrist this much, per _FIT
 _FIT_WRIST_SPAN = 0.25
 _FOOT_MM = 1.0  # the hand's footprint, for the fit, at this resolution (mm)
 _HIDDEN_BEHIND = 0.003  # what the photo doesn't show of a hand lies at least this far behind what covers it (m)
+_TUCK_MARGIN = 0.004  # a hand's part within this of the skin the photo shows (m) is shown; beyond twice this, hidden
+_HIDDEN_VOLUME = 0.004  # what the photo doesn't show of a hand stands at most this far out of what hides it (m): its volume, not its fingers
 _SINK = 0.002  # the palm this far into what it rests on, so the two join (m)
 _REST_SPAN = 0.03  # a hand lies across bumps and gaps narrower than this (m)
 _PALM_EASE = 0.002  # the hand's palm side eased over this (m)
@@ -449,6 +451,41 @@ def lay(loc, faces, placed: dict, skin, rest, have, ppm: float, wrist_depth: Opt
     if m.volume < 0:
         faces = faces[:, ::-1]
     return V, faces
+
+
+def tuck(V, faces, body_V, body_F, skin, ppm: float):
+    """What the photo doesn't show of a hand kept out of sight from every
+    side, not only the camera's: each part of it past the skin the photo
+    shows (beyond _TUCK_MARGIN) pressed onto the surface nearest it -- the
+    arm it wraps, the side it is tucked against -- standing at most
+    _HIDDEN_VOLUME out of it, so the hand's volume shows there, not the
+    fingers the camera never saw (whole, they stood out beside the arm and
+    above it). Eased in over the margin; the shown part as laid."""
+    import trimesh
+    from scipy.ndimage import distance_transform_edt, map_coordinates
+
+    V = np.asarray(V, dtype=np.float64)
+    m_ = max(_TUCK_MARGIN * ppm, 1.0)
+    d = distance_transform_edt(~skin)
+    hid = np.clip(map_coordinates(d, [V[:, 1], V[:, 0]], order=1, mode="nearest") / m_ - 1.0, 0.0, 1.0)
+    sel = hid > 0.0
+    if not sel.any():
+        return V
+    lo, hi = V.min(0) - 0.05 * ppm, V.max(0) + 0.05 * ppm
+    bf_ = np.asarray(body_F)
+    c_ = np.asarray(body_V)[bf_].mean(1)
+    near_f = bf_[((c_ >= lo) & (c_ <= hi)).all(1)]
+    if not len(near_f):
+        return V
+    body = trimesh.Trimesh(body_V, near_f, process=False)
+    cp, _, tri = trimesh.proximity.closest_point(body, V[sel])
+    n = body.face_normals[tri]
+    out_d = np.einsum("ij,ij->i", V[sel] - cp, n)
+    lim = _HIDDEN_VOLUME * ppm
+    tgt = np.where((out_d > lim)[:, None], cp + n * lim, V[sel])
+    W = V.copy()
+    W[sel] = V[sel] + hid[sel, None] * (tgt - V[sel])
+    return W
 
 
 def hidden_shown(V, faces, skin, rest, ppm: float) -> float:

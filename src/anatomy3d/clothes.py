@@ -75,7 +75,14 @@ _COLLAR_MIN_W = 0.12  # ... and nothing of it narrower than this many face width
 _SHIRT_SMOOTH = 0.01  # the shirt in a jacket's opening: colours averaged over this many face widths (the weave's noise) ...
 _SHIRT_NEARER = 0.5  # ... taken as the shirt where its colour is this much nearer the shirt's than the jacket's ...
 _SHIRT_REACH = 1.2  # ... within this many face widths of the face's middle
-_LAPEL_W = 0.55  # a lapel's width at its top, face widths (a jacket's lapels run along its opening, narrowing to the button)
+_LAPEL_W = 0.55  # a lapel's width at its top, face widths (a jacket's lapels run along its opening, narrowing to the button) -- when the photo shows no edge
+_LAPEL_SEEK = (0.12, 0.75)  # the lapel's outer edge looked for this many face widths out from the opening ...
+_LAPEL_EDGE_PCT = 85.0  # ... where the jacket's shading changes more than this percentile of it does
+_LAPEL_IN = 3.0  # ... one straight edge (notch to button): the points within this many px of it
+_LAPEL_SHARE = 0.3  # ... taken when that holds for at least this share of the opening's rows
+_LAPEL_RANGE = (0.25, 0.9)  # ... and the lapel it makes is this many face widths across at its widest (as lapels are)
+_KNOT_LOOK = 0.6  # the tie's knot: its foot (where the tie is narrowest under the knot) within this many face widths of its top
+_COLLAR_PAST_KNOT = 0.05  # a shirt's collar points end at the knot's foot, give or take this many face widths
 _TIE_MARGIN = 0.3  # ... where "a necktie" outscores the other garments by this much (logits)
 _TIE_SMOOTH = 0.02  # the tie's whole length: its colour, a pattern's dots averaged over this many face widths ...
 _TIE_MATCH = 1.5  # ... within this many times its own colour spread (Lab, the 90th percentile over what was read) ...
@@ -185,7 +192,8 @@ def read_clothes(rgb: np.ndarray, person: np.ndarray, face_mesh: Optional[np.nda
     labels[collar & (labels > 0) & (labels <= len(GARMENTS))] = NAMES.index("collar") + 1
     if face_mesh is not None:
         labels[shirt_whole(labels, rgb, face_mesh)] = NAMES.index("shirt") + 1
-        lap = lapels(labels, face_mesh)
+        collar_at_knot(labels, face_mesh)
+        lap = lapels(labels, face_mesh, rgb)
         labels[lap] = NAMES.index("lapel") + 1
     total = float(person.sum())
     found = {}
@@ -270,12 +278,112 @@ def shirt_whole(labels: np.ndarray, rgb: np.ndarray, face_mesh) -> np.ndarray:
     return binary_propagation(seed, mask=like | seed) & like
 
 
-def lapels(labels: np.ndarray, face_mesh) -> np.ndarray:
-    """A jacket's lapels, from how a jacket is made: they run along its
-    opening (where the shirt, the tie or the collar shows between its two
-    fronts), widest at the top and narrowing to the opening's foot, each
-    _LAPEL_W face widths across at the top. The opening's own two edges in
-    the photo place them; nothing when no jacket or no opening is read."""
+def knot_foot(labels: np.ndarray, face_mesh) -> Optional[int]:
+    """The photo row where a tie's knot ends: where the tie, read row by
+    row, is narrowest under the knot's widest, within _KNOT_LOOK face widths
+    of its top. None when no tie is read."""
+    from scipy.ndimage import uniform_filter1d
+
+    if "tie" not in NAMES:
+        return None
+    t = labels == NAMES.index("tie") + 1
+    w = t.sum(axis=1).astype(np.float64)
+    rows = np.flatnonzero(w > 0)
+    if len(rows) < 10:
+        return None
+    fw = float(np.ptp(np.asarray(face_mesh)[:468, 0]))
+    top = int(rows.min())
+    look = w[top:top + max(int(_KNOT_LOOK * fw), 10)]
+    look = uniform_filter1d(look, 5)
+    # (the knot's widest: the first peak from the top -- the blade below it
+    # is wider than the knot)
+    peaks = [i for i in range(3, len(look) - 3) if look[i] >= look[i - 3:i + 4].max() and look[i] > look[i + 3]]
+    if not peaks:
+        return None
+    k = peaks[0]
+    return top + k + int(np.argmin(look[k:]))
+
+
+def collar_at_knot(labels: np.ndarray, face_mesh) -> None:
+    """A shirt's collar as the photo shows it when a tie is worn: its two
+    points lie over the shirt either side of the knot and end at the knot's
+    foot (how a collar sits round a tie), so the shirt the photo shows down
+    to there is collar, and below it the shirt's front -- the knot's foot
+    read off the tie in the photo. In place; nothing without a tie."""
+    foot = knot_foot(labels, face_mesh)
+    if foot is None or "collar" not in NAMES or "shirt" not in NAMES:
+        return
+    fw = float(np.ptp(np.asarray(face_mesh)[:468, 0]))
+    chin = float(np.asarray(face_mesh)[152, 1])
+    end = int(round(foot + _COLLAR_PAST_KNOT * fw))
+    rows = np.arange(labels.shape[0])[:, None]
+    ci, si = NAMES.index("collar") + 1, NAMES.index("shirt") + 1
+    shirtish = np.isin(labels, (ci, si))
+    labels[shirtish & (rows > chin) & (rows <= end)] = ci
+    labels[shirtish & (rows > end)] = si
+
+
+def _lapel_edges(labels, rgb, op, jacket, fw):
+    """The lapels' outer edges in the photo: on each side of the opening, the
+    straight line (notch to button) through the most points where the
+    jacket's shading changes sharply, _LAPEL_SEEK face widths out. {"L"|"R":
+    (a, b)} with x = a*y + b, for the sides found."""
+    from scipy import ndimage
+
+    g = ndimage.gaussian_filter(np.asarray(rgb, dtype=np.float64)[..., :3].mean(axis=2), 1.5)
+    mag = np.hypot(ndimage.sobel(g, 1), ndimage.sobel(g, 0))
+    jin = ndimage.binary_erosion(jacket, iterations=6)  # (not the jacket's outline against what is behind it)
+    if not jin.any():
+        return {}, mag, 0.0
+    thr = float(np.percentile(mag[jin], _LAPEL_EDGE_PCT))
+    H, W = labels.shape
+    pts = {"L": [], "R": []}
+    rr = np.flatnonzero(op.any(axis=1))
+    a0, b0 = int(_LAPEL_SEEK[0] * fw), int(_LAPEL_SEEK[1] * fw)
+    for y in rr:
+        xs = np.flatnonzero(op[y])
+        for sd, x0, sgn in (("L", xs.min(), -1), ("R", xs.max(), 1)):
+            xx = x0 + sgn * np.arange(a0, b0)
+            xx = xx[(xx >= 0) & (xx < W)]
+            if len(xx) < 5 or jin[y, xx].sum() < 5:
+                continue
+            m = np.where(jin[y, xx], mag[y, xx], 0.0)
+            k = int(np.argmax(m))
+            if m[k] > thr:
+                pts[sd].append((float(xx[k]), float(y)))
+    out = {}
+    rng = np.random.default_rng(0)
+    for sd, p in pts.items():
+        if len(p) < max(10, _LAPEL_SHARE * len(rr)):
+            continue
+        p = np.asarray(p)
+        best = None
+        for _ in range(400):
+            i, j = rng.choice(len(p), 2, replace=False)
+            if abs(p[i, 1] - p[j, 1]) < 0.1 * fw:
+                continue
+            a = (p[j, 0] - p[i, 0]) / (p[j, 1] - p[i, 1])
+            # (it closes on the opening toward the button)
+            if (sd == "L" and a <= 0.15) or (sd == "R" and a >= -0.15):
+                continue
+            inl = np.abs(p[:, 0] - (a * p[:, 1] + p[i, 0] - a * p[i, 1])) < _LAPEL_IN
+            if best is None or inl.sum() > best.sum():
+                best = inl
+        if best is None or best.sum() < _LAPEL_SHARE * len(rr):
+            continue
+        a, b = np.polyfit(p[best, 1], p[best, 0], 1)
+        out[sd] = (float(a), float(b))
+    return out, mag, thr
+
+
+def lapels(labels: np.ndarray, face_mesh, rgb: Optional[np.ndarray] = None) -> np.ndarray:
+    """A jacket's lapels: they run along its opening (where the shirt, the
+    tie or the collar shows between its two fronts) out to their own edge.
+    That edge as the photo shows it (_lapel_edges) when it reads as a
+    lapel's width; else, from how a jacket is made, _LAPEL_W face widths
+    across at the top narrowing to the opening's foot. The opening's own
+    two edges in the photo place them; nothing when no jacket or no opening
+    is read."""
     from scipy.ndimage import binary_closing, label as cc_label
 
     H, W = labels.shape
@@ -302,20 +410,69 @@ def lapels(labels: np.ndarray, face_mesh) -> np.ndarray:
     y_t, y_b = int(rr.min()), int(rr.max())
     if y_b - y_t < 0.5 * fw:
         return np.zeros((H, W), bool)
+    edges, mag, thr = _lapel_edges(labels, rgb, op, jacket, fw) if rgb is not None else ({}, None, 0.0)
     out = np.zeros((H, W), bool)
     wmax = _LAPEL_W * fw
+    widest = {"L": 0.0, "R": 0.0}
+    seen = {"L": np.zeros((H, W), bool), "R": np.zeros((H, W), bool)}
     for y in range(y_t, y_b + 1):
         xs = np.flatnonzero(op[y])
         if not len(xs):
             continue
+        xl, xr = int(xs.min()), int(xs.max())
+        if "L" in edges:
+            a_, b_ = edges["L"]
+            e = int(round(a_ * y + b_))
+            if e < xl:
+                seen["L"][y, e:xl] = jacket[y, e:xl]
+                widest["L"] = max(widest["L"], xl - e)
+        if "R" in edges:
+            a_, b_ = edges["R"]
+            e = int(round(a_ * y + b_))
+            if e > xr + 1:
+                seen["R"][y, xr + 1:e + 1] = jacket[y, xr + 1:e + 1]
+                widest["R"] = max(widest["R"], e - xr)
         w = wmax * (1.0 - (y - y_t) / max(y_b - y_t, 1))
         if w < 1.0:
             continue
-        xl, xr = int(xs.min()), int(xs.max())
-        a, b = max(int(xl - w), 0), xl
-        out[y, a:b] = jacket[y, a:b]
-        a, b = xr + 1, min(int(xr + 1 + w), W)
-        out[y, a:b] |= jacket[y, a:b]
+        for sd, a, b in (("L", max(int(xl - w), 0), xl), ("R", xr + 1, min(int(xr + 1 + w), W))):
+            if sd not in edges:
+                out[y, a:b] |= jacket[y, a:b]
+    # below the opening's foot (the shirt and tie end there) the lapel goes
+    # on down its own two edges -- the opening's, carried on straight, and its
+    # outer one -- to where the photo shows what crosses it (a sleeve's edge:
+    # the jacket's shading changing sharply across the lapel) or they meet
+    fit_n = max(int(0.3 * fw), 5)
+    tail = [y for y in range(max(y_b - fit_n, y_t), y_b + 1) if op[y].any()]
+    for sd in edges:
+        if len(tail) < 5:
+            break
+        xs_e = [float(np.flatnonzero(op[y]).min() if sd == "L" else np.flatnonzero(op[y]).max()) for y in tail]
+        ai, bi = np.polyfit(tail, xs_e, 1)
+        a_, b_ = edges[sd]
+        for y in range(y_b + 1, min(y_b + int(_KNOT_LOOK * fw), H)):
+            xi, xo = ai * y + bi, a_ * y + b_
+            lo, hi = (int(round(xo)), int(round(xi))) if sd == "L" else (int(round(xi)) + 1, int(round(xo)) + 1)
+            lo, hi = max(lo, 0), min(hi, W)
+            if hi - lo < 2 or not jacket[y, lo:hi].all() or float(np.mean(mag[y, lo:hi] > thr)) > 0.5:
+                break
+            seen[sd][y, lo:hi] = True
+    for sd in ("L", "R"):
+        if sd in edges:
+            if _LAPEL_RANGE[0] * fw <= widest[sd] <= _LAPEL_RANGE[1] * fw:
+                out |= seen[sd]
+            else:
+                # (an edge too near or too far for a lapel: not one -- as made)
+                for y in range(y_t, y_b + 1):
+                    xs = np.flatnonzero(op[y])
+                    w = wmax * (1.0 - (y - y_t) / max(y_b - y_t, 1))
+                    if not len(xs) or w < 1.0:
+                        continue
+                    if sd == "L":
+                        a, b = max(int(xs.min() - w), 0), int(xs.min())
+                    else:
+                        a, b = int(xs.max()) + 1, min(int(xs.max() + 1 + w), W)
+                    out[y, a:b] |= jacket[y, a:b]
     return out
 
 

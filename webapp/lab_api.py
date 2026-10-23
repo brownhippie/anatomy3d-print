@@ -131,7 +131,7 @@ def _active_run() -> Optional[str]:
     return best
 
 
-_INPUTS_READING = "r4"
+_INPUTS_READING = "r5"
 
 
 def _inputs(run_id: str, d: Path):

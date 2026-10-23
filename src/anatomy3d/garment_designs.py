@@ -31,9 +31,11 @@ Each garment:
 SHOW = 1.6  # sizes shown up this much on a figure (as body_first._FIT_SHOW)
 SEAM_DEPTH = 0.003  # a seam's groove on a figure, m (shown up)
 SEAM_WIDTH = 0.007  # ... and its width
-COLLAR_THICK = {"notched": 0.008, "shirt": 0.004, "rib": 0.004, "hood": 0.03}  # each collar's own thickness
+COLLAR_THICK = {"notched": 0.005, "shirt": 0.0025, "rib": 0.004, "hood": 0.03}  # each collar's own thickness, as it stands off the neck (a jacket's rolled collar ~5 mm, a shirt's band ~2.5; at real cloth, 3 and 1.5, it didn't show on a figure; 8 and 4 in a hump stacked to a 2 cm roll round the nape)
 SHIRT_ABOVE_JACKET = 0.012  # a shirt's collar shows this far above a jacket's at the back of the neck
 HEM_STEP = 0.003  # a hem's step
+COLLAR_EDGE = 0.004  # a collar's top edge: its full thickness this close under it (a folded edge, crisp)
+COLLAR_FOOT = 0.012  # ... and at its foot it goes into the garment's back over this (it is sewn on there)
 
 DESIGNS = {
     "suit": {
