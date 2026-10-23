@@ -857,6 +857,8 @@ _REF_EAR_MIN_MM = 1.2
 _REF_EAR_THICK = 0.004
 # The hair's pattern, read from the photo (hair_pattern.py) and pressed into
 # the hair's surfaces (_hair_pattern), all in metres on the person:
+PRINT_GROOVE_DEPTH_MM = 0.3  # a groove the figure is to show: at least this deep on the print (mm) ...
+PRINT_GROOVE_W_MM = 0.5  # ... and this wide (a printer's nozzle, a resin print's own blur)
 _HAIR_STRAND_W = 0.005  # a sculpted strand (a lock of strands) is this wide
 _HAIR_STRAND_LEN = 0.05  # ... and runs on this long before it fades into the next
 _HAIR_STRAND_DEPTH = 0.0012  # grooves between strands: this deep either way
@@ -1869,7 +1871,8 @@ def _wave_phase(c2: np.ndarray, s2: np.ndarray, region: np.ndarray, crown) -> np
     return out
 
 
-def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, face_mesh, y0, x0, scale, pad, px_per_m):
+def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, face_mesh, y0, x0, scale, pad, px_per_m,
+                  print_px_per_mm=None):
     """The hair's pattern as offsets (photo px, outward) for its front and
     back surfaces: strands along the photo's own strand directions, the
     waves it measured, curls or coils, the ropes of braids and locs along
@@ -1888,6 +1891,10 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
     if mix is None:
         return zero, zero
     per_cell = px_per_m * scale  # grid cells per metre
+    # (on the print at least PRINT_GROOVE_DEPTH_MM deep and the strands
+    # PRINT_GROOVE_W_MM wide: sized on the person they printed as nothing)
+    floor_m = (PRINT_GROOVE_DEPTH_MM * print_px_per_mm / px_per_m) if print_px_per_mm else 0.0
+    strand_w = max(_HAIR_STRAND_W, (2.0 * PRINT_GROOVE_W_MM * print_px_per_mm / px_per_m) if print_px_per_mm else 0.0)
     hair_f = (parts_g == HAIR) & cells
     if hair_f.sum() < 30:
         return zero, zero
@@ -1937,7 +1944,7 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
         rng = np.random.default_rng(seed)
         out = np.zeros(shape)
         if w_s:
-            noise = gaussian_filter(rng.standard_normal(shape), max(0.5 * _HAIR_STRAND_W * per_cell, 0.6))
+            noise = gaussian_filter(rng.standard_normal(shape), max(0.5 * strand_w * per_cell, 0.6))
             half = int(np.clip(0.5 * _HAIR_STRAND_LEN * per_cell, 2, 40))
             out += w_s * _HAIR_STRAND_DEPTH * unit(_lic(noise, fc2, fs2, half))
         if w_w:
@@ -1946,7 +1953,7 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
             out += w_w * _HAIR_WAVE_DEPTH * np.where(reg, np.sin(2 * np.pi * phase / wl_cells), 0.0)
         for w_, size_, depth_ in ((w_c, _HAIR_CURL, _HAIR_CURL_DEPTH), (w_k, _HAIR_COIL, _HAIR_COIL_DEPTH)):
             if w_:
-                d = max(size_ * per_cell, 1.5)
+                d = max(size_ * per_cell, (2.0 * PRINT_GROOVE_W_MM * print_px_per_mm * scale) if print_px_per_mm else 0.0, 1.5)
                 bp = gaussian_filter(rng.standard_normal(shape), d / 4) - gaussian_filter(rng.standard_normal(shape), d / 2)
                 out += w_ * depth_ * unit(gaussian_filter(np.abs(unit(bp)), d / 6))
         if w_r:
@@ -1955,6 +1962,9 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
             noise = gaussian_filter(rng.standard_normal(shape), rope_cells / 3)
             half = int(np.clip(6 * rope_cells, 4, 90))
             out += w_r * _HAIR_ROPE_DEPTH * np.tanh(1.5 * unit(_lic(noise, fc2, fs2, half)))
+        sd = float(out[reg].std()) if reg.any() else 0.0
+        if floor_m > 0 and 1e-12 < sd < floor_m:
+            out = out * (floor_m / sd)  # (the pattern as a whole at least the print's groove deep)
         return out * px_per_m  # metres -> photo px
 
     out_f = pattern(c2, s2, False, 0)
@@ -1998,7 +2008,7 @@ def _hair_pattern(front, back, front_pre, back_pre, cells, parts_g, reading, fac
 
 
 def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int,
-                       px_per_m: float) -> np.ndarray:
+                       px_per_m: float, print_px_per_mm: Optional[float] = None) -> np.ndarray:
     """Offsets (photo px, toward the camera) for the face's parts on top of
     the landmark relief: eyeballs behind their lids, irises, lid creases or
     a closed lid's line, eyebrow hair, nostrils, the lips' edge, a closed
@@ -2020,6 +2030,10 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
     sub = (slice(r0, r1 + 1), slice(c0, c1 + 1))
     PY, PX = py[sub], px[sub]
     m = lambda v: v * px_per_m  # noqa: E731 - metres -> photo px
+    # (a groove a figure is to show is at least so deep and so wide on the
+    # print itself: sized on the person, a brow's hairs, the lines between
+    # teeth came out a tenth of a millimetre on a 15 cm figure -- nothing)
+    pmm = lambda mm: mm * (print_px_per_mm or 0.0)  # noqa: E731 - print mm -> photo px
     cell = 1.0 / scale  # photo px per grid cell
 
     def sample(mask):
@@ -2068,6 +2082,11 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
     # with a hair grain along them, so they read as brows, not a band)
     for b_ in reading.get("brows", {}).values():
         bm = sample(b_["mask"])
+        # (its outline smooth: the mask's pixel staircase stood as a jagged
+        # edge along the brow's foot)
+        bm_s = gaussian_filter(bm, max(1.0, pmm(0.25) / max(cell, 1e-6)))
+        bm = np.clip((bm_s - 0.3) / 0.4, 0.0, 1.0)
+        bm = bm * bm * (3.0 - 2.0 * bm)
         ys_, xs_ = np.nonzero(np.asarray(b_["mask"]))
         grain = 1.0
         if len(xs_) > 10:
@@ -2077,8 +2096,10 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
             ang = np.deg2rad(_BROW_GRAIN_ANGLE)
             dirn = np.array([ax[0] * np.cos(ang) - ax[1] * np.sin(ang), ax[0] * np.sin(ang) + ax[1] * np.cos(ang)])
             across = PX * -dirn[1] + PY * dirn[0]  # distance across the hairs' run (reading px)
-            grain = 1.0 - _BROW_GRAIN * 0.5 * (1.0 + np.cos(2.0 * np.pi * across / max(m(_BROW_GRAIN_STEP), 1.5)))
-        rel += m(_BROW_HEIGHT) * gaussian_filter(bm, 0.7) * grain
+            step_ = max(m(_BROW_GRAIN_STEP), pmm(2.0 * PRINT_GROOVE_W_MM), 1.5)
+            g_ = min(max(_BROW_GRAIN, pmm(PRINT_GROOVE_DEPTH_MM) / max(m(_BROW_HEIGHT), 1e-6)), 0.8)
+            grain = 1.0 - g_ * 0.5 * (1.0 + np.cos(2.0 * np.pi * across / step_))
+        rel += max(m(_BROW_HEIGHT), pmm(PRINT_GROOVE_DEPTH_MM) / 0.8) * gaussian_filter(bm, 0.7) * grain
     # nostrils
     for n_ in reading.get("nostrils", []):
         nx_, ny_ = n_["c"][0] - bx0, n_["c"][1] - by0
@@ -2112,7 +2133,10 @@ def _face_parts_relief(reading: dict, face_mesh: np.ndarray, grid_shape, y0: int
             rel -= inside * gaussian_filter(depth, 0.8)
             if "teeth_lines" in mouth:
                 # the lines between the teeth: shallow, each tooth its own
-                rel -= inside * m(_TOOTH_LINE) * gaussian_filter(sample(mouth["teeth_lines"]), 0.6)
+                sig_ = max(0.6, pmm(PRINT_GROOVE_W_MM) / 2.355 / max(cell, 1e-6))
+                tl = gaussian_filter(sample(mouth["teeth_lines"]), sig_)
+                tl = np.clip(tl / max(float(tl.max()), 1e-6), 0.0, 1.0) if tl.max() > 0 else tl
+                rel -= inside * max(m(_TOOTH_LINE), pmm(PRINT_GROOVE_DEPTH_MM)) * tl
         else:
             rel -= m(_MOUTH_LINE) * line(f[INNER_LIPS[:11]], 0.006 * size)
     # scars

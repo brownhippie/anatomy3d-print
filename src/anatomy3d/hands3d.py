@@ -457,7 +457,7 @@ def hidden_shown(V, faces, skin, rest, ppm: float) -> float:
     from .body_first import _raster_front
 
     near, _ = _raster_front(V, faces, skin.shape)
-    front = np.isfinite(near) & (-near > rest + _HIDDEN_BEHIND * ppm)
+    front = np.isfinite(near) & (-near > rest - _HIDDEN_BEHIND * ppm)
     return float((front & ~skin).sum()) / max(float(skin.sum()), 1.0)
 
 
@@ -495,7 +495,10 @@ def _settle(X, faces, skin, rest, have, ppm: float, c: float, s_: float):
         near, far = _raster_front(np.column_stack([Y[:, 0], Y[:, 1], -Y[:, 2]]), faces, skin.shape)
         got = np.isfinite(near)
         front, under = -near, -far
-        shown = (got & ~skin & (front > rest + _HIDDEN_BEHIND * ppm)).sum()
+        # (out of sight means at least _HIDDEN_BEHIND behind the surface: the
+        # sign had it the other way, and the back of a hand the photo doesn't
+        # show lay up to 3 mm proud of the sleeve, a plate with a rim round it)
+        shown = (got & ~skin & (front > rest - _HIDDEN_BEHIND * ppm)).sum()
         sunk = (on_skin & ~(got & (front > rest))).sum()
         clear = (on_skin & got & (under - rest > gap)).sum()
         return (shown + _SUNK_COST * sunk + clear) / seen_px

@@ -48,6 +48,8 @@ _FIT_TIE = (4.0, 11.0)  # a tie's width, cm
 _FIT_FRONT = 0.35  # the front stands off the layer under it by this share of the room at the sides (cloth lies on the chest)
 _FIT_THICK = {"inner": 0.0015, "outer": 0.003, "tie": 0.004, "collar": 0.004, "lapel": 0.004}  # the cloth's own thickness, m (a tie's knot and lining more)
 _FIT_SHOW = 1.6  # ... shown up this much on a figure (on a person cloth keeps close; on a model the gap is what shows it)
+_HAIR_TEX_COIL = 0.006  # the hair's texture round the head: a coil this across (m) ...
+_HAIR_TEX_CURL = 0.012  # ... a curl this across
 _HAIR_EDGE_SHARE = 0.35  # short hair at its hairline: this share of its layer ...
 _HAIRLINE_TAPER = 0.01  # ... the full layer this far in (m)
 _SHELL_TOPS = ("suit", "jacket", "coat")  # the tops made as a layer of their own over the body
@@ -68,6 +70,7 @@ _HAIR_SEAM_SMOOTH = 4  # the layer eased across where the front view stops seein
 _HAIR_NORMAL_SMOOTH = 6  # ... and laid along the surface's direction smoothed this much (mesh steps)
 _PIECE_MIN_H = 0.0008  # a garment piece: where it stands at least this over what is under it (m)
 _PIECE_MIN_W = 0.006  # ... nothing of it narrower than this (m)
+_PIECE_TOUCH_PX = 3  # a piece must come within this many photo px of a layer it stands over
 _PIECE_MIN_AREA = 0.0002  # ... at least this big (m^2: 2 cm^2)
 _PIECE_DZ = 1.0  # a piece's depth layers (photo px; half a pixel doubled its memory and fixed nothing: the terraces were the body's)
 _PIECE_MIN_FACING = 0.3  # ... and none where the surface turns this far side-on (the front view can't place it there)
@@ -374,6 +377,11 @@ _PLAN_MAX_FIX = 0.25  # ... and moved at most this share toward it
 
 _EYE_RINGS = ([33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246],
               [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466])
+_FACE_FEATURES = ([168, 193, 245, 128, 114, 217, 198, 209, 49, 64, 98, 97, 2, 326, 327, 294, 279, 429, 420, 437, 343, 357, 465, 417],
+                  [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146],
+                  [70, 63, 105, 66, 107, 55, 65, 52, 53, 46], [300, 293, 334, 296, 336, 285, 295, 282, 283, 276])  # nose, lips, brows
+_FACE_SKIN_SMOOTH = 0.005  # the face points' relief on the skin: its lumps smoothed over this much (m) ...
+_FACE_SKIN_EASE = 0.006  # ... eased in over this much (m) from the features, which keep their own shape
 _FACE_PIT = 0.006  # the face points' relief: pits narrower than twice this (m) filled ...
 _FACE_PIT_EYE = 0.004  # ... away from the eyes by this much (m): their sockets and lids are their own
 
@@ -390,6 +398,7 @@ def _mend_face_relief(fr, fm, mouth_open: bool, ppm: float):
     from scipy.ndimage import binary_dilation, distance_transform_edt, grey_closing
     from skimage.draw import polygon as _polygon
 
+    from . import silhouette_relief as sr
     from .face_parts import FACE_OVAL, INNER_LIPS
 
     f = np.asarray(fm)[:, :2]
@@ -405,6 +414,23 @@ def _mend_face_relief(fr, fm, mouth_open: bool, ppm: float):
     x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, W)
     sub = fr[y0:y1, x0:x1].astype(np.float64)
     out = fr.copy()
+    # no rim at the face's edge: the relief is the photo's face less a
+    # smooth fit, and at the face's sides (where it turns away) that left
+    # some 2 cm standing; faded out toward the outline it still stood up as
+    # a ridge all round just inside it (4-6 mm, a bulge where the face met
+    # the head). Within the fade it rises no higher than the plain blend from
+    # where the fade begins down to nothing at the outline
+    inside_ = np.abs(sub) > 1e-9
+    fade_px = float(np.ptp(f[:468, 0])) * sr._FACE_RELIEF_FADE_FRAC
+    if inside_.any() and fade_px >= 2.0:
+        dist = distance_transform_edt(inside_)
+        ring = inside_ & (np.abs(dist - fade_px) <= 0.75)
+        if ring.sum() >= 8:
+            _, (iy, ix) = distance_transform_edt(~ring, return_indices=True)
+            t = np.clip(dist / fade_px, 0.0, 1.0)
+            cap = sub[iy, ix] * (t * t * (3.0 - 2.0 * t))
+            band = inside_ & (dist < fade_px)
+            sub = np.where(band, np.minimum(sub, cap), sub)
     keep = np.zeros(sub.shape, dtype=bool)  # (left as they are: the eyes, and an open mouth)
     for ring in _EYE_RINGS:
         rr, cc = _polygon(f[ring, 1] - y0, f[ring, 0] - x0, sub.shape)
@@ -428,6 +454,22 @@ def _mend_face_relief(fr, fm, mouth_open: bool, ppm: float):
     closed = grey_closing(sub, footprint=disk)
     fsub = face[y0:y1, x0:x1] & ~keep & ~mouth
     sub = np.where(fsub, closed, sub)
+    # the skin smooth, as skin is: the face points' depths are noisy, and
+    # drawn as one surface through them the cheeks, the forehead and round
+    # the mouth came out in lumps (worst at full face shaping, with nothing
+    # else on the face). The features keep their own shape: the nose, the
+    # lips, the eyes and the brows
+    from scipy.ndimage import gaussian_filter as _gf
+
+    feat = np.zeros(sub.shape, dtype=bool)
+    for ring in _FACE_FEATURES:
+        rr, cc = _polygon(f[ring, 1] - y0, f[ring, 0] - x0, sub.shape)
+        feat[rr, cc] = True
+    feat |= keep | mouth
+    ease = np.clip(1.0 - distance_transform_edt(~feat) / max(_FACE_SKIN_EASE * ppm, 1.0), 0.0, 1.0)
+    skin = face[y0:y1, x0:x1].astype(np.float64) * (1.0 - ease)
+    smooth = _gf(sub, max(_FACE_SKIN_SMOOTH * ppm, 1.0))
+    sub = skin * smooth + (1.0 - skin) * sub
     out[y0:y1, x0:x1] = sub
     return out
 
@@ -789,7 +831,8 @@ _BODY_EYE_KEEP = 0.02  # what's left of the socket's depth, pressed flat (its or
 _EYE_PRESS = 0.012  # inside an open eye, everything this far behind the skin goes onto the eyeball, in order (m)
 _IRIS_OF_EYE = (0.17, 0.23)  # an iris's radius over its eye's width, corner to corner (11.7 mm in about 30, as eyes are)
 _IRIS_EDGE = 0.2  # the iris's rim, steep over this share of its radius (a soft funnel read as a blank eye; sharper, a staircase)
-_EYE_OPEN_SHOW = 1.5  # an open eye's opening, this much taller on the figure than in the photo
+_EYE_OPEN_SHOW = 1.0  # an open eye's opening, this much taller on the figure than in the photo (1.5 stared: the photo's smiling eyes are narrow)
+_EYE_EDGE_SMOOTH = 1.2  # ... its outline eased over this many photo px (its mask's pixel staircase showed along the lids)
 _EYE_DOME = 0.5  # an open eye's ball domes up to this share of its set-back in the middle
 _CHK_EYE_MM = 1.0  # an open eye sits at least this far behind the lids round it (mm, on the person)
 _CHK_BROW_MM = 1.0  # the eyebrows stand at least this far off the skin round them (mm, on the person)
@@ -1315,6 +1358,11 @@ def _measure_fit(V_bare, V_dressed, F, pw, names, clothes, J: dict, ppm: float, 
     return m
 
 
+_FACE_LINE_SIGMAS = (0.0012, 0.002)  # the face's lines: read at these widths on the person (m) ...
+_FACE_LINE_PCT = 94.0  # ... the darkest-lined share of the face's skin above this percentile ...
+_FACE_LINE_MIN_LEN = 0.012  # ... in lines at least this long (m): not pores, not the skin's grain ...
+_FACE_LINE_CLEAR = 0.002  # ... clear of the eyes, brows and lips by this much (m) ...
+_FACE_LINE_DEPTH = 0.0008  # ... carved at least this deep on the person (m)
 _ON_GARMENT = ("tie", "scarf", "belt", "necklace", "collar", "lapel")  # pieces lying on a garment, never what one is worn on
 
 
@@ -1407,7 +1455,7 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
     and V, a cuff -- becomes a closed solid on the finished surface, its face
     that surface (the folds on it) raised by the piece's height, its edges
     walls. [(vertices, faces)] in photo px, and what was made of each."""
-    from scipy.ndimage import binary_fill_holes, binary_opening, label as cc_label
+    from scipy.ndimage import binary_dilation, binary_fill_holes, binary_opening, label as cc_label
 
     from . import silhouette_relief as sr
     from .clothes import GARMENTS, NAMES, WORN
@@ -1435,6 +1483,7 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
         inner_names = [i for i in _OUTER.get(g, ()) + (("neck",) if g in ("shirt", "tshirt", "dress") else ()) if i in NAMES or i == "neck"]
         inner = np.isin(lab, [NAMES.index(i) + 1 for i in inner_names if i in NAMES]) | (neck_skin if "neck" in inner_names else False)
         own = lab == NAMES.index(g) + 1
+        inner_have = bool((inner & have).any())
         # (over what lies beside it as built so far -- the pieces under it
         # too, not only the body: measured off the body, a tie sat below the
         # shirt's raised collar beside it)
@@ -1457,7 +1506,16 @@ def _garment_pieces(V, F, clothes: dict, lift, lab, ppm: float, neck_rows=None):
             P = comps == k
             if P.sum() < _PIECE_MIN_AREA * ppm * ppm:
                 continue
+            # (a piece stands over a layer it meets: one touching none --
+            # raised only by a layer it doesn't meet, a tie across the arms --
+            # was a pad on the sleeve by the hand)
+            if inner_have and not (binary_dilation(P, iterations=_PIECE_TOUCH_PX) & inner).any():
+                continue
             h = gaussian_filter(np.where(P, lift_g * facing, 0.0), 0.7)
+            # (down to nothing where it is cut: kept where it stood at least
+            # _PIECE_MIN_H, it stood that much at its cut outline, a rim
+            # round a blob -- an oval on the sleeve by the hand)
+            h = np.maximum(h - _PIECE_MIN_H * ppm, 0.0)
             front = rest + h
             back = rest - _PIECE_SINK * ppm
             h0 = float(back[P].min()) - 3.0
@@ -2030,6 +2088,7 @@ def _set_eyes_back(V, F, face_read: dict, shape, ppm: float, pocket=None):
         # figure's size, left no room for its iris to show -- its height
         # taken _EYE_OPEN_SHOW times, over its own width only
         op = _eye_opened(op) & have
+        op = (gaussian_filter(op.astype(np.float64), _EYE_EDGE_SMOOTH) > 0.5) & have
         lids = binary_dilation(op, iterations=max(int(0.003 * ppm), 2)) & ~op & have
         if op.sum() < 6 or lids.sum() < 6:
             continue
@@ -2187,22 +2246,205 @@ def _sample_eased(img, V, F, px, py, cov):
     return samples[rows, i0] * (1.0 - w) + samples[rows, i0 + 1] * w
 
 
-def _refine_front(V, F, part_w, ear_w, shape):
+def _hair_texture_3d(V, kind, ppm: float, print_px_per_mm: float):
+    """Offsets (photo px, out along the surface) for the hair's texture at
+    each vertex, made in the solid round the head so it wraps it without a
+    seam: coils or curls as round knots, strands drawn out downward -- as
+    much of each as the reading's kind of hair takes (_HAIR_KIND_MIX), at
+    least PRINT_GROOVE_W_MM across and PRINT_GROOVE_DEPTH_MM deep on the
+    print."""
+    from . import silhouette_relief as sr
+
+    mix = sr._HAIR_KIND_MIX.get(kind)
+    if mix is None or not len(V):
+        return None
+    w_s, w_w, w_c, w_k, w_r = mix
+    min_w = 2.0 * sr.PRINT_GROOVE_W_MM * print_px_per_mm
+    min_d = sr.PRINT_GROOVE_DEPTH_MM * print_px_per_mm
+    out = np.zeros(len(V))
+    lo, hi = V.min(axis=0), V.max(axis=0)
+    parts_ = []
+    if w_k or w_c:
+        size = max((_HAIR_TEX_COIL if w_k >= w_c else _HAIR_TEX_CURL) * ppm, min_w)
+        depth = max((sr._HAIR_COIL_DEPTH if w_k >= w_c else sr._HAIR_CURL_DEPTH) * ppm, min_d)
+        parts_.append((w_k + w_c, size, (size / 4.0, size / 4.0, size / 4.0), depth, True))
+    if w_s or w_w or w_r:
+        wid = max(sr._HAIR_STRAND_W * ppm, min_w)
+        depth = max(sr._HAIR_STRAND_DEPTH * ppm, min_d)
+        parts_.append((w_s + w_w + w_r, wid, (wid / 2.0, sr._HAIR_STRAND_LEN * ppm / 4.0, wid / 2.0), depth, False))
+    rng = np.random.default_rng(7)
+    for w_, size, sig, depth, knots in parts_:
+        cell = max(size / 4.0, 0.75)
+        dims = np.ceil((hi - lo) / cell).astype(int) + 4
+        if np.prod(dims) > 30_000_000:
+            cell *= (np.prod(dims) / 30_000_000.0) ** (1.0 / 3.0)
+            dims = np.ceil((hi - lo) / cell).astype(int) + 4
+        noise = rng.standard_normal(tuple(dims)).astype(np.float32)
+        s_ = [max(v / cell, 0.5) for v in sig]
+        if knots:
+            band = gaussian_filter(noise, [v for v in s_]) - gaussian_filter(noise, [2.0 * v for v in s_])
+            band = gaussian_filter(np.abs(band / (band.std() + 1e-9)), [v / 1.5 for v in s_])
+        else:
+            band = gaussian_filter(noise, s_)
+        band = (band - band.mean()) / (band.std() + 1e-9)
+        g = (V - lo) / cell + 1.0
+        val = map_coordinates(band, [g[:, 0], g[:, 1], g[:, 2]], order=1, mode="nearest")
+        out += w_ * depth * np.tanh(val)  # (rounded over: its peaks at three times its spread stood up as spikes)
+    return out
+
+
+def _refine_front(V, F, part_w, ear_w, shape, fine=None, fine_px: float = 0.0, fine_v=None, fine_v_px: float = 0.0):
     """The faces the camera sees, split until no edge is longer than
     _DETAIL_EDGE_PX (refine.refine: no cracks), the per-vertex parts
-    carried along."""
+    carried along; and where `fine` (photo px mask) is, down to `fine_px`:
+    the grooves a figure shows there (a brow's hairs, the hair's strands,
+    the lines between teeth) are finer than the rest's triangles."""
     from .refine import refine
 
-    near, _ = _raster_front(V, F, shape)
-    c = V[F].mean(1)
-    nz = map_coordinates(np.where(np.isfinite(near), near, 1e9), [c[:, 1], c[:, 0]], order=0, mode="nearest")
-    nrm = trimesh.Trimesh(V, F, process=False).face_normals
-    mark = (c[:, 2] <= nz + _DETAIL_SEEN_PX) & (-nrm[:, 2] > _DETAIL_FACING[0])
+    def seen_faces(V, F):
+        near, _ = _raster_front(V, F, shape)
+        c = V[F].mean(1)
+        nz = map_coordinates(np.where(np.isfinite(near), near, 1e9), [c[:, 1], c[:, 0]], order=0, mode="nearest")
+        nrm = trimesh.Trimesh(V, F, process=False).face_normals
+        return c, (c[:, 2] <= nz + _DETAIL_SEEN_PX) & (-nrm[:, 2] > _DETAIL_FACING[0])
+
+    c, mark = seen_faces(V, F)
     vals = [part_w] + ([ear_w] if ear_w is not None else [])
-    V, F, out = refine(V, F, mark, _DETAIL_EDGE_PX, vals)
-    part_w = out.pop(0)
-    ear_w = out.pop(0) if ear_w is not None else None
+    if fine_v is not None:
+        vals = vals + [np.asarray(fine_v, dtype=np.float64)]  # (carried through every split, used last)
+    V, F, vals = refine(V, F, mark, _DETAIL_EDGE_PX, vals)
+    if fine is not None and fine.any() and 0.5 <= fine_px < _DETAIL_EDGE_PX:
+        c, mark = seen_faces(V, F)
+        iy = np.clip(np.round(c[:, 1]).astype(int), 0, shape[0] - 1)
+        ix = np.clip(np.round(c[:, 0]).astype(int), 0, shape[1] - 1)
+        V, F, vals = refine(V, F, mark & fine[iy, ix], fine_px, vals, rounds=3)
+    if fine_v is not None:
+        if fine_v_px >= 0.5:
+            # (and all round where `fine_v` says, seen or not: the hair's
+            # texture round the head on triangles the size of its coils came
+            # out shards)
+            V, F, vals = refine(V, F, (vals[-1][F] > 0.5).all(axis=1), fine_v_px, vals, rounds=3)
+        vals.pop()
+    part_w = vals.pop(0)
+    ear_w = vals.pop(0) if ear_w is not None else None
     return V, F, part_w, ear_w
+
+
+def _face_lines(rgb, fm, parts: dict, shape, ppm: float, print_px_per_mm: float):
+    """The face's own lines (photo px, depth into the skin): crow's feet,
+    the smile lines, the crease under the lower lip, the brow's furrows --
+    read from the photo as thin dark lines on the face's skin, only the long
+    ones kept (not pores, not the skin's grain), each a clean groove along
+    its middle, at least PRINT_GROOVE_DEPTH_MM deep and PRINT_GROOVE_W_MM
+    wide on the print. Not on the eyes, the brows or the lips: those are
+    their own."""
+    from scipy.ndimage import binary_dilation, label as cc_label
+    from skimage.draw import polygon as _polygon
+    from skimage.filters import sato
+    from skimage.morphology import skeletonize
+
+    from . import silhouette_relief as sr
+    from .face_parts import FACE_OVAL, OUTER_LIPS
+
+    H, W = shape
+    f = np.asarray(fm)[:, :2]
+    face = np.zeros(shape, dtype=bool)
+    rr, cc = _polygon(f[FACE_OVAL, 1], f[FACE_OVAL, 0], shape)
+    face[rr, cc] = True
+    labels = parts.get("labels")
+    if labels is not None:
+        from .head_parts import BODY_SKIN, FACE_SKIN
+
+        face &= np.isin(np.asarray(labels), (FACE_SKIN, BODY_SKIN))
+    if face.sum() < 200:
+        return None
+    keep_out = np.zeros(shape, dtype=bool)
+    for ring in tuple(_EYE_RINGS) + (OUTER_LIPS,):
+        rr, cc = _polygon(f[ring, 1], f[ring, 0], shape)
+        keep_out[rr, cc] = True
+    keep_out = binary_dilation(keep_out, iterations=max(int(round(_FACE_LINE_CLEAR * ppm)), 1))
+    fr_ = parts.get("face") or {}
+    box = fr_.get("box")
+    if box is not None:
+        for b_ in (fr_.get("brows") or {}).values():
+            mk = np.asarray(b_.get("mask"), dtype=bool)
+            if mk.ndim == 2:
+                ys, xs = np.nonzero(mk)
+                ys, xs = ys + int(box[1]), xs + int(box[0])
+                ok = (ys >= 0) & (ys < H) & (xs >= 0) & (xs < W)
+                bm = np.zeros(shape, dtype=bool)
+                bm[ys[ok], xs[ok]] = True
+                keep_out |= binary_dilation(bm, iterations=max(int(round(_FACE_LINE_CLEAR * ppm)), 1))
+    for n_ in fr_.get("nostrils") or []:
+        cy_, cx_ = float(n_["c"][1]), float(n_["c"][0])
+        r_ = max(float(n_.get("r", 3.0)) * 2.5, _FACE_LINE_CLEAR * ppm * 2)
+        yy, xx = np.ogrid[:H, :W]
+        keep_out |= (yy - cy_) ** 2 + (xx - cx_) ** 2 <= r_ ** 2  # (the nostrils are their own: their shadow is no line)
+    region = face & ~keep_out
+    ys, xs = np.nonzero(region)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    img = np.asarray(rgb)[y0:y1, x0:x1, :3].astype(np.float64)
+    gray = img @ np.array([0.299, 0.587, 0.114]) / 255.0
+    sig = [max(s_ * ppm, 0.8) for s_ in _FACE_LINE_SIGMAS]
+    ridge = sato(gray, sigmas=sig, black_ridges=True)
+    reg = region[y0:y1, x0:x1]
+    if not reg.any():
+        return None
+    thr = np.percentile(ridge[reg], _FACE_LINE_PCT)
+    lines = (ridge > thr) & reg
+    lines = gaussian_filter(lines.astype(np.float64), 1.0) > 0.5  # (its ragged edge eased: a clean middle)
+    skel = skeletonize(lines)
+    lab_, n = cc_label(skel, structure=np.ones((3, 3)))
+    if n == 0:
+        return None
+    sizes = np.bincount(lab_.ravel())
+    long_ = np.flatnonzero(sizes >= _FACE_LINE_MIN_LEN * ppm)
+    long_ = long_[long_ > 0]
+    if not len(long_):
+        return None
+    skel = np.isin(lab_, long_)
+    half = max(0.5 * sr.PRINT_GROOVE_W_MM * print_px_per_mm, 1.0)
+    d = distance_transform_edt(~skel)
+    groove = np.clip(1.0 - (d / half) ** 2, 0.0, 1.0)
+    groove = gaussian_filter(groove, 0.6)
+    depth = max(sr.PRINT_GROOVE_DEPTH_MM * print_px_per_mm, _FACE_LINE_DEPTH * ppm)
+    out = np.zeros(shape)
+    out[y0:y1, x0:x1] = depth * groove * reg
+    return out
+
+
+def _fine_regions(parts: dict, fm, shape, ppm: float):
+    """Where the figure's finest grooves are (photo px mask): the hair, the
+    brows, the mouth."""
+    from scipy.ndimage import binary_dilation
+    from skimage.draw import polygon as _polygon
+
+    fine = np.zeros(shape, dtype=bool)
+    labels = parts.get("labels")
+    if labels is not None:
+        from .head_parts import HAIR
+
+        fine |= np.asarray(labels) == HAIR
+    fr_ = parts.get("face") or {}
+    box = fr_.get("box")
+    if box is not None:
+        bx0, by0 = int(box[0]), int(box[1])
+        for b_ in (fr_.get("brows") or {}).values():
+            mk = np.asarray(b_.get("mask"), dtype=bool)
+            if mk.ndim != 2:
+                continue
+            ys, xs = np.nonzero(mk)
+            ys, xs = ys + by0, xs + bx0
+            ok = (ys >= 0) & (ys < shape[0]) & (xs >= 0) & (xs < shape[1])
+            fine[ys[ok], xs[ok]] = True
+    if fm is not None:
+        from .face_parts import OUTER_LIPS
+
+        f = np.asarray(fm)[:, :2]
+        for ring in (OUTER_LIPS,) + tuple(_EYE_RINGS):
+            rr, cc = _polygon(f[ring, 1], f[ring, 0], shape)
+            fine[rr, cc] = True
+    return binary_dilation(fine, iterations=max(int(round(0.003 * ppm)), 1))
 
 
 def _subdivide(V, F, pw):
@@ -2436,7 +2678,24 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     # detail: the body's torso and arm triangles are up to a centimetre
     # across, each a flat facet -- the jacket and the arms came out crooked,
     # its folds and edges a staircase of them)
-    V, F, part_w, ear_w9 = _refine_front(V, F, part_w, ear_w9, shape)
+    print_px_per_mm = float(np.ptp(V[:, 1])) / max(target_height_mm, 1e-6)  # (photo px per mm on the print)
+    lines_px = None
+    if inputs.face_mesh is not None and getattr(inputs, "rgb", None) is not None and not ((inputs.parts or {}).get("face") or {}).get("masked"):
+        try:
+            lines_px = _face_lines(np.asarray(inputs.rgb), inputs.face_mesh, inputs.parts or {}, shape, ppm, print_px_per_mm)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Note: face lines skipped ({exc}).")
+    fine_m = _fine_regions(inputs.parts or {}, inputs.face_mesh, shape, ppm)
+    if lines_px is not None:
+        from scipy.ndimage import binary_dilation as _bd
+
+        fine_m = fine_m | _bd(lines_px > 0, iterations=3)
+    scalp_v = None
+    if "head" in names and inputs.face_mesh is not None and ((inputs.parts or {}).get("hair") or {}).get("kind") in sr._HAIR_KIND_MIX:
+        scalp_v = (part_w[:, names.index("head")] > 0.5) & (V[:, 1] < float(np.asarray(inputs.face_mesh)[2, 1]))
+    V, F, part_w, ear_w9 = _refine_front(V, F, part_w, ear_w9, shape, fine_m,
+                                         0.5 * sr.PRINT_GROOVE_W_MM * print_px_per_mm, scalp_v,
+                                         0.5 * sr.PRINT_GROOVE_W_MM * print_px_per_mm)
     st = {"V": V, "F": F, "pw": part_w}
     before = st
     locks.lock("9 detail", "no new spikes", _spike_pct, lambda m, m0: m <= m0 + _LOCK_SPIKES, st)
@@ -2474,7 +2733,9 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             face_read = parts.get("face")
             if face_read:
                 try:
-                    fp = sr._face_parts_relief(face_read, fm, shape, 0, 0, 1.0, 0, ppm)
+                    fp = sr._face_parts_relief(face_read, fm, shape, 0, 0, 1.0, 0, ppm, print_px_per_mm=print_px_per_mm)
+                    if lines_px is not None:
+                        fp = fp - lines_px  # (the face's own lines, as grooves)
                     if labels is not None:
                         from .head_parts import BODY_SKIN, FACE_SKIN, HAIR
 
@@ -2488,7 +2749,8 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         # ropes, ending at the hairline (as the outline builder has it)
         try:
             back_h = np.where(cov, -far, 0.0)
-            hp, _ = sr._hair_pattern(front, back_h, front, back_h, cov, labels, hair_read, fm, 0, 0, 1.0, 0, ppm)
+            hp, _ = sr._hair_pattern(front, back_h, front, back_h, cov, labels, hair_read, fm, 0, 0, 1.0, 0, ppm,
+                                     print_px_per_mm=print_px_per_mm)
             offset += np.where(cov, hp, 0.0)
         except Exception as exc:  # noqa: BLE001 - the hair keeps its layer without the pattern
             print(f"Note: hair pattern skipped ({exc}).")
@@ -2700,6 +2962,21 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             nrm_h = np.column_stack([sr._mesh_smooth(lap_f, nrm_h[:, j], _HAIR_NORMAL_SMOOTH) for j in range(3)])
             nrm_h /= np.linalg.norm(nrm_h, axis=1, keepdims=True) + 1e-12
             V = V + (hv * sr._HAIR_SHORT * ppm)[:, None] * nrm_h
+            # the hair's own texture all round (coils, curls, strands, as
+            # read), where the photo's pattern doesn't reach: it only covers
+            # the hair the camera sees face on, and the crown and the back
+            # came out a smooth dome
+            try:
+                sel_h = hv > 0.01
+                tex = np.zeros(len(V))
+                t_ = _hair_texture_3d(V[sel_h], (hair_read or {}).get("kind"), ppm, print_px_per_mm) if sel_h.any() else None
+                if t_ is not None:
+                    tex[sel_h] = t_
+                    fa = np.clip((-nrm_h[:, 2] - 0.5) / 0.3, 0.0, 1.0)  # (face on: the photo's pattern is there)
+                    seen_pat = np.where(visible, fa, 0.0)
+                    V = V + (tex * hv * (1.0 - seen_pat))[:, None] * nrm_h
+            except Exception as exc:  # noqa: BLE001
+                print(f"Note: hair texture skipped ({exc}).")
     moved = np.linalg.norm(V - before["V"], axis=1)
     if labels is not None:
         lr = np.clip(np.rint(py).astype(int), 0, shape[0] - 1)
