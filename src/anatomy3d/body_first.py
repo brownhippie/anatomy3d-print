@@ -55,6 +55,9 @@ _HAIRLINE_TAPER = 0.01  # ... the full layer this far in (m)
 _SHELL_TOPS = ("suit", "jacket", "coat")  # the tops made as a layer of their own over the body
 _SHELL_SLEEVES = {"suit": "long", "jacket": "long", "coat": "long"}  # ... down their sleeves this far
 _SHELL_FORM = 0.02  # ... laid along the body's form averaged over this much (m), not its creases
+_SHELL_SPAN = 0.06  # ... and smoothing the body's form under it over about this (m): stiff cloth doesn't follow the muscles
+_SHELL_TAKE = 0.008  # ... taking its bumps down at most this (m: the chest muscles stand ~1 cm) ...
+_SHELL_FILL = 0.012  # ... and filling its dips at most this (m)
 _SHELL_EDGE = 3  # ... its edges a step eased over this many mesh steps
 _SHELL_LABEL_EASE = 0.003  # ... and the photo's names for it eased over this much (m): their pixel edges are ragged
 _GV_SMOOTH = 4  # the collars', seams' and hems' edges eased over this many mesh steps
@@ -78,6 +81,8 @@ _PIECE_MIN_FACING = 0.3  # ... and none where the surface turns this far side-on
 _PIECE_EDGE_SMOOTH = 0.002  # a piece's outline smoothed over this much (m)
 _PIECE_SINK = 0.002  # ... its back this far into the surface under it, so they join (m)
 _POP_MAX = 0.014  # no piece stands more than this over what is beside it (m)
+_TIE_KNOT = 0.013  # a tie's knot stands this far off the shirt at its fullest (m: a four-in-hand ~1-2 cm)
+_TIE_BLADE = 0.007  # ... its blade, down its middle (m: two layers, a lining, and how it stands off the shirt)
 _POP_SPAN = 0.05  # a piece stands over the lowest layer within this far (a tie, collar or lapel as a whole)
 _POP_BEVEL = 0.0015  # its edge softened over this
 _POP_FINE = 1.6  # the clothes' folds, seams and creases deepened this much
@@ -1424,6 +1429,46 @@ _LIES_ON = {"collar": ("shirt", "tshirt", "sweater", "dress")}  # what a piece i
 _ON_GARMENT = ("tie", "scarf", "belt", "necklace", "collar", "lapel")  # pieces lying on a garment, never what one is worn on
 
 
+def _tie_knot(lift, lab, fm, ppm: float):
+    """A tie's knot standing out as a knot: the tie the photo shows above
+    the knot's foot (read off the tie's width, clothes.knot_foot) domed up
+    to _TIE_KNOT off the shirt, rounded to its edges -- the blade below
+    stays a band of cloth. As the tie's own layer it was a 5 mm plate, an
+    outline on the shirt."""
+    from scipy.ndimage import distance_transform_edt
+
+    from .clothes import NAMES, knot_foot
+
+    if fm is None or "tie" not in NAMES:
+        return lift
+    try:
+        foot = knot_foot(lab, fm)
+    except Exception:  # noqa: BLE001
+        foot = None
+    if foot is None:
+        return lift
+    tie = lab == NAMES.index("tie") + 1
+    rows = np.arange(lab.shape[0])[:, None]
+    knot = tie & (rows <= foot)
+    if knot.sum() < 20:
+        return lift
+    d = distance_transform_edt(knot)
+    dome = np.sqrt(np.clip(d / max(float(d.max()), 1.0), 0.0, 1.0))
+    # the blade a band of cloth, rounded across: full down its middle, less
+    # at its edges (flat, it shaded as the shirt did and only its edge
+    # showed: an outline)
+    from scipy.ndimage import maximum_filter
+
+    dt = distance_transform_edt(tie)
+    ridge = maximum_filter(dt, size=max(int(round(0.02 * ppm)), 3))
+    crown = np.sqrt(np.clip(dt / np.maximum(ridge, 1.0), 0.0, 1.0))
+    lift = np.where(tie, np.maximum(lift * (0.5 + 0.5 * crown), _TIE_BLADE * ppm * crown), lift)
+    # (into the blade under it over a little, not a step at the foot)
+    ease = np.clip(1.0 - (rows - foot) / max(0.01 * ppm, 1.0), 0.0, 1.0) * tie
+    want = _TIE_KNOT * ppm * np.maximum(dome, 0.35 * ease * (rows > foot))
+    return np.where(tie, np.maximum(lift, want), lift)
+
+
 def _clothes_pop(clothes: dict, front, cov, ppm: float, H: dict, neck_rows=None, sharp: bool = False):
     """Offsets (photo px, toward the camera) for the clothes as tailored
     (_measure_fit): each piece -- a tie, a collar, a lapel, a jacket's front
@@ -1845,6 +1890,47 @@ def _garment_views(V, F, part_w, names, found, J: dict, ppm: float, labels=None,
         # on the chest: grown into each other, the two made one solid with
         # walls inside it 0.2 mm thick)
         shell_v = np.minimum(shell_v, sr._mesh_smooth(lap, 0.5 * _facing_gap(V, n_s, 2.0 * shell, shell_v > 0.0), _SHELL_EDGE))
+        # the cloth bridges the body's hollows -- between and under the
+        # chest's muscles, the belly's, down the spine, the shoulder blades
+        # (laid along each, the jacket read as a bare torso): what a smoothed
+        # surface stands out of the body by, where the top covers it; each of
+        # the torso and the arms smoothed on its own (across them, the cloth
+        # webbed the arms to the chest)
+        try:
+            grp = np.full(len(V), -1)
+            for gi, pre in enumerate(("torso", "L", "R")):
+                for nm_ in names:
+                    if (pre == "torso" and nm_ == "torso") or (pre != "torso" and nm_.endswith("." + pre) and nm_.startswith(("upperarm", "forearm"))):
+                        grp[part_w[:, names.index(nm_)] > 0.5] = gi
+            same = (grp[F] >= 0).all(1) & (grp[F[:, 0]] == grp[F[:, 1]]) & (grp[F[:, 1]] == grp[F[:, 2]])
+            if same.any():
+                lap_g = sr._mesh_laplacian(F[same], len(V))
+                e_len = float(np.median(np.linalg.norm(V[F[same, 0]] - V[F[same, 1]], axis=1)))
+                passes = int(np.clip((_SHELL_SPAN * m / max(e_len, 0.5)) ** 2 / 4.0, 20, 600))
+                Vsm = np.column_stack([sr._mesh_smooth(lap_g, V[:, k_], passes) for k_ in range(3)])
+                # (both ways: its dips filled and its bumps taken down -- the
+                # muscles are 1-3 mm either side, and filled alone the bumps
+                # beside them still showed)
+                fill = np.einsum("ij,ij->i", Vsm - V, n_s) * (grp >= 0)
+                cover = np.clip(sr._mesh_smooth(lap, c, _SHELL_EDGE), 0.0, 1.0)
+                # (eased across where the torso meets the arms: smoothed each
+                # on its own, their edges didn't meet -- a seam down the back)
+                ease_n = int(np.clip((0.012 * m / max(e_len, 0.5)) ** 2 / 4.0, _SHELL_EDGE, 120))
+                # (not into the folds where the torso meets the arms -- filled
+                # out there, the armpit stood as a lump behind the arm -- and
+                # no more than the muscles' own depth taken down, a cloth's
+                # span filled)
+                inner_v = np.zeros(len(V))
+                inner_v[np.unique(F[same])] = 1.0
+                inner_v[np.unique(F[~same])] = 0.0
+                away = np.clip(2.0 * sr._mesh_smooth(lap, inner_v, ease_n) - 1.0, 0.0, 1.0)
+                fill = np.clip(fill, -_SHELL_TAKE * m, _SHELL_FILL * m) * away
+                shell_v = shell_v + sr._mesh_smooth(lap, fill * cover, ease_n)
+                # (still no thicker than half the gap to a surface facing it)
+                shell_v = np.minimum(shell_v, sr._mesh_smooth(lap, 0.5 * _facing_gap(V, n_s, 2.0 * max(float(shell_v.max()), 1.0), shell_v > 0.0), _SHELL_EDGE))
+                made["bridged_mm"] = round(float(np.percentile(np.abs(fill[cover > 0.5]), 99)) / m * 1000.0, 1) if (cover > 0.5).any() else 0.0
+        except Exception as exc:  # noqa: BLE001 - the layer as it is then
+            print(f"Note: jacket not bridged ({exc}).")
         made["shell_mm"] = round(float(shell) / m * 1000.0, 1)
 
     # the collars: from the neck's base (the neck's lowest at each angle) up
@@ -2859,6 +2945,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
                 # steps kept here only in case the pieces can't be joined)
                 pop_off = _clothes_pop(clothes, front, cov, ppm, fit["_H"], nr)
                 pop_lift = _clothes_pop(clothes, front, cov, ppm, fit["_H"], nr, sharp=True)
+                pop_lift = (_tie_knot(pop_lift[0], pop_lift[1], fm, ppm), pop_lift[1])
         except Exception as exc:  # noqa: BLE001
             print(f"Note: clothes steps skipped ({exc}).")
     if depth_strength and inputs.depth is not None:
