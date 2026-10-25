@@ -2406,7 +2406,8 @@ def _parts_on_grid(labels: np.ndarray, grid_shape, y0: int, x0: int, scale: floa
     return labels[r[:, None], c[None, :]]
 
 
-def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int) -> np.ndarray:
+def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: float, pad: int,
+                 spread: float = 0.0) -> np.ndarray:
     """Front-surface offset (photo pixels) carrying the face's own shape --
     brow, eye sockets, nose, lips, cheekbones, jaw -- from the 478 face
     landmarks (face_features.detect_face_mesh). The face's overall
@@ -2439,8 +2440,27 @@ def _face_relief(face_mesh: np.ndarray, grid_shape, y0: int, x0: int, scale: flo
     filled = np.where(inside, relief, 0.0)
     weight = gaussian_filter(inside.astype(np.float64), sigma)
     relief = np.divide(gaussian_filter(filled, sigma), weight, out=np.zeros_like(filled), where=weight > 1e-6)
-    fade = np.clip(distance_transform_edt(inside) / max(face_width * _FACE_RELIEF_FADE_FRAC, 1.0), 0.0, 1.0)
+    d_in, (oy, ox) = distance_transform_edt(inside, return_indices=True)
+    fade = np.clip(d_in / max(face_width * _FACE_RELIEF_FADE_FRAC, 1.0), 0.0, 1.0)
     fade = fade * fade * (3.0 - 2.0 * fade)
+    if spread > 0:
+        # at the face's sides kept in full to its outline and faded out
+        # beyond it, over `spread` face widths of the head's side: faded
+        # inside instead, the face's own form (its cheeks set back of the
+        # head's) went back to the head's over the cheeks the camera sees
+        # face on, and the face stood on the head as a mask with a rim. At
+        # its top and foot (the hairline, the jaw) faded inside as before:
+        # carried out there, the chin's stood on the throat
+        def sideways(dy, dx):
+            d = np.hypot(dy, dx)
+            return np.clip((np.abs(dx) / np.maximum(d, 1e-6) - 0.55) / 0.3, 0.0, 1.0)
+        side_in = sideways(oy - grid_rows, ox - grid_cols)  # (toward its nearest outline)
+        side_in = gaussian_filter(side_in, max(face_width * 0.05, 1.0))
+        inner = relief * (side_in + (1.0 - side_in) * fade)
+        d_out, (iy, ix) = distance_transform_edt(~inside, return_indices=True)
+        t = np.clip(1.0 - d_out / max(face_width * spread, 1.0), 0.0, 1.0)
+        t = t * t * (3.0 - 2.0 * t) * side_in[iy, ix] * sideways(grid_rows - iy, grid_cols - ix)
+        return np.where(inside, inner, relief[iy, ix] * t).astype(np.float32)
     return np.where(inside, relief * fade, 0.0).astype(np.float32)
 
 

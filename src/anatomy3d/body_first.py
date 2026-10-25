@@ -67,6 +67,7 @@ _SB_JAW = 0.45  # the jaw's angle this many ear heights below the ear's bottom
 _SB_ABOVE = 0.25  # side whiskers start at the temple's hair, this many ear heights above the ear's top
 _SB_SIDEWAYS = 0.35  # ... only on the head's side (its surface facing sideways at least this much)
 _SB_SMOOTH = 8  # its outline eased over this many mesh steps
+_SB_EDGE = 0.006  # ... and its front edge over this (m)
 _SB_TRIMMED = 0.6  # a trimmed whisker's layer, of a full one's
 _HAIR_FLAT = ("sleek",)  # hair pulled flat to the head: no layer of its own over the unseen scalp (it raised folds there)
 _HAIR_UNSEEN = 1.0  # the short hair's layer over the scalp the front doesn't see, of the seen layer's
@@ -410,6 +411,7 @@ _FACE_FEATURES = ([168, 193, 245, 128, 114, 217, 198, 209, 49, 64, 98, 97, 2, 32
                   [70, 63, 105, 66, 107, 55, 65, 52, 53, 46], [300, 293, 334, 296, 336, 285, 295, 282, 283, 276])  # nose, lips, brows
 _FACE_SKIN_SMOOTH = 0.005  # the face points' relief on the skin: its lumps smoothed over this much (m) ...
 _FACE_SKIN_EASE = 0.006  # ... eased in over this much (m) from the features, which keep their own shape
+_FACE_SPREAD = 0.35  # the photo's face shape kept to the face's outline and eased out beyond it over this many face widths (onto the head's side)
 _FACE_NOSE_DEPTH = (0.15, 0.22)  # people's nose tip before the inner eye corners, as a share of the face's width (anthropometric)
 _FACE_PIT = 0.006  # the face points' relief: pits narrower than twice this (m) filled ...
 _FACE_PIT_EYE = 0.004  # ... away from the eyes by this much (m): their sockets and lids are their own
@@ -1686,8 +1688,12 @@ def _sideburns_3d(V, F, part_w, names, ear_w, head_axes, read: dict, fm, ppm: fl
         t = np.clip((z_start - loc[:, 2]) / max(z_start - z_end, 1.0), 0.0, 1.0)
         width = w_top * (1.0 + (flare - 1.0) * t) if read.get("end") != "tapered" else w_top * (1.0 - 0.8 * t)
         ahead = front - loc[:, 1]  # how far in front of the ear's front edge
-        on = head & (u * nrm[:, 0] > _SB_SIDEWAYS) & (u * loc[:, 0] > 0) & (loc[:, 2] <= z_start) & (loc[:, 2] >= z_end - 0.1 * ear_h)
-        across = np.clip(1.0 - (ahead - 0.5 * width) / np.maximum(0.25 * width, 1.0), 0.0, 1.0) * (ahead > -0.15 * ear_h)
+        # (eased at every edge -- on the head's side by how far it faces
+        # sideways, and in front over _SB_EDGE: cut there, the layer ended in
+        # a ridge from the temple to the jaw, a seam beside the face)
+        side_w = np.clip((u * nrm[:, 0] - _SB_SIDEWAYS + 0.15) / 0.3, 0.0, 1.0)
+        on = head & (u * loc[:, 0] > 0) & (loc[:, 2] <= z_start) & (loc[:, 2] >= z_end - 0.1 * ear_h)
+        across = np.clip(1.0 - (ahead - 0.5 * width) / np.maximum(_SB_EDGE * ppm, 1.0), 0.0, 1.0) * (ahead > -0.15 * ear_h) * side_w
         foot = np.clip((loc[:, 2] - (z_end - 0.1 * ear_h)) / (0.1 * ear_h), 0.0, 1.0)  # (a clean cut at the foot)
         hs = np.where(on, np.clip(across, 0.0, 1.0) * foot, 0.0)
         h = np.maximum(h, hs)
@@ -2904,7 +2910,8 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
             # nose's sides and creases fall between the face points, and
             # left there, a groove ran beside the photo's own nose)
             near_face, flat = _flatten_body_face(fm, near, cov, ppm)
-            fr = sr._face_relief(_face_over_body(_face_depth_in_proportion(fm), near_face, cov), shape, 0, 0, 1.0, 0) * strength
+            fr = sr._face_relief(_face_over_body(_face_depth_in_proportion(fm), near_face, cov), shape, 0, 0, 1.0, 0,
+                                 spread=_FACE_SPREAD) * strength
             if labels is not None:
                 from .head_parts import BODY_SKIN, FACE_SKIN
 
@@ -3057,10 +3064,19 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
     inb = (px >= 0) & (px < shape[1] - 1) & (py >= 0) & (py < shape[0] - 1)
     near_at = map_coordinates(np.where(np.isfinite(near), near, 1e9), [py, px], order=0, mode="nearest")
     visible = inb & (V[:, 2] <= near_at + 1.5)  # frontmost at its pixel (photo px)
+    # ... and how surely, eased: where the surface turns away (the cheek
+    # beside the ear, under the jaw) its depth changes more in a pixel than
+    # the margin, the yes/no flipped from vertex to vertex, and the face's
+    # shape -- moved in full where seen -- stopped along a line there: the
+    # face stood apart from the head as a mask
+    nz_ = np.clip(np.abs(nrm[:, 2]), 0.05, 1.0)
+    tol_ = 1.5 + np.minimum(1.5 * np.sqrt(1.0 - nz_ * nz_) / nz_, _SEEN_TOL_MAX)
+    vis_w = np.clip(1.0 - (V[:, 2] - near_at - tol_) / tol_, 0.0, 1.0) * inb
     # (where the body's eye sockets were pressed flat just behind the skin,
     # those layers carried with it: left, they showed through the eyes)
     carry = _pocket_carry(V, eye_pocket, near_at, ppm)
     visible |= carry
+    vis_w = np.maximum(vis_w, carry.astype(np.float64))
     facing = np.where(carry, 1.0, facing)  # (as the skin over them)
     # (and the body's own folds in the face -- its closed lips' seam -- moved
     # with the skin over them: left where the body's lips were while the
@@ -3077,16 +3093,27 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         in_face = map_coordinates(fz_.astype(np.float32), [py, px], order=0, mode="constant") > 0.5
         fold = inb & ~visible & in_face & (V[:, 2] <= near_at + _FACE_FOLD * ppm)
         visible |= fold
+        vis_w = np.maximum(vis_w, fold.astype(np.float64))
         # (in the face, in full whichever way the surface faces: the face's
         # own shape is moved, not only its detail -- faded where it turns,
         # the lips' seam, facing up and down, kept the body's lips and stood
         # out of the mouth; eased in from the face's outline: switched at it,
         # where the jaw turns under it stood as a step along the jaw)
-        fin = np.clip(distance_transform_edt(fz_) / max(_FACE_FLAT_EASE * ppm, 1.0), 0.0, 1.0)
-        fin = fin * fin * (3.0 - 2.0 * fin)
+        # (in full to the face's outline and eased out beyond it, as the
+        # face's shape is (_FACE_SPREAD): eased in inside it, the face's
+        # shape was cut back along a line down the cheek)
+        # (sideways only: under the jaw, facing down, held in full it tore)
+        fw_ = float(np.ptp(o_[:, 0]))
+        d_o, (oy_, ox_) = distance_transform_edt(~fz_, return_indices=True)
+        rr_g, cc_g = np.mgrid[0:shape[0], 0:shape[1]]
+        dd_ = np.hypot(rr_g - oy_, cc_g - ox_)
+        side_o = np.clip((np.abs(cc_g - ox_) / np.maximum(dd_, 1e-6) - 0.55) / 0.3, 0.0, 1.0)
+        fin = np.clip(1.0 - d_o / max(_FACE_SPREAD * fw_, 1.0), 0.0, 1.0)
+        fin = np.where(fz_, 1.0, fin * fin * (3.0 - 2.0 * fin) * side_o)
         w_in = map_coordinates(fin.astype(np.float32), [py, px], order=1, mode="constant")
-        facing = np.where(visible, facing + w_in * (1.0 - facing), facing)
+        facing = facing + vis_w * w_in * (1.0 - facing)
         report["face_fold_vertices"] = int(fold.sum())
+    vis_w = np.clip(sr._mesh_smooth(sr._mesh_laplacian(F, len(V)), vis_w, 3), 0.0, 1.0)
     off_v = _sample_eased(offset, V, F, px, py, cov)
     # (not on the ears: theirs is the ear's own shape, sized to the photo's
     # -- the photo's depth there is the head's outline, nothing of the ear's
@@ -3101,9 +3128,9 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         # height (toward the camera: -z)
         hs_v = map_coordinates(flat[0], [py, px], order=1, mode="nearest")
         w_v = map_coordinates(flat[1], [py, px], order=1, mode="constant")
-        off_v = off_v + np.where(visible, w_v * (hs_v + V[:, 2]) / np.maximum(facing, 1e-3), 0.0)
+        off_v = off_v + vis_w * w_v * (hs_v + V[:, 2]) / np.maximum(facing, 1e-3)
     V = V.copy()
-    V[:, 2] = V[:, 2] - np.where(visible, off_v * facing, 0.0)
+    V[:, 2] = V[:, 2] - vis_w * off_v * facing
     if labels is not None and fm is not None:
         from .head_parts import HAIR, HAT
 
@@ -3119,7 +3146,7 @@ def build_body_first(inputs, target_height_mm: float = 150.0, depth_strength: Op
         # (short hair only: longer hair's own volume is the outline's growth
         # -- pushed out along it too, its folds stood out as spikes)
         if hairy.max() > 0.5 and (hair_read or {}).get("kind") not in _LONG_HAIR:
-            hv = np.where(visible, map_coordinates(hairy, [py, px], order=1, mode="nearest"), 0.0) * (1.0 - ear_keep)
+            hv = vis_w * map_coordinates(hairy, [py, px], order=1, mode="nearest") * (1.0 - ear_keep)
             # ... and over the scalp the front doesn't see (the crown, the
             # back of the head above the nape): left bare there, the layer
             # stopped where the front view does, a ridge over the top of the
