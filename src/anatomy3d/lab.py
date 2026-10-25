@@ -592,6 +592,13 @@ def score(code: str, body, inputs: LabInputs, thumb_size: "tuple[int, int]" = (4
     m["min_wall_mm"] = round(float(estimate_min_wall_thickness(wm, sample_count=800)), 2)
 
     keep = preview.vertices[preview.faces][:, :, 1].min(axis=1) > floor + 0.5
+    # the hair's sculpted curls and the ears are folds on purpose: the hair check judges them
+    try:
+        scalp = _scalp(preview, floor, inputs)
+    except Exception:  # noqa: BLE001 - counted as before then
+        scalp = None
+    if scalp is not None:
+        keep &= ~scalp
     adj, ang = preview.face_adjacency, preview.face_adjacency_angles
     both = keep[adj[:, 0]] & keep[adj[:, 1]]
     # outward folds only: an inward crease (an arm or a hand sitting on the
@@ -766,6 +773,8 @@ PARAMS = [
     ("jaw_w", "Jaw width", "detected", "jaw angles ÷ face width", "100 − % off"),
     ("face_hw", "Face height : width", "detected", "forehead–chin ÷ cheek–cheek", "100 − % off"),
     ("face_id", "Face embedding match", "detected", "SFace (Apache-2.0) cosine, model's face render vs the photo's face", "100 × cosine"),
+    ("hair", "Hair texture", "detected", "share of the model's front, where the photo shows hair, sculpted as hair (folds over 30° between neighbouring faces of the preview), not a smooth dome; half of it counts as full", "100 × share ÷ 0.5, max 100"),
+    ("face_depth", "Face depth (side)", "detected", "how far the brow, eyes, cheeks, lips and chin sit behind the nose tip on the model vs the photo's face points, ÷ face width", "100 − % off"),
     ("d_head", "Head depth", "common", "front-to-back ÷ side-to-side at the eyes; ANSUR II 1.29", "100 − % off"),
     ("d_chest", "Chest depth", "common", "front-to-back through the chest's centre line ÷ shoulder-joint distance; ANSUR II 0.61", "100 − % off"),
     ("d_waist", "Waist depth", "common", "front-to-back through the waist's centre line ÷ shoulder-joint distance; ANSUR II 0.57", "100 − % off"),
@@ -778,6 +787,10 @@ PARAMS = [
 # the shoulders because arms hanging against the body join the torso's
 # cross-section and would inflate a width-based ratio's denominator.
 _ANSUR_DEPTH = {"d_head": 1.2914, "d_chest": 0.611, "d_waist": 0.572}
+# face points whose depth behind the nose tip (1) the side check compares:
+# brow, forehead, eye corners, temples, cheeks' edge, upper lip, chin
+_FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+_FACE_DEPTH_IDX = (9, 151, 33, 263, 127, 356, 234, 454, 0, 152)
 _FACE_IDX = {"eye": (33, 263), "cheek": (234, 454), "brow_chin": (10, 152), "nose": (168, 2), "mouth": (61, 291), "jaw": (172, 397)}
 
 
@@ -926,6 +939,116 @@ def _photo_face_crop(rgb: np.ndarray, lm: np.ndarray) -> np.ndarray:
     return np.asarray(im.resize((max(1, int(im.width * zoom)), max(1, int(im.height * zoom))), Image.LANCZOS))
 
 
+def _photo_px(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs", pts: np.ndarray):
+    """Model points in the photo's frame (the model scaled to the subject's
+    height and centred on it, as the Lab aligns them): (rows, cols)."""
+    ys, xs = np.nonzero(inputs.photo_mask)
+    my0, my1, mx0, mx1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    v = preview.vertices
+    top = float(v[:, 1].max())
+    above = v[v[:, 1] > floor]
+    mm = (top - floor) / (my1 - my0)
+    mx_c, px_c = (above[:, 0].min() + above[:, 0].max()) / 2, (mx0 + mx1) / 2
+    return (top - pts[:, 1]) / mm + my0, (pts[:, 0] - mx_c) / mm + px_c
+
+
+def _head_hair(inputs: "LabInputs"):
+    """The photo's hair pixels (head parts), or None when it shows too little
+    hair to judge (a hat, a shaved head, no head parts read)."""
+    from .head_parts import NAMES
+
+    lab_ = (getattr(inputs, "parts", None) or {}).get("labels")
+    if lab_ is None or inputs.face_mesh is None or lab_.shape != inputs.photo_mask.shape:
+        return None
+    hair = lab_ == NAMES.index("hair")
+    fw = float(np.ptp(np.asarray(inputs.face_mesh)[:468, 0]))
+    return hair if hair.sum() >= 0.05 * fw * fw else None
+
+
+def _scalp(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -> Optional[np.ndarray]:
+    """Faces of the head round the face: everything above the chin within the
+    head's breadth except the face's own front. Where the photo shows hair,
+    their folds are the hair's sculpted texture (and the ears'), judged by
+    the hair check rather than as spikes. None without hair to judge."""
+    hair = _head_hair(inputs)
+    if hair is None:
+        return None
+    lm = np.asarray(inputs.face_mesh)[:468]
+    r, c = _photo_px(preview, floor, inputs, preview.triangles_center)
+    hy, hx = np.nonzero(hair)
+    x0, x1 = min(lm[:, 0].min(), hx.min()), max(lm[:, 0].max(), hx.max())
+    pad = 0.1 * float(np.ptp(lm[:, 0]))
+    head = (r < float(lm[152, 1])) & (c > x0 - pad) & (c < x1 + pad)
+    import cv2
+
+    oval = np.zeros(hair.shape, np.uint8)
+    cv2.fillPoly(oval, [np.round(lm[_FACE_OVAL, :2]).astype(np.int32)], 1)
+    ok = (r >= 0) & (r < hair.shape[0]) & (c >= 0) & (c < hair.shape[1])
+    inside = np.zeros(len(r), bool)
+    inside[ok] = oval[r[ok].astype(int), c[ok].astype(int)] > 0
+    on_hair = np.zeros(len(r), bool)
+    on_hair[ok] = hair[r[ok].astype(int), c[ok].astype(int)]
+    face_front = (preview.face_normals[:, 2] > 0.0) & inside & ~on_hair
+    return head & ~face_front
+
+
+def _hair_texture(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -> Optional[float]:
+    """Share of the model's front, over the photo's hair, that is sculpted as
+    hair: folds over 30 degrees between neighbouring faces (a smooth bald
+    dome has almost none)."""
+    hair = _head_hair(inputs)
+    if hair is None:
+        return None
+    r, c = _photo_px(preview, floor, inputs, preview.triangles_center)
+    ok = (r >= 0) & (r < hair.shape[0]) & (c >= 0) & (c < hair.shape[1])
+    on = np.zeros(len(r), bool)
+    on[ok] = hair[r[ok].astype(int), c[ok].astype(int)]
+    on &= preview.face_normals[:, 2] > 0.3
+    if on.sum() < 50:
+        return None
+    adj, ang = preview.face_adjacency, np.degrees(preview.face_adjacency_angles)
+    bend = np.zeros(len(r))
+    np.maximum.at(bend, adj[:, 0], ang)
+    np.maximum.at(bend, adj[:, 1], ang)
+    return float((bend[on] > 30.0).mean())
+
+
+def _face_depth(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -> Optional[float]:
+    """The model's face depth over the photo's: how far the face points sit
+    behind the nose tip on the model (its front, in the photo's frame) against
+    the photo face points' own depths, both over the face's width, as one
+    least-squares factor (1 = as deep as the photo's face). A face pressed
+    flat into the head -- a mask with a rim -- reads well below 1 from the
+    front checks' blind side."""
+    from .study import front_in_photo
+
+    lm = np.asarray(inputs.face_mesh, dtype=np.float64)
+    if lm.shape[1] < 3:
+        return None
+    fw = float(np.linalg.norm(lm[234, :2] - lm[454, :2]))
+    if fw < 8:
+        return None
+    pad = 0.3 * fw
+    box = (int(lm[:468, 0].min() - pad), int(lm[:468, 1].min() - pad), int(lm[:468, 0].max() + pad) + 1, int(lm[:468, 1].max() + pad) + 1)
+    z, _, k = front_in_photo(preview, floor, inputs, box, max_px=400)
+    ys = np.nonzero(inputs.photo_mask)[0]
+    mm = float(preview.vertices[:, 1].max() - floor) / (ys.max() + 1 - ys.min())
+
+    def at(p, rad, how):
+        r, c, w = int((p[1] - box[1]) / k), int((p[0] - box[0]) / k), max(1, int(rad * fw / k))
+        a = z[max(0, r - w):r + w + 1, max(0, c - w):c + w + 1]
+        a = a[np.isfinite(a)]
+        return how(a) if len(a) else np.nan
+
+    tip = at(lm[1], 0.03, np.max)
+    mod = np.array([(tip - at(lm[i], 0.02, np.median)) / (fw * mm) for i in _FACE_DEPTH_IDX])
+    pho = np.array([(lm[i, 2] - lm[1, 2]) / fw for i in _FACE_DEPTH_IDX])  # (MediaPipe: z grows away, in x's scale)
+    ok = np.isfinite(mod) & (pho > 0.02)
+    if ok.sum() < 6 or not np.isfinite(tip):
+        return None
+    return float((mod[ok] @ pho[ok]) / (pho[ok] @ pho[ok]))
+
+
 def _parameters(m: dict, inputs: "LabInputs", preview: trimesh.Trimesh, floor: float, sil: np.ndarray, render_face, head_img) -> dict:
     """{key: [model value, photo/target value, held 0-100]}; a key is left
     out when it can't apply to this photo (no face, no hips, ...)."""
@@ -967,6 +1090,18 @@ def _parameters(m: dict, inputs: "LabInputs", preview: trimesh.Trimesh, floor: f
 
             cos = float(_sface["rec"].match(pe, re_, cv2.FaceRecognizerSF_FR_COSINE)) if re_ is not None else None
             out["face_id"] = [None if cos is None else round(cos, 3), 1.0, int(round(100 * max(0.0, cos))) if cos is not None else 0]
+        try:
+            fd = _face_depth(preview, floor, inputs)
+        except Exception:  # noqa: BLE001 - left out, as for a photo without a face
+            fd = None
+        if fd is not None:
+            out["face_depth"] = [round(fd, 2), 1.0, _held_ratio(fd, 1.0)]
+    try:
+        ht = _hair_texture(preview, floor, inputs)
+    except Exception:  # noqa: BLE001 - left out
+        ht = None
+    if ht is not None:
+        out["hair"] = [round(ht, 2), 0.5, int(round(min(100.0, 200.0 * ht)))]
     if inputs.animal_frac <= 0.15:
         top = float(preview.vertices[:, 1].max())
         above = preview.vertices[preview.vertices[:, 1] > floor]
