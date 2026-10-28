@@ -193,13 +193,22 @@ def _rotmats(rv: np.ndarray) -> np.ndarray:
     return np.eye(3)[None] + np.sin(th) * K + (1.0 - np.cos(th)) * (K @ K)
 
 
-def _bone_transforms(body: dict, bone_ids: np.ndarray, rv: np.ndarray):
+def _bone_transforms(body: dict, bone_ids: np.ndarray, rv: np.ndarray, base=None, only=None):
     """World rotation and position of every joint. Each posed bone turns
     about the rest pose's own axes (x: the body's left, y: back, z: up), in
-    its parent's turned frame."""
+    its parent's turned frame. Given base (Rw, pw) and only (bone indices,
+    ascending, closed under children), only those are worked out again: the
+    rest are base's (when only those bones' turns changed)."""
     parents, joints = body["parents"], body["joints"]
     local = np.tile(np.eye(3), (len(parents), 1, 1))
     local[bone_ids] = _rotmats(rv)
+    if base is not None and only is not None:
+        Rw, pw = base[0].copy(), base[1].copy()
+        for j in only:
+            p = parents[j]
+            Rw[j] = Rw[p] @ local[j]
+            pw[j] = pw[p] + Rw[p] @ (joints[j] - joints[p])
+        return Rw, pw
     Rw = np.empty_like(local)
     pw = np.empty_like(joints)
     for j, p in enumerate(parents):
@@ -376,14 +385,16 @@ def measure_ears(photo_mask: np.ndarray, face_mesh: Optional[np.ndarray], px_per
 
 
 def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: dict, faces: Optional[np.ndarray] = None,
-               px_per_m: float = 1000.0, info: Optional[dict] = None) -> np.ndarray:
+               px_per_m: float = 1000.0, info: Optional[dict] = None, profile: Optional[dict] = None) -> np.ndarray:
     """Each ear of the posed body (photo px) sized, moved up or down and
     swung out from the head about its front edge until it starts, ends and
     reaches as far out as the photo's (measure_ears). Turned in the head's
     own frame; the skin around the ear follows partway. The swing grows
     from nothing where the ear grows out of the head to all of it
     _EAR_BEND (metres) out along the ear (given the faces): the root stays
-    on the skull, as a real ear's does."""
+    on the skull, as a real ear's does. Given a profile ({side: [(row, x),
+    ...]}: the photo's ear outline row by row), the ear's outer edge is
+    matched on every one of those rows, not at its widest point alone."""
     V = np.asarray(V, dtype=np.float64)
     A = np.asarray(head_axes, dtype=np.float64)  # columns: the head's left, back, up (photo px frame)
     out = V.copy()
@@ -439,10 +450,19 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
             new = (np.column_stack([a, bk, r[:, 2] + dz]) + hinge) @ A.T
             return V + follow[:, None] * (new - V)
 
+        prof = None if profile is None else profile.get(side)
+
         def resid(p):
             q = moved(p)[core]
             r = [q[:, 1].min() - t["top"], q[:, 1].max() - t["bottom"]]
-            if fit_turn:
+            if prof is not None and len(prof) and fit_turn:
+                # the outer edge row by row (each row's band of the ear), weighted so the rows count as one point
+                wr = 1.0 / np.sqrt(len(prof))
+                for row, x in prof:
+                    band = np.abs(q[:, 1] - row) <= 1.5
+                    if band.any():
+                        r.append(wr * (u_img * (q[band, 0] * u_img).max() - x))
+            elif fit_turn:
                 r.append(u_img * (q[:, 0] * u_img).max() - outer_x)
             return np.array(r)
 
@@ -1019,4 +1039,8 @@ def fit_body_reference(pose: Optional[dict], face_mesh: Optional[np.ndarray], ph
     if parts is not None:
         report["head_has"] = [k for k, v in parts.get("found", {}).items() if v]
     return {"matched": report["matched"], "report": report, "skin": skin_read, "vertices": px, "joints_px": joints_px, "core_depth": core_depth, "faces": body["faces"], "part_w": body["part_w"],
-            "part_names": np.array(body["part_names"]), "px_per_m": s, "ear_w": body["ear_w"], "head_axes": head_axes, "ears": ears, "parts": parts}
+            "part_names": np.array(body["part_names"]), "px_per_m": s, "ear_w": body["ear_w"], "head_axes": head_axes, "ears": ears, "parts": parts,
+            # the solved body itself, so it can be built again in 3D: its build
+            # (_rest's vector), each posed bone's turn, and the camera (scale,
+            # x, y: photo px = (x + s X, y - s Z, s Y) of the model's metres)
+            "solved": {"ph": ph.copy(), "bone_ids": bone_ids.copy(), "rv": rv.copy(), "cam": [s, float(cam[1]), float(cam[2])], "gender": gender}}
