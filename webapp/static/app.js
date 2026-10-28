@@ -26,6 +26,13 @@ const loadingOverlay = document.getElementById("loading-overlay");
 const loadingMsg = document.getElementById("loading-msg");
 const statsBar = document.getElementById("stats-bar");
 const downloadBar = document.getElementById("download-bar");
+const rateBar = document.getElementById("rate-bar");
+const rateStars = document.getElementById("rate-stars");
+const rateNote = document.getElementById("rate-note");
+const rateSend = document.getElementById("rate-send");
+const rateDone = document.getElementById("rate-done");
+const rateCompare = document.getElementById("rate-compare");
+let rateUrl = null, rateValue = 0, compareUrl = null;
 const trellisStatusEl = document.getElementById("trellis-status");
 const descriptionField = document.getElementById("description-field");
 const descriptionInput = document.getElementById("description-input");
@@ -716,6 +723,10 @@ function showResult(data) {
     <span><b>${data.stats.height_mm.toFixed(1)}mm</b> tall</span>
     <span><b>${data.stats.watertight ? "watertight" : "needs repair"}</b></span>
   `;
+  showRating(data.rate_url, data.compare_url);
+  if (data.compare_of) {
+    setStatus("ok", `The same photo built with another setting (${data.code}), to compare with the one before. Rate both: the app keeps the one you rate higher.`);
+  }
   downloadBar.innerHTML = `
     <a href="${data.stl_url}" download>Download STL</a>
     <a class="secondary" href="${data.obj_url}" download>Download OBJ</a>
@@ -880,6 +891,7 @@ async function generate() {
       : "Extracting silhouettes and carving the visual hull…";
   downloadBar.innerHTML = "";
   statsBar.style.display = "none";
+  rateBar.hidden = true;
 
   const form = new FormData();
   selectedFiles.forEach((f) => form.append("images", f));
@@ -925,6 +937,7 @@ resetBtn.addEventListener("click", () => {
   messagesEl.innerHTML = "";
   emptyResultHint.style.display = "";
   statsBar.style.display = "none";
+  rateBar.hidden = true;
   downloadBar.innerHTML = "";
   if (currentModel) {
     scene.remove(currentModel);
@@ -1102,6 +1115,7 @@ async function labOpen(i) {
   document.getElementById("lab-note").value = item.rating ? item.rating.note : "";
   labPaintStars(item.rating ? item.rating.stars : 0);
   statsBar.style.display = "none";
+  rateBar.hidden = true;
   downloadBar.innerHTML = item.status === "ok"
     ? `<a href="/api/lab/runs/${labState.runId}/stl/${item.code}" download>Download STL</a>`
     : "";
@@ -1227,3 +1241,74 @@ fetch("/api/version")
   setActiveTab("viewer");
   pollJob(jobId);
 })();
+
+
+// ---------- your verdict on a render (into the server's ledger: the app
+// builds with the setting you rate higher, and never one you rate 2 or less)
+function paintStars(n) {
+  rateStars.querySelectorAll("button").forEach((b, i) => {
+    b.classList.toggle("on", i < n);
+    b.setAttribute("aria-pressed", String(i < n));
+  });
+}
+function showRating(url, compare) {
+  rateUrl = url || null;
+  compareUrl = compare || null;
+  rateCompare.hidden = !compareUrl;
+  rateCompare.disabled = false;
+  rateValue = 0;
+  rateBar.hidden = !rateUrl;
+  rateDone.hidden = true;
+  rateNote.value = "";
+  rateSend.disabled = true;
+  if (!rateStars.children.length) {
+    for (let i = 1; i <= 5; i++) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = "\u2605";
+      b.setAttribute("aria-label", `${i} star${i > 1 ? "s" : ""}`);
+      b.addEventListener("click", () => {
+        rateValue = i;
+        paintStars(i);
+        rateSend.disabled = false;
+      });
+      rateStars.appendChild(b);
+    }
+  }
+  paintStars(0);
+}
+rateSend.addEventListener("click", async () => {
+  if (!rateUrl || !rateValue) return;
+  const body = new FormData();
+  body.append("stars", String(rateValue));
+  body.append("note", rateNote.value.trim());
+  rateSend.disabled = true;
+  try {
+    const res = await fetch(rateUrl, { method: "POST", body });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    rateDone.textContent = "Thanks: recorded.";
+  } catch (err) {
+    rateDone.textContent = `Not recorded: ${err.message}`;
+    rateSend.disabled = false;
+  }
+  rateDone.hidden = false;
+});
+rateCompare.addEventListener("click", async () => {
+  if (!compareUrl) return;
+  rateCompare.disabled = true;
+  try {
+    const res = await fetch(compareUrl, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    rateBar.hidden = true;
+    generateBtn.disabled = true;
+    loadingOverlay.classList.add("show");
+    loadingMsg.textContent = `Building the same photo with setting ${data.code}…`;
+    localStorage.setItem(LAST_JOB_KEY, data.job_id);
+    pollJob(data.job_id);
+  } catch (err) {
+    rateDone.textContent = `Can't compare: ${err.message}`;
+    rateDone.hidden = false;
+    rateCompare.disabled = false;
+  }
+});

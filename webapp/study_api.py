@@ -165,7 +165,18 @@ def _judge(st: dict) -> "tuple[bool, str]":
     worst = min(st["best_per_photo"].get(k, -1e9) - v for k, v in st["base_per_photo"].items())
     if worst < -AUTO_WORST:
         return False, f"a photo got worse by {-worst:.2f}"
-    return True, f"gain {gain:.2f}, no photo worse than {-min(worst, 0):.2f}"
+    # applying tuned values changes every build: like a push, it may leave
+    # no photo further from itself on any quantity (the ledger's readings)
+    base, best = st.get("base_readings"), st.get("best_readings")
+    if not base or not best:
+        return False, "no readings to check it against (studied before the ledger)"
+    from anatomy3d import ledger
+
+    worse = [f"{pid}: {q}" for pid, b in base.items() for q, v in (b or {}).items()
+             if q in ledger.QUANTITIES and (best.get(pid) or {}).get(q) is not None and ledger._worse(q, best[pid][q], v)]
+    if worse:
+        return False, f"further from the photo on {len(worse)} quantity/photo pairs (" + ", ".join(worse[:4]) + ("…" if len(worse) > 4 else "") + ")"
+    return True, f"gain {gain:.2f}, and no photo further from itself on any quantity"
 
 
 def autopilot_step(generation_lock: threading.Lock) -> bool:
@@ -356,7 +367,7 @@ def list_studies():
             out.append(_summary(st))
     tuned = knobs.read_tuned()
     return {"studies": out, "areas": knobs.AREAS, "objective": study.OBJECTIVE, "autopilot": autopilot_state(),
-            "auto_rule": f"applies a finished study by itself when its mean beats its start by {AUTO_GAIN} and no photo got worse than {AUTO_WORST}",
+            "auto_rule": f"applies a finished study by itself when its mean beats its start by {AUTO_GAIN}, no photo got worse than {AUTO_WORST}, and no photo is further from itself on any of the ledger's quantities",
             "tuned": {"source": tuned.get("source"), "at": tuned.get("at"), "values": tuned.get("values", {}),
                       "stale": _tuned_status["stale"]},
             "free_mb": round(_free() / 1e6)}

@@ -330,6 +330,16 @@ def _capsule_inputs(photo_path: str, rgb_full: np.ndarray) -> dict:
 HEIGHT_MM = 150.0
 
 
+def refused(code: str, animal_frac: float) -> Optional[str]:
+    """Why this combination is never built on this photo, or None."""
+    fam, _ = decode(code)
+    if fam == "O" and options(code)["rescue"] == "on" and animal_frac <= _RESCUE_ANIMAL_MIN:
+        # (its depth bands on a person are lines of equal estimated depth,
+        # not edges: steps along them cut grooves across the chest)
+        return "Layer rescue is for animals: on a person it cuts grooves along the depth estimate's bands."
+    return None
+
+
 def build(code: str, inputs: LabInputs):
     """The finished model (body + base disk) for one combination."""
     from .mesh_export import add_base_disk
@@ -369,10 +379,9 @@ def build(code: str, inputs: LabInputs):
             out = add_base_disk(body, HEIGHT_MM)
         out.report = rep or None  # (the reality checks of each step)
         return out
-    if fam == "O" and o["rescue"] == "on" and inputs.animal_frac <= _RESCUE_ANIMAL_MIN:
-        # (its depth bands on a person are lines of equal estimated depth,
-        # not edges: steps along them cut grooves across the chest)
-        raise RuntimeError("Layer rescue is for animals: on a person it cuts grooves along the depth estimate's bands.")
+    why = refused(code, inputs.animal_frac)
+    if why:
+        raise RuntimeError(why)
     if fam == "C":
         if inputs.capsule is None:
             raise RuntimeError(f"Capsule builder can't use this photo: {inputs.capsule_unavailable}")
@@ -773,8 +782,8 @@ PARAMS = [
     ("jaw_w", "Jaw width", "detected", "jaw angles ÷ face width", "100 − % off"),
     ("face_hw", "Face height : width", "detected", "forehead–chin ÷ cheek–cheek", "100 − % off"),
     ("face_id", "Face embedding match", "detected", "SFace (Apache-2.0) cosine, model's face render vs the photo's face", "100 × cosine"),
-    ("hair", "Hair texture", "detected", "share of the model's front, where the photo shows hair, sculpted as hair (folds over 30° between neighbouring faces of the preview), not a smooth dome; half of it counts as full", "100 × share ÷ 0.5, max 100"),
-    ("face_depth", "Face depth (side)", "detected", "how far the brow, eyes, cheeks, lips and chin sit behind the nose tip on the model vs the photo's face points, ÷ face width", "100 − % off"),
+    ("hair", "Hair texture", "detected", "share of the model's front surface area (mm²), where the photo shows hair, sculpted as hair (folds over 30° between neighbouring faces), not a smooth dome", "100 × share"),
+    ("face_depth", "Face depth (side)", "detected", "mean mm the brow, eyes, cheeks, lips and chin sit behind the nose tip: the model's vs the photo's face points' (their pixel depth at the model's mm per pixel)", "100 − % off"),
     ("d_head", "Head depth", "common", "front-to-back ÷ side-to-side at the eyes; ANSUR II 1.29", "100 − % off"),
     ("d_chest", "Chest depth", "common", "front-to-back through the chest's centre line ÷ shoulder-joint distance; ANSUR II 0.61", "100 − % off"),
     ("d_waist", "Waist depth", "common", "front-to-back through the waist's centre line ÷ shoulder-joint distance; ANSUR II 0.57", "100 − % off"),
@@ -993,9 +1002,9 @@ def _scalp(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -> Optio
 
 
 def _hair_texture(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -> Optional[float]:
-    """Share of the model's front, over the photo's hair, that is sculpted as
-    hair: folds over 30 degrees between neighbouring faces (a smooth bald
-    dome has almost none)."""
+    """Share of the model's front surface area (mm^2), over the photo's hair,
+    that is sculpted as hair: folds over 30 degrees between neighbouring
+    faces (a smooth bald dome has almost none)."""
     hair = _head_hair(inputs)
     if hair is None:
         return None
@@ -1010,16 +1019,18 @@ def _hair_texture(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -
     bend = np.zeros(len(r))
     np.maximum.at(bend, adj[:, 0], ang)
     np.maximum.at(bend, adj[:, 1], ang)
-    return float((bend[on] > 30.0).mean())
+    area = preview.area_faces[on]  # (mm^2: by area, so the mesh's own triangle sizes don't weigh in)
+    return float(area[bend[on] > 30.0].sum() / max(area.sum(), 1e-12))
 
 
-def _face_depth(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -> Optional[float]:
-    """The model's face depth over the photo's: how far the face points sit
-    behind the nose tip on the model (its front, in the photo's frame) against
-    the photo face points' own depths, both over the face's width, as one
-    least-squares factor (1 = as deep as the photo's face). A face pressed
-    flat into the head -- a mask with a rim -- reads well below 1 from the
-    front checks' blind side."""
+def _face_depth(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -> "Optional[tuple[float, float]]":
+    """How deep the face is, in mm on the figure: the mean of how far the
+    brow, forehead, eye corners, temples, cheeks' edge, upper lip and chin
+    sit behind the nose tip -- on the model (its front, in the photo's frame)
+    and on the photo's face points (their depth is in photo pixels, as their
+    x is, so the same mm per pixel that sizes the model sizes it). Returns
+    (model mm, photo mm). A face pressed flat into the head -- a mask with a
+    rim -- is far shallower than the photo's."""
     from .study import front_in_photo
 
     lm = np.asarray(inputs.face_mesh, dtype=np.float64)
@@ -1041,12 +1052,12 @@ def _face_depth(preview: trimesh.Trimesh, floor: float, inputs: "LabInputs") -> 
         return how(a) if len(a) else np.nan
 
     tip = at(lm[1], 0.03, np.max)
-    mod = np.array([(tip - at(lm[i], 0.02, np.median)) / (fw * mm) for i in _FACE_DEPTH_IDX])
-    pho = np.array([(lm[i, 2] - lm[1, 2]) / fw for i in _FACE_DEPTH_IDX])  # (MediaPipe: z grows away, in x's scale)
-    ok = np.isfinite(mod) & (pho > 0.02)
+    mod = np.array([tip - at(lm[i], 0.02, np.median) for i in _FACE_DEPTH_IDX])  # mm
+    pho = np.array([(lm[i, 2] - lm[1, 2]) * mm for i in _FACE_DEPTH_IDX])  # photo px -> mm (MediaPipe: z grows away, in x's scale)
+    ok = np.isfinite(mod) & (pho > 0.02 * fw * mm)
     if ok.sum() < 6 or not np.isfinite(tip):
         return None
-    return float((mod[ok] @ pho[ok]) / (pho[ok] @ pho[ok]))
+    return float(np.mean(mod[ok])), float(np.mean(pho[ok]))
 
 
 def _parameters(m: dict, inputs: "LabInputs", preview: trimesh.Trimesh, floor: float, sil: np.ndarray, render_face, head_img) -> dict:
@@ -1095,13 +1106,13 @@ def _parameters(m: dict, inputs: "LabInputs", preview: trimesh.Trimesh, floor: f
         except Exception:  # noqa: BLE001 - left out, as for a photo without a face
             fd = None
         if fd is not None:
-            out["face_depth"] = [round(fd, 2), 1.0, _held_ratio(fd, 1.0)]
+            out["face_depth"] = [round(fd[0], 2), round(fd[1], 2), _held_ratio(fd[0], fd[1])]
     try:
         ht = _hair_texture(preview, floor, inputs)
     except Exception:  # noqa: BLE001 - left out
         ht = None
     if ht is not None:
-        out["hair"] = [round(ht, 2), 0.5, int(round(min(100.0, 200.0 * ht)))]
+        out["hair"] = [round(ht, 3), None, int(round(100.0 * ht))]
     if inputs.animal_frac <= 0.15:
         top = float(preview.vertices[:, 1].max())
         above = preview.vertices[preview.vertices[:, 1] > floor]

@@ -625,6 +625,9 @@ def evaluate(inputs: "lab.LabInputs", values: dict):
             m.update(critic(preview, _floor(preview), inputs))
         except Exception:  # noqa: BLE001 - a photo it can't apply to just doesn't score it
             pass
+    from . import ledger
+
+    m["readings"] = ledger.readings(m)  # (per quantity, what the autopilot's apply is checked on)
     m.pop("params", None)
     m["objective"] = round(objective(m), 2)
     return m, thumb
@@ -795,10 +798,12 @@ def finish_candidate(st: dict) -> dict:
         line["kept"] = f"rebuilt {role} (new code)"
         st["cand"] = None
         return line
+    readings = {pid: r.get("readings") for pid, r in c["results"].items()}
     if st["best_obj"] is None:
         st["best_obj"] = st["base_obj"] = round(mean, 2)
         st["best_per_photo"] = dict(per)
         st["base_per_photo"] = dict(per)
+        st["best_readings"] = st["base_readings"] = readings
         line["kept"] = "baseline"
         line["all"] = {pid: {k_: v_ for k_, v_ in r.items() if isinstance(v_, (int, float)) and not isinstance(v_, bool)}
                        for pid, r in c["results"].items()}
@@ -813,6 +818,7 @@ def finish_candidate(st: dict) -> dict:
         st["x"][key] = to
         st["best_obj"] = round(mean, 2)
         st["best_per_photo"] = dict(per)
+        st["best_readings"] = readings
         st["improved"] = True
         st["queue"].insert(0, [key, sign])  # keep going the same way
         st["kept"].append({"i": st["evals"], "key": key, "from": c["change"][1], "to": to, "gain": line["gain"],

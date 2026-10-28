@@ -586,6 +586,54 @@ button.secondary:hover { border-color: var(--accent); }
   gap: 8px;
 }
 
+/* your verdict on a render: it decides which setting the app builds next */
+.rate-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  background: rgba(22, 25, 34, 0.9);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.rate-bar[hidden] { display: none; }
+.rate-stars { display: inline-flex; gap: 2px; }
+.rate-stars button {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 20px;
+  line-height: 1;
+  padding: 2px 3px;
+  cursor: pointer;
+}
+.rate-stars button.on { color: var(--warn); }
+.rate-stars button:focus-visible { outline: 2px solid var(--accent); border-radius: 4px; }
+.rate-bar input {
+  flex: 1 1 140px;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font: inherit;
+}
+.rate-bar button.secondary {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+.rate-done { color: var(--ok); }
+
 @media (max-width: 480px) {
   /* Full-width and centered on a narrow phone, both bars, stacked by
      the flex column above (stats on top, downloads below) rather than

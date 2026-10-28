@@ -219,6 +219,14 @@
 
         <div class="stage-bottom-bar">
           <div class="stats-bar" id="stats-bar" style="display:none"></div>
+          <div class="rate-bar" id="rate-bar" hidden>
+            <span class="rate-label">Rate this model</span>
+            <span class="rate-stars" id="rate-stars" role="group" aria-label="Rate this model, 1 to 5 stars"></span>
+            <input type="text" id="rate-note" maxlength="500" placeholder="What's wrong or right? (optional)" aria-label="Note with your rating">
+            <button type="button" class="secondary" id="rate-send">Send</button>
+            <span class="rate-done" id="rate-done" hidden></span>
+            <button type="button" class="secondary" id="rate-compare" hidden>Build it another way to compare</button>
+          </div>
           <div class="download-bar" id="download-bar"></div>
         </div>
 

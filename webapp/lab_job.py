@@ -2,6 +2,8 @@
 
     python lab_job.py run <run_id>     the run's next combination
     python lab_job.py study <sid>      the study's next step
+    python lab_job.py measure <job_id> an app render's reading, into the ledger
+    python lab_job.py build <job_dir>  an app render built with the production pick
 
 A build peaks near 6 GB on some photos; in the server's own process the
 service ran out of its 8 GB and was restarted mid-build, again and again,
@@ -30,6 +32,10 @@ def main() -> int:
         lab_api._work_one(arg)
     elif kind == "study":
         study_api.work_one(arg, lock)
+    elif kind == "measure":
+        lab_api.measure_one(arg)
+    elif kind == "build":
+        return lab_api.build_pick(arg)
     else:
         return 2
     return 0

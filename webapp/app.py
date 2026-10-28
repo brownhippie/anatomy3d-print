@@ -106,7 +106,8 @@ _generation_lock = threading.Lock()
 # Combination Lab (see lab_api.py). Imported by path so it resolves the same
 # whether the server is started as `webapp.app:app` or `app:app --app-dir webapp`.
 sys.path.insert(0, str(WEBAPP_DIR))
-from lab_api import router as lab_router, start_worker as start_lab_worker  # noqa: E402
+from lab_api import router as lab_router, start_worker as start_lab_worker, production_like as lab_production_like  # noqa: E402
+from anatomy3d import ledger  # noqa: E402
 import study_api  # noqa: E402
 
 app.include_router(lab_router)
@@ -334,6 +335,72 @@ async def api_generate(
     return {"job_id": job_id, "status": "running"}
 
 
+_WALL_RE = re.compile(r"thinnest measured region ~([0-9.]+)mm")
+
+
+def _thinnest_wall(messages: "list[str]") -> Optional[float]:
+    """The thinnest wall the print file's own export measured (print_prep.export_stl
+    says it in its messages), mm at the model's own size; None if it wasn't measured.
+    Read, not measured again: measuring it here cost a render about a minute."""
+    for line in reversed(messages or []):
+        m = _WALL_RE.search(line)
+        if m:
+            return round(float(m.group(1)), 2)
+    return None
+
+
+def _prints(mesh: trimesh.Trimesh, wall: Optional[float]) -> bool:
+    return bool(mesh.is_watertight) and (wall is None or wall >= ledger.WALL_MIN_MM)
+
+
+def _pick_for(method: str, image_paths: "list[str]") -> Optional[str]:
+    """The production pick, when it is something other than the app's own
+    build and this request can use it (one photo, the built-in methods)."""
+    if method not in ("capsule", "silhouette_relief") or len(image_paths) != 1:
+        return None
+    code = (ledger.pick() or {}).get("code")
+    if not code or lab_production_like(code):
+        return None
+    return code
+
+
+def _build_with_pick(code: str, photo: str, height_mm: float, job_dir: Path, report_progress) -> "tuple[list[str], str, str]":
+    """lab.build(code) in a process of its own (a build can take 6 GB), under
+    the generation lock, written as the app's own files."""
+    import json as _json
+
+    report_progress(f"Building with the picked setting {code}", 0.2)
+    (job_dir / "pick_request.json").write_text(_json.dumps({"code": code, "photo": photo, "height_mm": height_mm}))
+    with _generation_lock:
+        rc = subprocess.run([sys.executable, str(WEBAPP_DIR / "lab_job.py"), "build", str(job_dir)], timeout=40 * 60).returncode
+    done = _json.loads((job_dir / "pick_done.json").read_text()) if (job_dir / "pick_done.json").exists() else {}
+    if rc != 0 or "code" not in done:
+        raise RuntimeError(done.get("error") or f"its process ended ({rc})")
+    return [f"Built with setting {done['code']}."] + list(done.get("messages") or []), "picked setting", done["code"]
+
+
+def _code_for(used_method: str, tweaks: dict) -> str:
+    """The app's own build as a label for the ledger and your ratings."""
+    plain = tweaks.get("thickness", 1.0) == 1.0 and tweaks.get("face_detail") == "normal" and tweaks.get("photo_depth") == "normal"
+    return f"app:{used_method}" + ("" if plain else ":tweaked")
+
+
+def _queue_measure(job_id, photo, job_dir, code, method, tweaks, height_mm, watertight, wall, pick, render_seconds) -> None:
+    import json as _json
+
+    p = ledger.root() / "pending" / job_id
+    p.mkdir(parents=True, exist_ok=True)
+    shutil.copy(photo, p / ("photo" + Path(photo).suffix.lower()))
+    model = job_dir / "model.obj"
+    shutil.copy(model if model.exists() else job_dir / "model.stl", p / ("model.obj" if model.exists() else "model.stl"))
+    (p / "meta.json").write_text(_json.dumps({
+        "counter": ledger.next_counter(), "at": time.time(), "photo": "photo" + Path(photo).suffix.lower(),
+        "model": "model.obj" if model.exists() else "model.stl", "code": code, "method": method, "tweaks": tweaks,
+        "height_mm": height_mm, "at_size": {"watertight": bool(watertight), "wall_mm": wall}, "pick": pick,
+        "render_seconds": render_seconds,
+    }))
+
+
 def _run_job(
     job_id: str,
     method: str,
@@ -346,6 +413,8 @@ def _run_job(
     job_dir: Path,
     out_stl: Path,
     tweaks: Optional[dict] = None,
+    force_code: Optional[str] = None,
+    compare_of: Optional[str] = None,
 ) -> None:
     """Runs entirely on its own background thread (see the Thread(...)
     call in api_generate above) -- never called directly from the event
@@ -423,7 +492,7 @@ def _run_job(
             note = f"The body builder couldn't use this photo ({exc}), so it was built from the photo's outline instead."
             return [note] + messages, "silhouette_relief (outline)"
 
-    try:
+    def run_default() -> "tuple[list[str], str]":
         if method == "trellis":
             _trellis_stats["attempts"] += 1
             try:
@@ -467,6 +536,20 @@ def _run_job(
         else:
             messages, bust_method = run_capsule()
             used_method = bust_method or method
+        return messages, used_method
+
+    t_render = time.time()
+    used_code = None
+    try:
+        pk = force_code or _pick_for(method, image_paths)
+        if pk:
+            try:
+                messages, used_method, used_code = _build_with_pick(pk, image_paths[0], height_mm, job_dir, report_progress)
+            except Exception as pick_exc:  # noqa: BLE001 - the app's own build instead
+                messages, used_method = run_default()
+                messages = [f"The picked setting {pk} couldn't build this photo ({pick_exc}); built with the app's own setting."] + messages
+        else:
+            messages, used_method = run_default()
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         with _job_state_lock:
@@ -474,6 +557,18 @@ def _run_job(
         return
 
     mesh = trimesh.load(str(out_stl), process=True)
+    # the printer's limits on this model at its own size, before it's handed over
+    wall = _thinnest_wall(messages)
+    if used_code and not _prints(mesh, wall):
+        what = "an unsealed model" if not mesh.is_watertight else f"a {wall} mm wall"
+        try:
+            again, used_method = run_default()
+            messages = [f"The picked setting {used_code} gave {what}; built again with the app's own setting."] + again
+            used_code = None
+            mesh = trimesh.load(str(out_stl), process=True)
+            wall = _thinnest_wall(messages)
+        except Exception:  # noqa: BLE001 - the picked one is kept then
+            pass
     height_actual = float(mesh.vertices[:, 1].max() - mesh.vertices[:, 1].min())
 
     # Front photo only — a cutout is a single-view concept, same as the
@@ -505,8 +600,21 @@ def _run_job(
     }
     if has_cutout:
         result["cutout_url"] = f"/jobs/{job_id}/cutout.png"
+    code = used_code or _code_for(used_method, tweaks)
+    result["code"] = code
+    result["compare_of"] = compare_of
+    result["compare_url"] = None if compare_of else f"/api/jobs/{job_id}/compare"
+    result["request"] = {"method": method, "height_mm": height_mm, "use_depth": use_depth, "bust_mode": bust_mode, "crop_frac": crop_frac}
+    result["stats"]["thinnest_wall_mm"] = wall
+    result["rate_url"] = f"/api/jobs/{job_id}/rate"
     with _job_state_lock:
         _job_state[job_id] = result
+    # the reading, after the model is handed over (the Lab's worker measures it between its own builds)
+    try:
+        _queue_measure(job_id, image_paths[0], job_dir, code, used_method, tweaks, height_mm, mesh.is_watertight, wall,
+                       used_code, round(time.time() - t_render, 1))
+    except Exception as exc:  # noqa: BLE001 - the reading never costs the render
+        print(f"Ledger: render {job_id} not queued: {exc}")
 
 
 @app.get("/api/jobs/{job_id}/status")
@@ -523,6 +631,61 @@ def job_status(job_id: str):
     if state is None:
         raise HTTPException(404, "Job not found or expired.")
     return state
+
+
+@app.post("/api/jobs/{job_id}/rate")
+def rate_job(job_id: str, stars: int = Form(...), note: str = Form("")):
+    """Your verdict on a render: 1-5 stars and a note, into the ledger. The
+    production pick moves to a setting you rated higher, and never to one
+    you rated 2 or less."""
+    if not JOB_ID_RE.match(job_id) or not 1 <= stars <= 5:
+        raise HTTPException(400, "stars must be 1 to 5.")
+    with _job_state_lock:
+        state = _job_state.get(job_id)
+    code = (state or {}).get("code")
+    if not code:
+        raise HTTPException(404, "Job not found or expired.")
+    ledger.rate("app", job_id, code, stars, note)
+    try:
+        now = ledger.choose_after_rating()
+    except Exception:  # noqa: BLE001
+        now = ledger.pick()
+    return {"ok": True, "code": code, "stars": stars, "pick": now.get("code")}
+
+
+@app.post("/api/jobs/{job_id}/compare")
+def compare_job(job_id: str):
+    """The same photo built with the strongest other setting (ledger.challenger),
+    to rate beside the first: the app learns the setting you rate higher."""
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(404, "Job not found or expired.")
+    with _job_state_lock:
+        state = dict(_job_state.get(job_id) or {})
+    src = JOBS_DIR / job_id / "input"
+    if state.get("status") != "done" or not src.is_dir():
+        raise HTTPException(404, "Job not found or expired.")
+    current = (ledger.pick() or {}).get("code") or ledger.held_production()
+    code = ledger.challenger(current)
+    if not code:
+        raise HTTPException(409, "No other setting to compare yet: the held job hasn't been read on this server.")
+    req = state.get("request") or {}
+    new_id = uuid.uuid4().hex
+    jd = JOBS_DIR / new_id
+    (jd / "input").mkdir(parents=True)
+    paths = []
+    for f in sorted(src.iterdir()):
+        shutil.copy(f, jd / "input" / f.name)
+        paths.append(str(jd / "input" / f.name))
+    with _job_state_lock:
+        _job_state[new_id] = {"status": "running", "created_at": time.time()}
+    threading.Thread(
+        target=_run_job,
+        args=(new_id, req.get("method", "capsule"), paths[:1], float(req.get("height_mm", 150.0)), bool(req.get("use_depth", False)),
+              bool(req.get("bust_mode", False)), req.get("crop_frac"), "", jd, jd / "model.stl", state.get("tweaks")),
+        kwargs={"force_code": code, "compare_of": job_id},
+        daemon=True,
+    ).start()
+    return {"job_id": new_id, "code": code}
 
 
 @app.get("/jobs/{job_id}/model.obj")

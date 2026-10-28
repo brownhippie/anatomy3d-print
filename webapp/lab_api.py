@@ -35,7 +35,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from trimesh.exchange.obj import export_obj
 
-from anatomy3d import lab
+from anatomy3d import lab, ledger
 
 import jobs
 import study_api
@@ -174,6 +174,8 @@ def _work_one(run_id: str) -> bool:
             meta["status"] = "done"
             meta["finished"] = time.time()
             _write_json(d / "meta.json", meta)
+        if meta.get("calibration"):
+            _calibration_done(d, meta)
         return False
     code = pending[0]
     t0 = time.time()
@@ -200,6 +202,12 @@ def _work_one(run_id: str) -> bool:
                         if inputs.bust_hint and not meta.get("reordered_for_bust"):
                             _write_json(d / "order.json", lab.run_order(fams, bust=True))
                             meta["reordered_for_bust"] = True
+                        # settings this photo never builds (layer rescue on a person): left out, not built to fail
+                        now = _read_json(d / "order.json", [])
+                        kept = [c for c in now if not lab.refused(c, inputs.animal_frac)]
+                        if len(kept) != len(now):
+                            _write_json(d / "order.json", kept)
+                            meta["refused_left_out"] = len(now) - len(kept)
                         _write_json(d / "meta.json", meta)
                     return True
                 inputs = _inputs(run_id, d)
@@ -228,11 +236,27 @@ def _work_one(run_id: str) -> bool:
         except Exception as exc:  # noqa: BLE001 - one bad combination mustn't stop the run
             row.update(status="fail", error=f"{type(exc).__name__}: {str(exc)[:200]}")
     row["seconds"] = round(time.time() - t0, 1)
+    row["commit"] = ledger.machine()
     with _state_lock:
         with open(d / "results.jsonl", "a") as f:
             f.write(json.dumps(row) + "\n")
+    _ledger_row(d, meta, row)
     jobs.clear()
     return True
+
+
+def _ledger_row(d: Path, meta: dict, row: dict) -> None:
+    """The build as one change in the ledger (failed builds too: their
+    error is the noise channel)."""
+    try:
+        sha = meta.get("photo_sha") or ledger.photo_sha(d / meta["photo_file"])
+        h = ledger.held()
+        r = ledger.make_row("lab", ledger.next_counter(), row["code"], sha, row if row.get("status") == "ok" else {},
+                            run_id=d.name, status=row.get("status"), error=row.get("error"),
+                            held=bool(h) and h.get("photo") == sha and row["code"] in set(h.get("codes") or []))
+        ledger.append(r)
+    except Exception as exc:  # noqa: BLE001 - the reading never stops a build
+        print(f"Ledger: {row.get('code')}: {exc}")
 
 
 def _release_memory() -> None:
@@ -285,13 +309,283 @@ def _run_job(kind: str, arg: str) -> None:
     _lab_bytes["total"] = None  # (what it stored, counted again)
 
 
+# ---------------------------------------------------------------- the ledger: held job, calibration, app renders
+
+
+def _run_dirs() -> "list[tuple[Path, dict]]":
+    out = []
+    for d in LAB_ROOT.iterdir():
+        meta = _read_json(d / "meta.json", None) if d.is_dir() else None
+        if meta:
+            out.append((d, meta))
+    return sorted(out, key=lambda dm: dm[1].get("created", 0))
+
+
+def _sha(d: Path, meta: dict) -> Optional[str]:
+    if meta.get("photo_sha"):
+        return meta["photo_sha"]
+    try:
+        return ledger.photo_sha(d / meta["photo_file"])
+    except (OSError, KeyError):
+        return None
+
+
+def _held_setup() -> None:
+    """Once: the Lab's earlier builds into the ledger, and the held job (the
+    photo with the most builds on the volume, its first HELD_N settings)."""
+    if not (ledger.root() / "backfilled").exists():
+        runs = []
+        for d, meta in _run_dirs():
+            sha = _sha(d, meta)
+            if sha:
+                runs.append((dict(meta, run_id=d.name), list(_results(d).values()), sha))
+        n = ledger.backfill(runs)
+        (ledger.root() / "backfilled").write_text(str(n))
+        print(f"Ledger: {n} earlier builds read in.")
+    if not ledger.held():
+        best = max(_run_dirs(), key=lambda dm: len(_results(dm[0])), default=None)
+        if best is None:
+            return
+        # the photo with the most builds; its settings from its latest run (every family it has now)
+        sha = _sha(*best)
+        d, meta = [dm for dm in _run_dirs() if _sha(*dm) == sha and not dm[1].get("calibration")][-1]
+        fams = meta.get("families", ["O"])
+        animal = 0.0 if "B" in fams else 1.0  # (a body was posed on it: a person)
+        try:
+            animal = pickle.loads((d / f"inputs_{_INPUTS_READING}.pkl").read_bytes()).animal_frac
+        except Exception:  # noqa: BLE001
+            pass
+        order = [c for c in _read_json(d / "order.json", []) if c.split("-")[0] in fams and not lab.refused(c, animal)]
+        ledger.set_held(_sha(d, meta), order[:ledger.HELD_N])
+        print(f"Ledger: held job set from run {d.name}.")
+
+
+def _ensure_calibration() -> None:
+    """Every new commit builds the held job first: a run of the held photo
+    with only the held settings, ahead of whatever run was going (it goes on
+    after). Its window is what the push guard reads."""
+    _held_setup()
+    h = ledger.held()
+    c = ledger.machine()
+    if not h or c.startswith("unknown"):
+        return
+    src = None
+    for d, meta in _run_dirs():
+        if meta.get("calibration") and meta.get("commit") == c:
+            return
+        if _sha(d, meta) == h["photo"]:
+            src = (d, meta)
+    if src is None:
+        return
+    sd, smeta = src
+    run_id = uuid.uuid4().hex[:12]
+    d = LAB_ROOT / run_id
+    d.mkdir(parents=True)
+    shutil.copy(sd / smeta["photo_file"], d / smeta["photo_file"])
+    for p in sd.glob("inputs_*.pkl"):
+        shutil.copy(p, d / p.name)
+    now = time.time()
+    with _state_lock:
+        resume = None
+        for od, om in _run_dirs():
+            if om.get("status") == "running":
+                resume = od.name
+                om["status"] = "paused"
+                _write_json(od / "meta.json", om)
+        _write_json(d / "order.json", list(h["codes"]))
+        _write_json(d / "meta.json", {
+            "run_id": run_id, "photo_name": f"held job · {c}", "photo_file": smeta["photo_file"], "created": now, "started": now,
+            "status": "running", "families": smeta.get("families", ["O"]), "families_checked": True,
+            "calibration": True, "commit": c, "photo_sha": h["photo"], "resume": resume,
+        })
+    print(f"Ledger: held job for {c} started (run {run_id}); then run {resume} goes on.")
+
+
+def _calibration_done(d: Path, meta: dict) -> None:
+    try:
+        g = ledger.guard(meta["commit"])
+        h = ledger.held()
+        current = next((x for x in h.get("codes", []) if x.startswith("O-")), lab.CODE_PRODUCTION)
+        p = ledger.choose(meta["commit"], current)
+        print(f"Ledger: guard for {meta['commit']}: {'passed' if g['passed'] else 'failed'}; pick {p.get('code')} ({p.get('why')}).")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Ledger: guard error: {exc}")
+    r = meta.get("resume")
+    if r and (LAB_ROOT / r / "meta.json").exists():
+        with _state_lock:
+            m = _read_json(LAB_ROOT / r / "meta.json", {})
+            if m.get("status") == "paused":
+                m["status"] = "running"
+                m["started"] = time.time()
+                _write_json(LAB_ROOT / r / "meta.json", m)
+
+
+def _pending_measures() -> "list[str]":
+    p = ledger.root() / "pending"
+    if not p.is_dir():
+        return []
+    return sorted((x.name for x in p.iterdir() if (x / "meta.json").exists()), key=lambda n: (p / n / "meta.json").stat().st_mtime)
+
+
+def measure_one(job_id: str) -> None:
+    """An app render, measured as the Lab measures its builds, into the
+    ledger. Runs in the worker's own process, after the model was handed
+    over (the reading costs the render nothing)."""
+    import trimesh
+
+    from anatomy3d.mesh_types import BodyMesh
+
+    p = ledger.root() / "pending" / job_id
+    meta = _read_json(p / "meta.json", None)
+    if meta is None:
+        return
+    key = f"measure:{job_id}"
+    why = jobs.stopped(key)
+    if why:
+        # (it took its process down before: recorded, not tried again)
+        ledger.append({"source": "app", "counter": meta.get("counter"), "job_id": job_id, "at": meta.get("at"), "commit": ledger.machine(),
+                       "code": meta.get("code"), "status": "unmeasured", "error": f"stopped: {why}", "R": {}})
+        shutil.rmtree(p, ignore_errors=True)
+        return
+    jobs.mark(key)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            inputs = lab.prepare_inputs(str(p / meta["photo"]))
+            m = trimesh.load(str(p / meta["model"]), force="mesh", process=False)
+            h = float(m.vertices[:, 1].max() - m.vertices[:, 1].min())
+            V = m.vertices * (lab.HEIGHT_MM / h) if h > 0 else m.vertices
+            t0 = time.time()
+            metrics, _, _ = lab.score(meta.get("code") or lab.CODE_PRODUCTION, BodyMesh(vertices=V, faces=m.faces), inputs)
+        row = ledger.make_row("app", meta["counter"], meta.get("code") or f"app:{meta.get('method')}", ledger.photo_sha(p / meta["photo"]),
+                              metrics, job_id=job_id, method=meta.get("method"), tweaks=meta.get("tweaks"),
+                              height_mm=meta.get("height_mm"), at_size=meta.get("at_size"), pick=meta.get("pick"),
+                              render_seconds=meta.get("render_seconds"), measure_seconds=round(time.time() - t0, 1))
+        row["at"] = meta.get("at", row["at"])
+        # the wall as the print is made (the export's own measure at the asked height), not at the Lab's 150 mm
+        w = (meta.get("at_size") or {}).get("wall_mm")
+        if w is not None:
+            row["R"]["wall"] = float(w)
+        if (meta.get("at_size") or {}).get("watertight") is not None:
+            row["R"]["sealed"] = 1.0 if meta["at_size"]["watertight"] else 0.0
+        ledger.append(row)
+    except Exception as exc:  # noqa: BLE001
+        ledger.append({"source": "app", "counter": meta.get("counter"), "job_id": job_id, "at": meta.get("at"), "commit": ledger.machine(),
+                       "code": meta.get("code"), "status": "unmeasured", "error": f"{type(exc).__name__}: {str(exc)[:200]}", "R": {}})
+    finally:
+        shutil.rmtree(p, ignore_errors=True)
+        jobs.clear()
+
+
+def production_like(code: str) -> bool:
+    """True when the code is the app's own production build (option 0
+    everywhere, but for the outline's "below the photo", which follows the
+    photo) -- the app builds that with its own pipeline."""
+    try:
+        fam, idx = lab.decode(code)
+    except ValueError:
+        return False
+    legs = [d[0] for d in lab.FAMILIES[fam]["dims"]].index("legs") if fam == "O" else -1
+    return fam in ("O", "C") and all(i == 0 for k, i in enumerate(idx) if k != legs)
+
+
+def build_pick(job_dir: str) -> int:
+    """An app render built with the production pick (lab.build), written as
+    the app writes its own (model.obj, model.glb, model.stl at the asked
+    height). Runs in a process of its own. 0 when it built."""
+    from anatomy3d.mesh_export import export_glb, export_obj, to_trimesh
+    from anatomy3d.mesh_types import BodyMesh
+    from anatomy3d.print_prep import export_stl
+
+    jd = Path(job_dir)
+    req = _read_json(jd / "pick_request.json", None)
+    if req is None:
+        return 3
+    said = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(said):
+            inputs = lab.prepare_inputs(req["photo"])
+            code = req["code"]
+            fam, idx = lab.decode(code)
+            if fam == "O":
+                # "below the photo" follows this photo, not the held one
+                legs = [d[0] for d in lab.FAMILIES["O"]["dims"]].index("legs")
+                idx = list(idx)
+                idx[legs] = 1 if inputs.bust_hint else 0
+                code = lab.encode("O", tuple(idx))
+            why = lab.refused(code, inputs.animal_frac)
+            if why:
+                raise RuntimeError(why)
+            body = lab.build(code, inputs)
+            s = float(req["height_mm"]) / lab.HEIGHT_MM
+            out = BodyMesh(vertices=body.vertices * s, faces=body.faces, colors=getattr(body, "colors", None))
+            export_obj(out, str(jd / "model.obj"))
+            export_glb(out, str(jd / "model.glb"))
+            export_stl(to_trimesh(out), str(jd / "model.stl"), target_faces=20000)
+        lines = [x for x in said.getvalue().splitlines() if x.strip() and ("Wall" in x or "Warning" in x or "watertight" in x)]
+        _write_json(jd / "pick_done.json", {"code": code, "messages": lines})
+        return 0
+    except Exception as exc:  # noqa: BLE001 - the app falls back to its own build
+        _write_json(jd / "pick_done.json", {"error": f"{type(exc).__name__}: {str(exc)[:300]}"})
+        return 1
+
+
+@router.get("/ledger")
+def ledger_summary():
+    """What the ledger holds and what it decided: the held job, the latest
+    guard, the production pick, and the counts."""
+    rs = ledger.rows()
+    guards = sorted(ledger.root().glob("guard_*.json"), key=lambda q: q.stat().st_mtime)
+    h = ledger.held()
+    return {
+        "rows": len(rs), "app_renders": sum(1 for r in rs if r.get("source") == "app"),
+        "lab_builds": sum(1 for r in rs if r.get("source") == "lab"), "ratings": sum(1 for r in rs if r.get("source") == "rating"),
+        "held": {"photo": h.get("photo"), "settings": len(h.get("codes") or [])},
+        "guard": _read_json(guards[-1], None) if guards else None,
+        "pick": ledger.pick(), "commit": ledger.commit(), "machine": ledger.machine(), "pending_measures": len(_pending_measures()),
+    }
+
+
+@router.get("/ledger/reading")
+def ledger_reading(q: str, family: str = "O"):
+    """The plugin's reading of one quantity over the held job, a window per commit."""
+    if q not in ledger.QUANTITIES or family not in lab.FAMILIES:
+        raise HTTPException(404, "Unknown quantity or family.")
+    got, ref = ledger.read_held(q, family)
+    if got is None:
+        return {"q": q, "family": family, "reading": None, "why": ref}
+    return {"q": q, "family": family, "reading": got, "reference": ref}
+
+
+@router.get("/ledger/guard/{commit}")
+def ledger_guard(commit: str):
+    g = _read_json(ledger.root() / f"guard_{commit.replace(':', '_')}.json", None)
+    if g is None:
+        raise HTTPException(404, "No guard for this commit yet.")
+    return g
+
+
 def _worker_loop() -> None:
     turn = 0
+    try:
+        _ensure_calibration()
+    except Exception as exc:  # noqa: BLE001 - the Lab goes on without it
+        print(f"Ledger: calibration not started: {exc}")
+    last_machine = ledger.machine()
     while True:
         run_id = None
         try:
             turn += 1
             housekeeping()
+            if turn % 20 == 0 and ledger.machine() != last_machine:
+                # tuned values changed (the Study's autopilot): a new machine, so the held job again
+                last_machine = ledger.machine()
+                _ensure_calibration()
+            pend = _pending_measures()
+            if pend:
+                # an app render's reading first: it's one build's worth, and the person may rate it
+                _run_job("measure", pend[0])
+                time.sleep(0.3)
+                continue
             sid = study_api.active()
             if sid is None and study_api.autopilot_step(_generation_lock):
                 _release_memory()
@@ -371,6 +665,7 @@ async def create_run(image: UploadFile = File(...)):
         _write_json(d / "meta.json", {
             "run_id": run_id, "photo_name": image.filename or "photo", "photo_file": f"photo{suffix}",
             "created": now, "started": now, "status": "running", "families": ["C", "O", "B"],
+            "commit": ledger.machine(), "photo_sha": ledger.photo_sha(d / f"photo{suffix}"),
         })
     return {"run_id": run_id}
 
@@ -492,6 +787,8 @@ def rate(run_id: str, rating: Rating):
         else:
             ratings[rating.code] = {"stars": max(0, min(5, rating.stars)), "note": rating.note[:500], "at": time.time()}
         _write_json(d / "ratings.json", ratings)
+    if rating.stars > 0:
+        ledger.rate("lab", run_id, rating.code, max(1, min(5, rating.stars)), rating.note)
     return {"ok": True, "rated": len(ratings)}
 
 
