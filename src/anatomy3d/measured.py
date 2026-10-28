@@ -635,6 +635,10 @@ _ARM_TURN_COST = 0.05  # photo px per degree of turn
 _COLLIDE_GRID = 0.0015  # m: the torso's depth grid
 _COLLIDE_GAP = 0.004  # m: an arm kept at least this far in front of the torso's surface (a sleeve and a shirt between them)
 _COLLIDE_STEPS = (1.0, 5.0, 20.0, 60.0)  # the inside weight, per px of each point inside, raised in these steps
+_HAND_POINTS = ("finger2-1", "finger2-2", "finger5-1", "finger5-2", "finger1-3")  # knuckles and fingers that rest on what the hand holds
+_FINGER_R = 0.01  # m: a finger's half thickness
+_ALONG = np.linspace(0.0, 1.0, 9)  # places along a forearm, elbow (0) to wrist (1)
+_WRIST_TURN_MAX = 1.57  # rad: a wrist's turn from the body's fit, at most (a wrist bends up to about 80 degrees each way)
 _ARM_REST_MAX = 0.025  # m: crossed forearms rest on what's behind them, the jacket and shirt between: at most this gap beyond _COLLIDE_GAP
 _REST_W = 3.0  # the resting gap's weight, per photo px past it
 _CURL_RANGE = (-1.0, 2.0)  # the fingers' curl: from straight (x0) to three times the resting bend (x3)
@@ -647,6 +651,20 @@ _ARM_DEPTH_W = 0.5  # a forearm's depth target (from the body: on the torso, or 
 _ARM_HIDDEN_W = 0.2  # a pose point where the photo shows clothes or nothing (a guess at a hidden hand)
 _ARM_ELBOW_W = 0.7  # the reader's elbow (matched to the sleeve's outside corner; the sleeve's thickness a guess)
 _SLEEVE = 0.012  # m: a jacket sleeve and shirt over the elbow
+
+
+def _rotvec(R) -> np.ndarray:
+    """A turn matrix as its axis times angle."""
+    c = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+    th = float(np.arccos(c))
+    if th < 1e-9:
+        return np.zeros(3)
+    v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    if th > np.pi - 1e-4:
+        # (half a turn: the axis from the matrix's own column)
+        w, U = np.linalg.eigh((R + R.T) / 2.0)
+        return U[:, np.argmax(w)] * th
+    return v / (2.0 * np.sin(th)) * th
 
 
 def _solid_field(V, F, g: float, vg: float, pad: float = 0.03):
@@ -818,10 +836,13 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
         pts = np.concatenate([a_["fa"], a_["hd"]])[::2]  # (the upper arm meets the torso at the shoulder: not tested)
         cw = [0.0]
 
+        R_in = {i: br._rotmats(rv_in[i][None])[0] for i in rows}
+
         def turned(x):
+            # each change a real turn after the fit's own (in the parent's frame): x degrees is x degrees
             r = rv_in.copy()
             for k, i in enumerate(rows):
-                r[i] = rv_in[i] + x[3 * k:3 * k + 3]
+                r[i] = _rotvec(br._rotmats(x[3 * k:3 * k + 3][None])[0] @ R_in[i])
             for i in a_["fing"]:
                 r[i] = rv_in[i] * (1.0 + x[nt])
             for i in a_["thumb"]:
@@ -843,15 +864,19 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
             ins = [np.maximum(_COLLIDE_GAP - f(Q), 0.0) * s * cw[0] for f in solids]
             extra = []
             if rest:
-                # resting on what's behind it (the torso, or the forearm under it)
-                Qr = Qf[at[a_["fa"][::2]]]
-                d = np.min([f(Qr) for f in rest], axis=0)
-                near_ = np.sort(d)[: max(len(d) // 10, 1)]
-                extra.append(_REST_W * max(float(np.mean(near_)) - _COLLIDE_GAP - _ARM_REST_MAX, 0.0) * s)
-            return np.concatenate([out, *ins, extra, _ARM_TURN_COST * np.degrees(x[:nt]) * np.sqrt(len(a_["tgt"])),
+                # resting on what's behind it (the torso, or the forearm under it), all along
+                # its length: elbow to wrist, each place's surface within the clothes' allowance
+                e_, w_ = pw[J(f"lowerarm01.{a_['sd']}")], pw[J(f"wrist.{a_['sd']}")]
+                A = e_ + _ALONG[:, None] * (w_ - e_)
+                rr = a_["r_e"] + _ALONG * (a_["r_w"] - a_["r_e"])
+                d = np.min([f(A) for f in rest], axis=0) - rr
+                extra.append(_REST_W * np.maximum(d - _COLLIDE_GAP - _ARM_REST_MAX, 0.0) * s)
+            return np.concatenate([out, *ins, *extra, _ARM_TURN_COST * np.degrees(x[:nt]) * np.sqrt(len(a_["tgt"])),
                                    _CURL_COST * x[nt:] * np.sqrt(len(a_["tgt"]))])
 
-        bnd = np.repeat(bound if bound is not None else [_ARM_TURN_MAX] * len(rows), 3)
+        if bound is None:
+            bound = [_WRIST_TURN_MAX if i == a_["rows"]["wrist"] else _ARM_TURN_MAX for i in rows]
+        bnd = np.repeat(bound, 3)
         lo = np.r_[-bnd, _CURL_RANGE[0], _CURL_RANGE[0]]
         hi_ = np.r_[bnd, _CURL_RANGE[1], _CURL_RANGE[1]]
         best = None
@@ -869,6 +894,8 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
                 if best is None or sol.cost < best.cost:
                     best = sol
         sol = best
+        _DEBUG.setdefault("arm_x", []).append((a_["side"], len(rows), np.round(np.degrees(sol.x[:nt]), 1).tolist(),
+                                               np.round(sol.x[nt:], 2).tolist(), round(float(sol.cost), 1)))
         return turned(sol.x), sol.x[:nt], sol.x[nt:]
 
     # each forearm's depth from the body: behind, on the torso; in front, on the arm behind
@@ -893,6 +920,16 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
     rows = [a_["rows"][b] for b in ("upperarm01", "lowerarm01", "wrist")]
     rv, tx, cx_ = fit(a_, rows, [torso], rv, depth_for(a_, [torso]), rest=[torso], starts=(0.3, 1.2))
     turns[a_["sd"]] = (tx, cx_)
+
+    def axis_gap(a_, rv_, solids_):
+        Rw_, pw_ = br._bone_transforms(body, bone_ids, rv_)
+        e, w = pw_[J(f"lowerarm01.{a_['sd']}")], pw_[J(f"wrist.{a_['sd']}")]
+        tt = np.linspace(0, 1, 9)[:, None]
+        A = e + tt * (w - e)
+        d = np.min([f(A) for f in solids_], axis=0) * 1000.0
+        return np.round(d).astype(int).tolist()
+
+    _DEBUG["axis_gap_back"] = axis_gap(a_, rv, [torso])
     if len(sides) == 2:
         b_ = sides[1]
         Rw, pw = br._bone_transforms(body, bone_ids, rv)
@@ -902,6 +939,7 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
         rv, tx, cx_ = fit(b_, rows, [torso, back_fore], rv, depth_for(b_, [torso, back_fore]), rest=[torso, back_fore],
                           starts=(0.3, 1.2))
         turns[b_["sd"]] = (tx, cx_)
+        _DEBUG["axis_gap_front"] = axis_gap(b_, rv, [torso, back_fore])
         # the hand behind, again: on top of the front arm where the photo shows it, out of it everywhere
         Rw, pw = br._bone_transforms(body, bone_ids, rv)
         Vb = br._skin(body, Rw, pw)
@@ -919,6 +957,7 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
                            rest=[torso], starts=(0.0,), swings=_HAND_STARTS)
         turns[a_["sd"]] = (turns[a_["sd"]][0], turns[a_["sd"]][1] + cx2)
 
+
     # checked on the meshes themselves: each arm against the torso and the other arm, as solids
     Rw, pw = br._bone_transforms(body, bone_ids, rv)
     Vall = br._skin(body, Rw, pw)
@@ -932,19 +971,28 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
             if b_ is not a_:
                 thr = np.maximum(thr, np.maximum(-fields[b_["sd"]](Qa), 0.0))
         tx, cx_ = turns[sd]
-        chk.add("4 posed", f"{side} arm turns from the body's fit (largest)", float(np.degrees(np.abs(tx).max())),
+        chk.add("4 posed", f"{side} upper arm and forearm turns from the body's fit (largest)", float(np.degrees(np.abs(tx[:6]).max())),
                 hi=np.degrees(_ARM_TURN_MAX) - 0.1, unit=" degrees")
+        chk.add("4 posed", f"{side} wrist turn from the body's fit", float(np.degrees(np.linalg.norm(tx[6:9]))),
+                hi=np.degrees(_WRIST_TURN_MAX) - 0.1, unit=" degrees")
         chk.add("4 posed", f"{side} fingers' curl, thumb's curl (x the resting hand's)", float(1.0 + cx_[0]),
                 unit=f" ; thumb {1.0 + cx_[1]:.2f}")
         chk.add("4 posed", f"{side} forearm and hand through the skin of the body or the other arm, deeper than the field's "
                 f"{vg * 1000:.0f} mm cell (share of their points)", float((thr > vg).mean()), hi=0.0)
         chk.add("4 posed", f"{side} forearm and hand: deepest point through the skin", float(thr.max()) * 1000.0, unit=" mm")
         under = [torso] + [_solid_field(Vall, Fb[np.isin(Fb, o_["fa"]).all(axis=1)], g, vg) for o_ in sides if o_ is not a_ and a_["front"]]
-        d = np.min([f(Vall[a_["fa"]]) for f in under], axis=0)
+        e_, w_ = pw[J(f"lowerarm01.{sd}")], pw[J(f"wrist.{sd}")]
+        A = e_ + _ALONG[:, None] * (w_ - e_)
+        gap_ = np.min([f(A) for f in under], axis=0) - (a_["r_e"] + _ALONG * (a_["r_w"] - a_["r_e"]))
         chk.add("4 posed", f"{side} forearm resting on {'the forearm under it or the torso' if a_['front'] else 'the torso'}"
-                ": gap (nearest tenth of its points)", float(np.mean(np.sort(d)[: max(len(d) // 10, 1)])) * 1000.0,
-                hi=(_COLLIDE_GAP + _ARM_REST_MAX) * 1000.0 + 2.0, unit=" mm")
+                ": largest gap along it, elbow to wrist", float(gap_.max()) * 1000.0,
+                hi=(_COLLIDE_GAP + _ARM_REST_MAX) * 1000.0 + 2.0, unit=f" mm (elbow..wrist {np.round(gap_ * 1000).astype(int).tolist()})")
         Qf = Vall[np.arange(len(Vall))]
+        others = [torso] + [_solid_field(Vall, Fb[np.isin(Fb, o_["arm"]).all(axis=1)], g, vg) for o_ in sides if o_ is not a_]
+        Hp = pw[[J(f"{b2}.{sd}") for b2 in _HAND_POINTS]]
+        hg = np.min([f(Hp) for f in others], axis=0) - _FINGER_R
+        chk.add("4 posed", f"{side} hand resting on what it holds: largest gap of its knuckles and fingers", float(hg.max()) * 1000.0,
+                hi=(_COLLIDE_GAP + _ARM_REST_MAX) * 1000.0 + 2.0, unit=f" mm ({np.round(hg * 1000).astype(int).tolist()})")
         for n, t, wt in a_["tgt"]:
             ki = kpn.index(n) if n.endswith(("wrist",)) else None
             if ki is not None:
