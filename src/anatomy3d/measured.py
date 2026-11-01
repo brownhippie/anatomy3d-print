@@ -1290,7 +1290,163 @@ def read_fingers(m, labels, wrist_xy, mm_px: float):
     return out
 
 
-def _region_checks(px, F, body: dict, labels, mask, chk: "Checks", mm_px: float, pose=None, box=None):
+# the clothes: how far each garment stands off the skin (m), and which photo labels are it
+_GARMENT_OF = {"suit": "jacket", "jacket": "jacket", "coat": "jacket", "sweater": "jacket", "hoodie": "jacket",
+               "lapel": "lapel", "shirt": "shirt", "tshirt": "shirt", "collar": "collar", "tie": "tie", "scarf": "tie"}
+_EASE = {"jacket": 0.010, "lapel": 0.013, "shirt": 0.002, "collar": 0.004, "tie": 0.006}
+_EASE_MAX = 0.06  # m: no garment stands further off the skin than this
+_CUFF = (0.006, 0.018)  # m from the wrist: skin below the first, shirt cuff to the second, jacket sleeve above
+_EASE_SMOOTH = 25  # neighbour averagings of the jacket's ease (no false steps)
+
+
+def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
+    """The clothes, read from the photo and put on the resting body: every
+    clothed skin point (torso, arms to the cuff, the neck up to the collar)
+    takes the garment the photo shows there (seen from the front: its label
+    at that spot; out of view: the garment around it, the jacket by
+    default), and stands off the skin by that garment's ease -- at the
+    sides by the gap between the body's outline and the photo's, row by
+    row. Smoothed (a jacket has no steps); its edges kept (lapels, collar,
+    cuffs, tie). Returns the dressed resting points and each point's
+    garment ("" for skin)."""
+    from scipy import ndimage
+
+    from .silhouette_relief import _raster_depth
+
+    s, cx, cy = cam
+    rd = (inputs.parts or {}).get("clothes") or {}
+    cl = rd.get("labels")
+    if cl is None:
+        return None, None
+    from .clothes import NAMES
+
+    cl = np.asarray(cl)
+    H, W = cl.shape
+    name_of = {i + 1: n for i, n in enumerate(NAMES)}
+    gar_px = np.full(cl.shape, "", dtype=object)
+    for i, n in name_of.items():
+        if n in _GARMENT_OF:
+            gar_px[cl == i] = _GARMENT_OF[n]
+    pn = body["part_names"]
+    PW = np.asarray(body["part_w"])
+    labels, J = body["labels"], body["joints"]
+    nv = len(V_posed)
+    px = np.column_stack([cx + s * V_posed[:, 0], cy - s * V_posed[:, 2], s * V_posed[:, 1]])
+    # where clothes can be: torso, arms (to the cuff), the neck's foot (the collar)
+    arm = sum(PW[:, pn.index(n)] for n in pn if n.startswith(("upperarm", "forearm")))
+    torso = PW[:, pn.index("torso")]
+    neck = PW[:, pn.index("neck")]
+    clothed = (torso + arm) > 0.5
+    # the cuffs: distance from each wrist joint (rest)
+    cuff = np.zeros(nv, dtype=object)
+    cuff[:] = ""
+    for sd in "LR":
+        fa = PW[:, pn.index(f"forearm.{sd}")] > 0.5
+        w = J[labels.index(f"wrist.{sd}")]
+        e = J[labels.index(f"lowerarm01.{sd}")]
+        ax = (w - e) / np.linalg.norm(w - e)
+        d = (w - body["verts"]) @ ax  # how far up the forearm from the wrist
+        cuff[fa & (d < _CUFF[0])] = "skin"
+        cuff[fa & (d >= _CUFF[0]) & (d < _CUFF[1])] = "shirt"
+    # the collar: the neck up to where the photo's collar/shirt reaches
+    cmask = np.isin(gar_px, ("collar", "shirt"))
+    collar_top = None
+    if cmask.any():
+        ys = np.nonzero(cmask)[0]
+        collar_top = float(np.percentile(ys, 2))
+    neck_band = (neck > 0.5) & (collar_top is not None) & (px[:, 1] >= (collar_top if collar_top is not None else 1e9))
+    # seen from the front: the label at each visible point
+    near, _ = _raster_depth(px[:, 0], px[:, 1], px[:, 2], F, (H, W))
+    xi = np.clip(np.round(px[:, 0]).astype(int), 0, W - 1)
+    yi = np.clip(np.round(px[:, 1]).astype(int), 0, H - 1)
+    vis = np.isfinite(near[yi, xi]) & (px[:, 2] <= near[yi, xi] + 1.5)
+    g = np.full(nv, "", dtype=object)
+    on = (clothed | neck_band) & vis
+    g[on] = gar_px[yi[on], xi[on]]
+    # out of view (or read as skin/nothing on a clothed point): the garment around it
+    want = clothed | neck_band
+    unknown = want & (g == "")
+    import scipy.sparse as sp
+
+    A = _smoother(F, nv)
+    kinds = ["jacket", "lapel", "shirt", "collar", "tie"]
+    for _ in range(40):
+        if not unknown.any():
+            break
+        votes = np.stack([A @ (g == k).astype(np.float64) for k in kinds], axis=1)
+        best = votes.argmax(axis=1)
+        take = unknown & (votes.max(axis=1) > 0)
+        g[take] = np.array(kinds, dtype=object)[best[take]]
+        unknown = want & (g == "")
+    g[unknown & clothed] = "jacket"
+    g[unknown & neck_band] = "collar"
+    # the back and the arms' undersides: a jacket (a seen V can't reach round the back)
+    back = want & ~vis & np.isin(g, ("shirt", "tie", "lapel")) & (torso > 0.5)
+    nrm_p = np.asarray(trimesh.Trimesh(V_posed, F, process=False).vertex_normals)
+    g[back & (nrm_p[:, 1] > 0.2)] = "jacket"
+    g[cuff == "shirt"] = "shirt"
+    g[cuff == "skin"] = ""
+    # how far off the skin: the jacket by the photo's outline at the sides
+    ease = np.zeros(nv)
+    for k in kinds:
+        ease[g == k] = _EASE[k]
+    person = np.asarray(inputs.photo_mask, dtype=bool)
+    model_sil = np.isfinite(near)
+    gap = np.zeros((H, 2))
+    for r in range(H):
+        pr, mr = np.flatnonzero(person[r]), np.flatnonzero(model_sil[r])
+        if len(pr) and len(mr):
+            gap[r, 0] = max(mr.min() - pr.min(), 0)  # photo's left side (the body's right)
+            gap[r, 1] = max(pr.max() - mr.max(), 0)
+    jk = np.isin(g, ("jacket", "lapel"))
+    side_w = np.clip((np.abs(nrm_p[:, 0]) - 0.2) / 0.6, 0.0, 1.0)
+    extra = np.where(nrm_p[:, 0] < 0, gap[yi, 0], gap[yi, 1]) / s * side_w
+    extra[~jk] = 0.0
+    smooth_e = ease.copy()
+    smooth_e[jk] = _EASE["jacket"] + extra[jk]
+    for _ in range(_EASE_SMOOTH):
+        nb = A @ smooth_e
+        smooth_e = np.where(jk, 0.5 * smooth_e + 0.5 * np.where(jk, nb, smooth_e), smooth_e)
+    ease = np.where(jk, smooth_e + np.where(g == "lapel", _EASE["lapel"] - _EASE["jacket"], 0.0), ease)
+    ease = np.clip(ease, 0.0, _EASE_MAX)
+    # on the resting body
+    Vr = body["verts"]
+    nr = np.asarray(trimesh.Trimesh(Vr, F, process=False).vertex_normals)
+    Vd = Vr + ease[:, None] * nr
+    for k in kinds:
+        sel = g == k
+        if sel.any():
+            chk.add("3 clothes", f"{k}: ease off the skin (median, largest)", float(np.median(ease[sel])) * 1000.0,
+                    unit=f" mm ({float(ease[sel].max()) * 1000:.0f} mm at most; {int(sel.sum())} points)")
+    if collar_top is not None:
+        chk.add("3 clothes", "collar's top, from the photo", collar_top, unit=" photo px row")
+    return Vd, g
+
+
+def _clothes_collisions(body: dict, V, s: float, chk: "Checks"):
+    """With the clothes on: each forearm and hand (sleeve and all) against the
+    dressed torso and the other dressed arm, as solids."""
+    pn = body["part_names"]
+    PW = np.asarray(body["part_w"])
+    F = np.asarray(body["faces"])
+    g, vg = _COLLIDE_GRID, _SDF_GRID
+    torso = _solid_field(V, F[(PW[F, pn.index("torso")] > 0.5).all(axis=1)], g, vg)
+    arms = {}
+    for sd in "LR":
+        sel = np.flatnonzero(sum(PW[:, pn.index(f"{p}.{sd}")] for p in ("upperarm", "forearm", "hand")) > 0.5)
+        arms[sd] = (sel, _solid_field(V, F[np.isin(F, sel).all(axis=1)], g, vg))
+    for sd, nm in (("L", "left"), ("R", "right")):
+        pts = np.flatnonzero(sum(PW[:, pn.index(f"{p}.{sd}")] for p in ("forearm", "hand")) > 0.5)
+        Q = V[pts]
+        d = np.maximum(-torso(Q), 0.0)
+        for o in "LR":
+            if o != sd:
+                d = np.maximum(d, np.maximum(-arms[o][1](Q), 0.0))
+        chk.add("3 clothes", f"{nm} sleeve and hand through the dressed body or the other sleeve, deeper than {vg * 1000:.0f} mm (share)",
+                float((d > vg).mean()), hi=0.0, unit=f" (deepest {d.max() * 1000:.0f} mm)")
+
+
+def _region_checks(px, F, body: dict, labels, mask, chk: "Checks", mm_px: float, pose=None, box=None, garment=None, cloth=None):
     """Every part against the photo's own region for it, in the photo's
     camera (what's in front decides what shows): how much of the photo's
     region the part covers, and how much of the part shows outside where it
@@ -1340,8 +1496,28 @@ def _region_checks(px, F, body: dict, labels, mask, chk: "Checks", mm_px: float,
         mine = np.isin(lab_sk, list(ids)) if ids else np.zeros_like(skin)
         rows.append((f"{nm} hand", hs, mine if mine.any() else None, mine | np.isin(labels, (ACCESSORY,))))
     body_parts = [pn.index(n) for n in pn if n.startswith(("torso", "upperarm", "forearm"))]
-    rows.append(("torso and arms (under the clothes)", shown(np.isin(fpart, body_parts)), None,
-                 person & np.isin(labels, (CLOTHES, BODY_SKIN, FACE_SKIN, ACCESSORY))))
+    if garment is not None and cloth is not None:
+        from .clothes import NAMES
+
+        cl = np.asarray(cloth)
+        gname = {i + 1: _GARMENT_OF.get(n, "") for i, n in enumerate(NAMES)}
+        gpx = np.vectorize(lambda v: gname.get(int(v), ""))(cl) if cl.size < 4_000_000 else None
+        fg = np.array(garment, dtype=object)[F[:, 0]]
+        for gk, nm in (("jacket", "jacket (and lapels)"), ("shirt", "shirt and collar"), ("tie", "tie")):
+            kinds = ("jacket", "lapel") if gk == "jacket" else (("shirt", "collar") if gk == "shirt" else ("tie",))
+            sel = np.isin(fg, kinds)
+            if not sel.any():
+                continue
+            want = np.isin(gpx, kinds)
+            # (a garment may show where another garment of the photo is: only not on skin, hair or nothing)
+            ok = person & np.isin(labels, (CLOTHES, ACCESSORY)) & known
+            rows.append((nm, shown(sel), want & known, ok))
+        bare = np.isin(fpart, body_parts) & (fg == "")
+        if bare.any():
+            rows.append(("bare torso and arms (should be under the clothes)", shown(bare), None, np.zeros_like(person)))
+    else:
+        rows.append(("torso and arms (under the clothes)", shown(np.isin(fpart, body_parts)), None,
+                     person & np.isin(labels, (CLOTHES, BODY_SKIN, FACE_SKIN, ACCESSORY))))
     _DEBUG["regions"] = {name: (sh_, want, ok) for name, sh_, want, ok in rows}
     for name, sh_, want, ok in rows:
         n_sh = int(sh_.sum())
@@ -1473,6 +1649,13 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
     rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), chk, (inputs.parts or {}).get("labels")))
     Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
     V = br._skin(body, Rw, pw)
+    # 3. the clothes, read from the photo and put on the resting body; posed again with the same skeleton
+    garment = None
+    Vd, garment = _dress(body, V, np.asarray(body["faces"], dtype=np.int64), (s, cx, cy), inputs, chk)
+    if Vd is not None:
+        body = dict(body, verts=Vd)
+        V = br._skin(body, Rw, pw)
+        _clothes_collisions(body, V, s, chk)
     Jp = pw  # each bone's joint, posed (m)
     # the pose checked in numbers: the body's points on the photo's
     K = kps(V)
@@ -1597,7 +1780,8 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
     # every part against the photo's own region for it
     if inputs.parts and inputs.parts.get("labels") is not None:
         _region_checks(px[:n_body], F[F.max(1) < n_body], body, np.asarray(inputs.parts["labels"]), inputs.photo_mask, chk, 1000.0 / s,
-                       pose=inputs.pose, box=inputs.parts.get("box"))
+                       pose=inputs.pose, box=inputs.parts.get("box"), garment=None if garment is None else garment[:n_body],
+                       cloth=(inputs.parts.get("clothes") or {}).get("labels"))
     # the teeth joined to the head: one solid
     from .silhouette_relief import _join_solids
 
