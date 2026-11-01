@@ -30,6 +30,16 @@ _CHK_JOINT_MISS = 0.08  # the body's shoulders, elbows, hips off the photo's, x 
 _CHK_HEAD = (0.9, 1.1)  # the head's breadth at the eyes over the face points' (cheek to cheek, x the head's own share)
 
 
+class _Prefixed:
+    """A Checks whose rows' names start with a prefix."""
+
+    def __init__(self, chk, pre: str):
+        self.chk, self.pre = chk, pre
+
+    def add(self, step, what, *a, **k):
+        self.chk.add(step, self.pre + what, *a, **k)
+
+
 class Checks:
     """Each step checked in numbers: what it made against what the photo
     measured, the human body, or a printable solid; with the range it
@@ -718,7 +728,7 @@ def _solid_field(V, F, g: float, vg: float, pad: float = 0.03):
     return sd
 
 
-def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels_px=None):
+def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels_px=None, settle: bool = False):
     """Each arm's turns (upper arm, forearm, wrist) and its hand's finger and
     thumb curl, set so the arm's points land on the photo's pose points (each
     degree costing _ARM_TURN_COST px, within _ARM_TURN_MAX of the body fit's)
@@ -1096,8 +1106,8 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
         d_ = pw0_[J(f"finger3-1.{sd}")] - pw0_[wi]
         ax_ = Rw0_[par[wi]].T @ (d_ / np.linalg.norm(d_))
         best = None
-        for ang in _SKIN_WRIST_STARTS:
-            for c0 in (0.0, -0.6):  # (fingers as they are, and straighter)
+        for ang in ((0.0,) if settle else _SKIN_WRIST_STARTS):
+            for c0 in ((0.0,) if settle else (0.0, -0.6)):  # (fingers as they are, and straighter)
                 x0 = np.zeros(18)
                 x0[6:9] = ax_ * ang
                 x0[9:13] = c0
@@ -1126,7 +1136,9 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
     turns = {}
     a_ = sides[0]
     rows = [a_["rows"][b] for b in ("upperarm01", "lowerarm01", "wrist")]
-    rv, tx, cx_ = fit(a_, rows, [torso], rv, depth_for(a_, [torso]), rest=[torso], starts=(0.3, 1.2))
+    st_ = (0.0,) if settle else (0.3, 1.2)
+    sw_ = (0.0,) if settle else None
+    rv, tx, cx_ = fit(a_, rows, [torso], rv, depth_for(a_, [torso]), rest=[torso], starts=st_, swings=sw_)
     turns[a_["sd"]] = (tx, cx_)
 
     def axis_gap(a_, rv_, solids_):
@@ -1145,7 +1157,7 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
         back_fore = _solid_field(Va, Fb[np.isin(Fb, a_["fa"]).all(axis=1)], g, vg)
         rows = [b_["rows"][b] for b in ("upperarm01", "lowerarm01", "wrist")]
         rv, tx, cx_ = fit(b_, rows, [torso, back_fore], rv, depth_for(b_, [torso, back_fore]), rest=[torso, back_fore],
-                          starts=(0.3, 1.2))
+                          starts=st_, swings=sw_)
         turns[b_["sd"]] = (tx, cx_)
         _DEBUG["axis_gap_front"] = axis_gap(b_, rv, [torso, back_fore])
         # the hand behind, again: on top of the front arm where the photo shows it, out of it everywhere
@@ -1162,7 +1174,7 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
                 if np.isfinite(f):
                     hd_depth.append((kind, f - _COLLIDE_GAP - r_h))
         rv, tx2, cx2 = fit(a_, [a_["rows"][b] for b in ("upperarm01", "lowerarm01", "wrist")], [torso, front_arm], rv, hd_depth,
-                           rest=[torso], starts=(0.0,), swings=_HAND_STARTS)
+                           rest=[torso], starts=(0.0,), swings=(0.0,) if settle else _HAND_STARTS)
         turns[a_["sd"]] = (turns[a_["sd"]][0], turns[a_["sd"]][1] + cx2)
 
     # last and first in weight: each hand on the photo's own visible hand skin
@@ -1175,6 +1187,8 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
                                    turns[h_["sd"]][1] + np.array([float(np.mean(info["x"][9:13])), info["x"][17]]))
 
 
+    if settle:
+        chk = _Prefixed(chk, "with clothes: ")
     # checked on the meshes themselves: each arm against the torso and the other arm, as solids
     Rw, pw = br._bone_transforms(body, bone_ids, rv)
     Vall = br._skin(body, Rw, pw)
@@ -1297,6 +1311,7 @@ _EASE = {"jacket": 0.010, "lapel": 0.013, "shirt": 0.002, "collar": 0.004, "tie"
 _EASE_MAX = 0.06  # m: no garment stands further off the skin than this
 _CUFF = (0.006, 0.018)  # m from the wrist: skin below the first, shirt cuff to the second, jacket sleeve above
 _EASE_SMOOTH = 25  # neighbour averagings of the jacket's ease (no false steps)
+_LABEL_SMOOTH = 4  # neighbour-majority passes over the garments' edges
 
 
 def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
@@ -1384,6 +1399,11 @@ def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
     back = want & ~vis & np.isin(g, ("shirt", "tie", "lapel")) & (torso > 0.5)
     nrm_p = np.asarray(trimesh.Trimesh(V_posed, F, process=False).vertex_normals)
     g[back & (nrm_p[:, 1] > 0.2)] = "jacket"
+    # the edges between garments smoothed: each point takes its neighbours' majority (a few times)
+    for _ in range(_LABEL_SMOOTH):
+        votes = np.stack([A @ (g == k).astype(np.float64) for k in kinds], axis=1)
+        maj = np.array(kinds, dtype=object)[votes.argmax(axis=1)]
+        g = np.where(want & (votes.max(axis=1) > 0.5), maj, g)
     g[cuff == "shirt"] = "shirt"
     g[cuff == "skin"] = ""
     # how far off the skin: the jacket by the photo's outline at the sides
@@ -1400,14 +1420,13 @@ def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
             gap[r, 1] = max(pr.max() - mr.max(), 0)
     jk = np.isin(g, ("jacket", "lapel"))
     side_w = np.clip((np.abs(nrm_p[:, 0]) - 0.2) / 0.6, 0.0, 1.0)
-    extra = np.where(nrm_p[:, 0] < 0, gap[yi, 0], gap[yi, 1]) / s * side_w
-    extra[~jk] = 0.0
-    smooth_e = ease.copy()
-    smooth_e[jk] = _EASE["jacket"] + extra[jk]
+    # the side gap of each point's row and side, smoothed over the jacket, then taken
+    # in proportion to how side-on the point is (the front lies near the shirt)
+    raw = np.where(nrm_p[:, 0] < 0, gap[yi, 0], gap[yi, 1]) / s
+    raw[~jk] = 0.0
     for _ in range(_EASE_SMOOTH):
-        nb = A @ smooth_e
-        smooth_e = np.where(jk, 0.5 * smooth_e + 0.5 * np.where(jk, nb, smooth_e), smooth_e)
-    ease = np.where(jk, smooth_e + np.where(g == "lapel", _EASE["lapel"] - _EASE["jacket"], 0.0), ease)
+        raw = np.where(jk, 0.5 * raw + 0.5 * (A @ raw), 0.0)
+    ease = np.where(jk, _EASE["jacket"] + raw * side_w + np.where(g == "lapel", _EASE["lapel"] - _EASE["jacket"], 0.0), ease)
     ease = np.clip(ease, 0.0, _EASE_MAX)
     # on the resting body
     Vr = body["verts"]
@@ -1654,7 +1673,12 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
     Vd, garment = _dress(body, V, np.asarray(body["faces"], dtype=np.int64), (s, cx, cy), inputs, chk)
     if Vd is not None:
         body = dict(body, verts=Vd)
+        _clothes_collisions(body, br._skin(body, Rw, pw), s, _Prefixed(chk, "before the arms are set again: "))
+        # the arms set again with the clothes on (sleeves against the jacket and each other)
+        rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), chk, (inputs.parts or {}).get("labels"), settle=True))
+        Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
         V = br._skin(body, Rw, pw)
+        Jp = pw
         _clothes_collisions(body, V, s, chk)
     Jp = pw  # each bone's joint, posed (m)
     # the pose checked in numbers: the body's points on the photo's
