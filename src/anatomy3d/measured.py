@@ -647,6 +647,7 @@ _COLLIDE_GAP = 0.004  # m: an arm kept at least this far in front of the torso's
 _COLLIDE_STEPS = (1.0, 5.0, 20.0, 60.0)  # the inside weight, per px of each point inside, raised in these steps
 _HAND_POINTS = ("finger2-1", "finger2-2", "finger5-1", "finger5-2", "finger1-3")  # knuckles and fingers that rest on what the hand holds
 _FINGER_R = 0.01  # m: a finger's half thickness
+_UPPER_ALONG = np.linspace(0.4, 1.0, 5)  # places along an upper arm, shoulder (0) to elbow (1), that rest on the body's side
 _ALONG = np.linspace(0.0, 1.0, 9)  # places along a forearm, elbow (0) to wrist (1)
 _WRIST_TURN_MAX = 1.57  # rad: a wrist's turn from the body's fit, at most (a wrist bends up to about 80 degrees each way)
 _ARM_REST_MAX = 0.025  # m: crossed forearms rest on what's behind them, the jacket and shirt between: at most this gap beyond _COLLIDE_GAP
@@ -800,6 +801,10 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
         dd = np.linalg.norm(body["verts"][fa] - (e_ + tt[:, None] * ax), axis=1)
         r_e = float(np.median(dd[tt < 0.25])) if (tt < 0.25).any() else float(np.median(dd))
         r_w = float(np.median(dd[tt > 0.75])) if (tt > 0.75).any() else float(np.median(dd))
+        s_r, e_r = body["joints"][J(f"upperarm01.{sd}")], body["joints"][J(f"lowerarm01.{sd}")]
+        axu = e_r - s_r
+        tu = np.clip((body["verts"][ua] - s_r) @ axu / (axu @ axu), 0, 1)
+        r_u = float(np.median(np.linalg.norm(body["verts"][ua] - (s_r + tu[:, None] * axu), axis=1)[tu > 0.4]))
         arm = np.concatenate([ua, fa, hd])
         # each finger's tip: its last bone's skin point furthest from that bone's joint
         tipv = {}
@@ -809,7 +814,7 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
             cand = np.flatnonzero(wk > 0.5)
             if len(cand):
                 tipv[k] = int(cand[np.argmax(np.linalg.norm(body["verts"][cand] - body["joints"][bi], axis=1))])
-        sides.append(dict(side=side, sd=sd, rows=rows, tgt=tgt, ua=ua, fa=fa, hd=hd, arm=arm, r_e=r_e, r_w=r_w, tipv=tipv,
+        sides.append(dict(side=side, sd=sd, rows=rows, tgt=tgt, ua=ua, fa=fa, hd=hd, arm=arm, r_e=r_e, r_w=r_w, tipv=tipv, r_u=r_u,
                           fing=[pos[J(f"finger{k}-{j}.{sd}")] for k in (2, 3, 4, 5) for j in (1, 2, 3) if J(f"finger{k}-{j}.{sd}") in pos],
                           thumb=[pos[J(f"finger1-2.{sd}")]] if J(f"finger1-2.{sd}") in pos else []))
     if not sides:
@@ -899,6 +904,12 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
             Q = Qf[at[pts]]
             ins = [np.maximum(_COLLIDE_GAP - f(Q), 0.0) * s * cw[0] for f in solids]
             extra = []
+            if rest is not None:
+                # the upper arm hangs against the body's side (the photo shows no gap between them)
+                s_, e2_ = pw[J(f"upperarm01.{a_['sd']}")], pw[J(f"lowerarm01.{a_['sd']}")]
+                Au = s_ + _UPPER_ALONG[:, None] * (e2_ - s_)
+                du = torso(Au) - a_["r_u"]
+                extra.append(_REST_W * np.maximum(du - _COLLIDE_GAP - _ARM_REST_MAX, 0.0) * s)
             if rest:
                 # resting on what's behind it (the torso, or the forearm under it), all along
                 # its length: elbow to wrist, each place's surface within the clothes' allowance
@@ -1187,8 +1198,6 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
                                    turns[h_["sd"]][1] + np.array([float(np.mean(info["x"][9:13])), info["x"][17]]))
 
 
-    if settle:
-        chk = _Prefixed(chk, "with clothes: ")
     # checked on the meshes themselves: each arm against the torso and the other arm, as solids
     Rw, pw = br._bone_transforms(body, bone_ids, rv)
     Vall = br._skin(body, Rw, pw)
@@ -1667,16 +1676,19 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
         ids, rvs = _finger_rest(body, side)
         bone_ids += ids
         rv += list(rvs)
-    # 3. the clothes, read from the photo (on the body as the fit posed it) and put on the resting body
+    # 3. the arms, bare: wrists, hands and fingers where the photo has them
     bare = body
-    Rw0, pw0 = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
+    rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), _Prefixed(chk, "bare: "), (inputs.parts or {}).get("labels")))
+    Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
+    # 4. the clothes, read from the photo on that pose (each bit of the outline goes to the part
+    # the camera sees there) and put on the resting body
     garment = None
-    Vd, garment = _dress(body, br._skin(body, Rw0, pw0), np.asarray(body["faces"], dtype=np.int64), (s, cx, cy), inputs, chk)
+    Vd, garment = _dress(body, br._skin(body, Rw, pw), np.asarray(body["faces"], dtype=np.int64), (s, cx, cy), inputs, chk)
     if Vd is not None:
         body = dict(body, verts=Vd)
-    # 4. the arms, dressed: wrists and hands where the photo has them, sleeves clear of the jacket and each other
-    rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), chk, (inputs.parts or {}).get("labels")))
-    Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
+        # 5. the arms settled with the clothes on (sleeves clear of the jacket and each other)
+        rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), chk, (inputs.parts or {}).get("labels"), settle=True))
+        Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
     V = br._skin(body, Rw, pw)
     if Vd is not None:
         _clothes_collisions(body, V, s, chk)
