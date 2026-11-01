@@ -644,6 +644,24 @@ _REST_W = 3.0  # the resting gap's weight, per photo px past it
 _CURL_RANGE = (-1.0, 2.0)  # the fingers' curl: from straight (x0) to three times the resting bend (x3)
 _CURL_COST = 2.0  # photo px per unit of curl change
 _ELBOW_STARTS = (-0.5, 0.0, 0.5)  # rad: the upper arm's starting swings about the body's left-right axis
+_FINGER_WIDTH = (9.0, 32.0)  # mm: a finger seen from above or the side (touching fingers read wider)
+_FINGER_FROM_WRIST = 70.0  # mm: a fingertip is at least this far from the wrist (curled; straight about 150 and more)
+_FINGER_SEEN = 11.0  # mm: how much of a finger must show to be read
+_FINGER_W = 2.0  # each visible fingertip, per photo px (with the skin: first of all)
+_FINGER_DIR_W = 30.0  # each visible finger's direction (photo px per unit of sin of the angle off)
+_SPREAD_MAX = 0.35  # rad: a finger's spread from its resting line, each way
+_CHK_FINGER_MM = 5.0  # mm: a visible fingertip off the photo's
+_CHK_FINGER_DEG = 15.0  # degrees: a visible finger's direction off the photo's
+_CHK_REGION_OUT = 0.05  # a part shown outside its own region in the photo, share of it shown
+_CHK_REGION_COVER = 0.9  # a part's own region in the photo, share of it the part covers
+_CHK_SKIN_MM = 3.0  # mm: the hand's miss of the photo's visible skin of it (median)
+_CHK_SKIN_SPILL = 0.1  # share of the hand's shown points off the photo's skin
+_SKIN_W = 3.0  # the photo's visible hand skin, per px: first of all (covered by the hand; the hand shown nowhere else)
+_SKIN_POINTS_W = 0.3  # the pose reader's hand points, while the skin decides
+_SKIN_SAMPLE = 300  # visible skin pixels the hand must cover
+_SKIN_HAND_PTS = 500  # the hand's points tested for showing outside the skin
+_SKIN_FORE_TURN = 0.3  # rad: the forearm's turn while the hand is set to its skin
+_SKIN_WRIST_STARTS = (0.0, 1.2, -1.2)  # rad: the hand's starting turns about its own length
 _HAND_STARTS = (-0.2, 0.0, 0.2)  # rad: the upper arm's starting swings, small, when a placed arm's hand is set again
 _ARM_SAMPLE = 400  # each arm's points tested against the other arm's capsules
 _SDF_GRID = 0.004  # m: the torso's distance field's cells
@@ -773,7 +791,15 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
         r_e = float(np.median(dd[tt < 0.25])) if (tt < 0.25).any() else float(np.median(dd))
         r_w = float(np.median(dd[tt > 0.75])) if (tt > 0.75).any() else float(np.median(dd))
         arm = np.concatenate([ua, fa, hd])
-        sides.append(dict(side=side, sd=sd, rows=rows, tgt=tgt, ua=ua, fa=fa, hd=hd, arm=arm, r_e=r_e, r_w=r_w,
+        # each finger's tip: its last bone's skin point furthest from that bone's joint
+        tipv = {}
+        for k in (1, 2, 3, 4, 5):
+            bi = J(f"finger{k}-3.{sd}")
+            wk = (body["skin_w"] * (body["skin_idx"] == bi)).sum(axis=1)
+            cand = np.flatnonzero(wk > 0.5)
+            if len(cand):
+                tipv[k] = int(cand[np.argmax(np.linalg.norm(body["verts"][cand] - body["joints"][bi], axis=1))])
+        sides.append(dict(side=side, sd=sd, rows=rows, tgt=tgt, ua=ua, fa=fa, hd=hd, arm=arm, r_e=r_e, r_w=r_w, tipv=tipv,
                           fing=[pos[J(f"finger{k}-{j}.{sd}")] for k in (2, 3, 4, 5) for j in (1, 2, 3) if J(f"finger{k}-{j}.{sd}") in pos],
                           thumb=[pos[J(f"finger1-2.{sd}")]] if J(f"finger1-2.{sd}") in pos else []))
     if not sides:
@@ -913,6 +939,188 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
                 out.append((nm_, f - _COLLIDE_GAP - r_))
         return out
 
+    from scipy import ndimage as _ndi
+    from scipy.spatial import cKDTree as _KD
+
+    H_, W_ = labels_px.shape if labels_px is not None else (0, 0)
+    sh_y = max(P[n][1] for n in ("left_shoulder", "right_shoulder") if n in P) if labels_px is not None else 0
+    skin_all = None
+    if labels_px is not None:
+        skin_all = (labels_px == BODY_SKIN) & (np.arange(H_)[:, None] > sh_y + 20)
+        lb_, _n = _ndi.label(skin_all)
+
+    def photo_hand(a_):
+        """The photo's visible skin of this hand: the skin patch (below the
+        shoulders) under its pose points, or the nearest one."""
+        pts = [P[f"{a_['side']}_{t}"][:2] for t in ("index", "thumb", "pinky", "wrist") if f"{a_['side']}_{t}" in P]
+        ids = set()
+        for x, y in pts:
+            xi, yi = int(np.clip(x, 0, W_ - 1)), int(np.clip(y, 0, H_ - 1))
+            if lb_[yi, xi] > 0:
+                ids.add(int(lb_[yi, xi]))
+        if not ids:
+            return None
+        m = np.isin(lb_, list(ids))
+        return m if m.sum() >= 30 else None
+
+    def skin_fit(a_, o_, rv_in):
+        """The hand's turn (forearm a little, wrist, fingers' and thumb's curl)
+        set first of all to the photo's own visible skin of it: every visible
+        pixel covered by the hand, and the hand shown nowhere else -- except
+        where the other arm hides it (in front of it, as the camera sees). The
+        pose points, the body and the other arm still count (less)."""
+        m = photo_hand(a_)
+        if m is None:
+            return rv_in, None
+        ys, xs = np.nonzero(m)
+        rs = np.random.default_rng(2)
+        pick = rs.choice(len(xs), min(_SKIN_SAMPLE, len(xs)), replace=False)
+        sk = np.column_stack([xs[pick], ys[pick]]).astype(np.float64) + 0.5
+        outside = _ndi.distance_transform_edt(~m)  # px to the skin, 0 on it
+        hd = a_["hd"][::max(len(a_["hd"]) // _SKIN_HAND_PTS, 1)]
+        # the other arm as the camera sees it: what it hides
+        occ_front = None
+        if o_ is not None:
+            Rw, pw = br._bone_transforms(body, bone_ids, rv_in)
+            Vo = br._skin(body, Rw, pw)
+            pxo = np.column_stack([cx + s * Vo[:, 0], cy - s * Vo[:, 2], s * Vo[:, 1]])
+            Fo = Fb[np.isin(Fb, o_["arm"]).all(axis=1)]
+            from .silhouette_relief import _raster_depth as _rd
+
+            occ_front, _ = _rd(pxo[:, 0], pxo[:, 1], pxo[:, 2], Fo, (H_, W_))
+        sd = a_["sd"]
+        rows = [a_["rows"]["upperarm01"], a_["rows"]["lowerarm01"], a_["rows"]["wrist"]]
+        base = br._bone_transforms(body, bone_ids, rv_in)
+        only = subtree([bone_ids[i] for i in rows])
+        R_in = {i: br._rotmats(rv_in[i][None])[0] for i in rows}
+        others = [torso] + ([o_["field_now"]] if o_ is not None and "field_now" in o_ else [])
+        if o_ is not None:
+            Vn = br._skin(body, *br._bone_transforms(body, bone_ids, rv_in))
+            others = [torso, _solid_field(Vn, Fb[np.isin(Fb, o_["arm"]).all(axis=1)], g, vg)]
+        pts_c = np.concatenate([a_["fa"], a_["hd"]])[::2]
+
+        # each finger its own curl and spread (about the palm's normal, at its knuckle)
+        Jr_ = body["joints"]
+        jn = lambda n: Jr_[J(f"{n}.{sd}")]  # noqa: E731
+        u_ = jn("finger3-1") - jn("wrist")
+        nrm_ = np.cross(u_, jn("finger2-1") - jn("finger5-1"))
+        nrm_ /= np.linalg.norm(nrm_)
+        fpos = {(k, j): pos[J(f"finger{k}-{j}.{sd}")] for k in (2, 3, 4, 5) for j in (1, 2, 3) if J(f"finger{k}-{j}.{sd}") in pos}
+
+        def turned(x):
+            r = rv_in.copy()
+            for k, i in enumerate(rows):
+                r[i] = _rotvec(br._rotmats(x[3 * k:3 * k + 3][None])[0] @ R_in[i])
+            for (k, j), i in fpos.items():
+                rr = rv_in[i] * (1.0 + x[9 + (k - 2)])
+                if j == 1:
+                    rr = _rotvec(br._rotmats((nrm_ * x[13 + (k - 2)])[None])[0] @ br._rotmats(rr[None])[0])
+                r[i] = rr
+            for i in a_["thumb"]:
+                r[i] = rv_in[i] * (1.0 + x[17])
+            return r
+
+        # the photo's fingers on this hand, and which of the model's they are (in order across the hand)
+        wr_ = P.get(f"{a_['side']}_wrist")
+        seen_f = read_fingers(m, labels_px, wr_, 1000.0 / s)
+        tipv = a_["tipv"]
+
+        def tips2d(Qf):
+            T = Qf[at[[tipv[k] for k in (2, 3, 4, 5)]]]
+            return np.column_stack([cx + s * T[:, 0], cy - s * T[:, 2]])
+
+        pairs = []
+        if seen_f:
+            Rw0p, pw0p = base
+            T0 = tips2d(skin_fast(Rw0p, pw0p))
+            k2 = np.column_stack([cx + s * pw0p[[J(f"finger{k}-1.{sd}") for k in (2, 5)], 0],
+                                  cy - s * pw0p[[J(f"finger{k}-1.{sd}") for k in (2, 5)], 2]])
+            ac = k2[0] - k2[1]  # index knuckle from the little finger's, as the camera sees it
+            ac /= max(np.linalg.norm(ac), 1e-9)
+            ph = sorted(seen_f, key=lambda f: -(f["tip"] @ ac))  # (the index side first)
+            nf = min(len(ph), 4)
+            best_w = min(range(0, 5 - nf), key=lambda o: sum(np.linalg.norm(T0[o + i] - ph[i]["tip"]) for i in range(nf)))
+            pairs = [(2 + best_w + i, ph[i]) for i in range(nf)]
+
+        def parts(x):
+            Rw, pw = br._bone_transforms(body, bone_ids, turned(x), base=base, only=only)
+            Qf = skin_fast(Rw, pw)
+            Hm = Qf[at[hd]]
+            h2 = np.column_stack([cx + s * Hm[:, 0], cy - s * Hm[:, 2]])
+            hz = s * Hm[:, 1]
+            # hidden: behind the other arm where the camera sees it
+            hid = np.zeros(len(h2), dtype=bool)
+            if occ_front is not None:
+                xi = np.clip(h2[:, 0].astype(int), 0, W_ - 1)
+                yi = np.clip(h2[:, 1].astype(int), 0, H_ - 1)
+                f = occ_front[yi, xi]
+                hid = np.isfinite(f) & (hz > f)
+            # cover: each visible skin pixel's nearest hand point (px)
+            cover = _KD(h2).query(sk)[0]
+            # spill: each shown hand point's distance outside the skin (px)
+            xi = np.clip(np.round(h2[:, 0]).astype(int), 0, W_ - 1)
+            yi = np.clip(np.round(h2[:, 1]).astype(int), 0, H_ - 1)
+            spill = np.where(hid, 0.0, outside[yi, xi])
+            return Rw, pw, Qf, cover, spill, hid
+
+        def miss(x):
+            Rw, pw, Qf, cover, spill, _h = parts(x)
+            out = []
+            for n, t, wt in a_["tgt"]:
+                q = where(n, Rw, pw, Qf, a_)
+                out += [_SKIN_POINTS_W * wt * (cx + s * q[0] - t[0]), _SKIN_POINTS_W * wt * (cy - s * q[2] - t[1])]
+            if pairs:
+                T = tips2d(Qf)
+                for k, f in pairs:
+                    t2 = T[k - 2]
+                    out += list(_FINGER_W * (t2 - f["tip"]))
+                    base_j = pw[J(f"finger{k}-2.{sd}")]
+                    b2 = np.array([cx + s * base_j[0], cy - s * base_j[2]])
+                    dm = t2 - b2
+                    dm /= max(np.linalg.norm(dm), 1e-9)
+                    out.append(_FINGER_DIR_W * float(dm[0] * f["dir"][1] - dm[1] * f["dir"][0]))
+                    out.append(_FINGER_DIR_W * max(0.0, -float(dm @ f["dir"])))  # (not pointing the other way)
+            Q = Qf[at[pts_c]]
+            ins = [np.maximum(_COLLIDE_GAP - f(Q), 0.0) * s * _COLLIDE_STEPS[-1] for f in others]
+            return np.concatenate([_SKIN_W * cover / np.sqrt(len(cover)), _SKIN_W * spill / np.sqrt(len(spill)), out, *ins,
+                                   _ARM_TURN_COST * np.degrees(x[:9]), _CURL_COST * x[9:13], _CURL_COST * x[13:17], _CURL_COST * x[17:]])
+
+        lo = np.r_[np.full(6, -_SKIN_FORE_TURN), np.full(3, -_WRIST_TURN_MAX), np.full(4, -1.0), np.full(4, -_SPREAD_MAX), -1.0]
+        hi_ = np.r_[np.full(6, _SKIN_FORE_TURN), np.full(3, _WRIST_TURN_MAX), np.full(4, _CURL_RANGE[1]), np.full(4, _SPREAD_MAX),
+                    _CURL_RANGE[1]]
+        from scipy.optimize import least_squares as _lsq
+
+        # starts: the hand turned about its own length (palm down, sideways, up, over)
+        Rw0_, pw0_ = base
+        wi = J(f"wrist.{sd}")
+        d_ = pw0_[J(f"finger3-1.{sd}")] - pw0_[wi]
+        ax_ = Rw0_[par[wi]].T @ (d_ / np.linalg.norm(d_))
+        best = None
+        for ang in _SKIN_WRIST_STARTS:
+            for c0 in (0.0, -0.6):  # (fingers as they are, and straighter)
+                x0 = np.zeros(18)
+                x0[6:9] = ax_ * ang
+                x0[9:13] = c0
+                x0[17] = c0
+                got = _lsq(miss, x0, bounds=(lo, hi_))
+                if best is None or got.cost < best.cost:
+                    best = got
+        _Rw, _pw, _Q, cover, spill, hid = parts(best.x)
+        info = {"x": best.x, "cover_px": float(np.median(cover)), "cover_far": float(np.percentile(cover, 90)),
+                "spill_share": float((spill > 1.5).mean()), "hidden_share": float(hid.mean()), "photo_px": int(m.sum()),
+                "fingers_seen": len(seen_f), "fingers": []}
+        if pairs:
+            T = tips2d(_Q)
+            names = {2: "index", 3: "middle", 4: "ring", 5: "little"}
+            for k, f in pairs:
+                t2 = T[k - 2]
+                bj = _pw[J(f"finger{k}-2.{sd}")]
+                dm = t2 - np.array([cx + s * bj[0], cy - s * bj[2]])
+                ang = float(np.degrees(np.arccos(np.clip(dm @ f["dir"] / max(np.linalg.norm(dm), 1e-9), -1, 1))))
+                info["fingers"].append((names[k], float(np.linalg.norm(t2 - f["tip"])) * 1000.0 / s, ang))
+        _DEBUG[f"skin_{sd}"] = info
+        return turned(best.x), info
+
     # where they cross the forearm in front lies on the one behind; each hand
     # the photo shows lies on what's under it (the other arm), a hidden one under it
     turns = {}
@@ -957,6 +1165,15 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
                            rest=[torso], starts=(0.0,), swings=_HAND_STARTS)
         turns[a_["sd"]] = (turns[a_["sd"]][0], turns[a_["sd"]][1] + cx2)
 
+    # last and first in weight: each hand on the photo's own visible hand skin
+    if labels_px is not None:
+        for h_ in sides:
+            o_ = [x for x in sides if x is not h_]
+            rv, info = skin_fit(h_, o_[0] if o_ else None, rv)
+            if info is not None:
+                turns[h_["sd"]] = (turns[h_["sd"]][0][:9] + info["x"][:9],
+                                   turns[h_["sd"]][1] + np.array([float(np.mean(info["x"][9:13])), info["x"][17]]))
+
 
     # checked on the meshes themselves: each arm against the torso and the other arm, as solids
     Rw, pw = br._bone_transforms(body, bone_ids, rv)
@@ -993,6 +1210,17 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
         hg = np.min([f(Hp) for f in others], axis=0) - _FINGER_R
         chk.add("4 posed", f"{side} hand resting on what it holds: largest gap of its knuckles and fingers", float(hg.max()) * 1000.0,
                 hi=(_COLLIDE_GAP + _ARM_REST_MAX) * 1000.0 + 2.0, unit=f" mm ({np.round(hg * 1000).astype(int).tolist()})")
+        sk_ = _DEBUG.get(f"skin_{sd}")
+        if sk_ is not None:
+            chk.add("4 posed", f"{side} hand covering the photo's visible skin of it (median miss; {sk_['photo_px']} px of skin)",
+                    sk_["cover_px"] * mmp, hi=_CHK_SKIN_MM, unit=f" mm (90th percentile {sk_['cover_far'] * mmp:.1f})")
+            if not sk_["fingers"]:
+                chk.add("4 posed", f"{side} hand: fingers the photo shows", 0.0, unit=" (none show: only the skin is matched)")
+            for fn, dmm, dang in sk_["fingers"]:
+                chk.add("4 posed", f"{side} {fn} fingertip off the photo's (seen)", dmm, hi=_CHK_FINGER_MM, unit=" mm")
+                chk.add("4 posed", f"{side} {fn} finger's direction off the photo's (seen)", dang, hi=_CHK_FINGER_DEG, unit=" degrees")
+            chk.add("4 posed", f"{side} hand shown where the photo shows no skin of it (share of its points, hidden ones aside)",
+                    sk_["spill_share"], hi=_CHK_SKIN_SPILL, unit=f" (hidden behind the other arm: {sk_['hidden_share']:.2f})")
         for n, t, wt in a_["tgt"]:
             ki = kpn.index(n) if n.endswith(("wrist",)) else None
             if ki is not None:
@@ -1004,6 +1232,131 @@ def _arms_to_photo(body: dict, bone_ids, rv, P: dict, cam, chk: "Checks", labels
             chk.add("4 posed", f"{n.replace('_', ' ')} off the photo's ({'seen' if shown else 'hidden or sleeve: weighed less'})", dmm,
                     hi=(_CHK_HAND_MM if shown else None), unit=" mm")
     return rv
+
+
+def read_fingers(m, labels, wrist_xy, mm_px: float):
+    """The fingers the photo shows on one hand's visible skin patch m: the
+    patch's centre line (at 4x), its branch ends; a finger is a branch end
+    that is finger-wide (_FINGER_WIDTH, mm) and points away from the wrist.
+    Each: its tip (photo px), its direction (unit, photo px axes) and width
+    (mm). [] when no finger shows (a fist, a tucked hand)."""
+    from PIL import Image
+    from scipy import ndimage
+    from skimage.morphology import skeletonize
+
+    H, W = m.shape
+    ys, xs = np.nonzero(m)
+    if len(xs) < 30:
+        return []
+    pad = 20
+    x0, y0 = max(xs.min() - pad, 0), max(ys.min() - pad, 0)
+    x1, y1 = min(xs.max() + pad, W), min(ys.max() + pad, H)
+    k = 4
+    sub = m[y0:y1, x0:x1]
+    mk = np.asarray(Image.fromarray(sub.astype(np.uint8) * 255).resize(((x1 - x0) * k, (y1 - y0) * k), Image.BILINEAR)) > 127
+    mk = ndimage.binary_opening(mk, iterations=2)
+    dt = ndimage.distance_transform_edt(mk)
+    sk = skeletonize(mk)
+    nb = ndimage.convolve(sk.astype(int), np.ones((3, 3), int), mode="constant") - 1
+    out = []
+    for y, x in np.argwhere(sk & (nb == 1)):
+        path, seen = [(y, x)], {(y, x)}
+        for _ in range(int(_FINGER_SEEN / mm_px * k)):
+            yy, xx = path[-1]
+            nxt = None
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    q = (yy + dy, xx + dx)
+                    if (dy or dx) and 0 <= q[0] < sk.shape[0] and 0 <= q[1] < sk.shape[1] and sk[q] and q not in seen:
+                        nxt = q
+            if nxt is None:
+                break
+            path.append(nxt)
+            seen.add(nxt)
+        if len(path) < 0.5 * _FINGER_SEEN / mm_px * k:
+            continue
+        pth = np.array(path)
+        width = 2.0 * float(np.median(dt[tuple(pth[len(pth) // 3:].T)])) / k * mm_px
+        tip = np.array([x0 + pth[0][1] / k, y0 + pth[0][0] / k])
+        d = (pth[0] - pth[-1])[::-1].astype(np.float64)
+        d /= max(np.linalg.norm(d), 1e-9)
+        if not (_FINGER_WIDTH[0] <= width <= _FINGER_WIDTH[1]):
+            continue
+        if wrist_xy is not None and (tip - np.asarray(wrist_xy[:2])) @ d <= 0:
+            continue  # (pointing back to the wrist: where the hand meets the sleeve)
+        if wrist_xy is not None and np.linalg.norm(tip - np.asarray(wrist_xy[:2])) * mm_px < _FINGER_FROM_WRIST:
+            continue  # (too near the wrist: skin by the cuff or a watch)
+        out.append({"tip": tip, "dir": d, "width_mm": width})
+    return out
+
+
+def _region_checks(px, F, body: dict, labels, mask, chk: "Checks", mm_px: float, pose=None, box=None):
+    """Every part against the photo's own region for it, in the photo's
+    camera (what's in front decides what shows): how much of the photo's
+    region the part covers, and how much of the part shows outside where it
+    may. From the photo's labels (head_parts: hair, body and face skin,
+    clothes, accessory)."""
+    from scipy import ndimage
+
+    from .head_parts import ACCESSORY, BACKGROUND, BODY_SKIN, CLOTHES, FACE_SKIN, GLASSES, HAIR, HAT, MASK
+    from .silhouette_relief import _raster_depth
+
+    H, W = labels.shape
+    pn = body["part_names"]
+    PW = np.asarray(body["part_w"])
+    EW = np.asarray(body["ear_w"]).reshape(len(PW), -1)
+    near, _ = _raster_depth(px[:, 0], px[:, 1], px[:, 2], F, (H, W))
+    # only where the photo's labels were read (their box): outside it a pixel's part is not known
+    known = np.zeros((H, W), dtype=bool)
+    bx0, by0, bx1, by1 = (int(v) for v in (box or (0, 0, W, H)))
+    known[max(by0, 0):min(by1, H), max(bx0, 0):min(bx1, W)] = True
+    fpart = np.argmax(PW[F].mean(axis=1), axis=1)
+    ear_f = EW[F].max(axis=2).mean(axis=1) > 0.5
+    person = np.asarray(mask, dtype=bool)
+    skin = labels == BODY_SKIN
+    lab_sk, _n = ndimage.label(skin)
+
+    def shown(sel):
+        n_, _ = _raster_depth(px[:, 0], px[:, 1], px[:, 2], F[sel], (H, W))
+        return np.isfinite(n_) & (n_ <= near + 1e-6) & known
+
+    rows = []
+    head = pn.index("head")
+    face_ok = np.isin(labels, (FACE_SKIN, HAIR, HAT, MASK, GLASSES))
+    sh = shown((fpart == head) & ~ear_f)
+    rows.append(("face and head", sh, labels == FACE_SKIN, face_ok | np.isin(labels, (BODY_SKIN,))))
+    rows.append(("ears", shown(ear_f), None, np.isin(labels, (BODY_SKIN, FACE_SKIN, HAIR))))
+    rows.append(("neck", shown(fpart == pn.index("neck")), None, np.isin(labels, (BODY_SKIN, FACE_SKIN, CLOTHES))))
+    for sd, nm in (("L", "left"), ("R", "right")):
+        hs = shown(fpart == pn.index(f"hand.{sd}"))
+        # this hand's own skin: the skin patches under its pose points (index, thumb, pinky, wrist)
+        ids = set()
+        for t in ("index", "thumb", "pinky", "wrist"):
+            q = (pose or {}).get(f"{nm}_{t}")
+            if q is not None:
+                xi, yi = int(np.clip(q[0], 0, W - 1)), int(np.clip(q[1], 0, H - 1))
+                if lab_sk[yi, xi] > 0:
+                    ids.add(int(lab_sk[yi, xi]))
+        mine = np.isin(lab_sk, list(ids)) if ids else np.zeros_like(skin)
+        rows.append((f"{nm} hand", hs, mine if mine.any() else None, mine | np.isin(labels, (ACCESSORY,))))
+    body_parts = [pn.index(n) for n in pn if n.startswith(("torso", "upperarm", "forearm"))]
+    rows.append(("torso and arms (under the clothes)", shown(np.isin(fpart, body_parts)), None,
+                 person & np.isin(labels, (CLOTHES, BODY_SKIN, FACE_SKIN, ACCESSORY))))
+    _DEBUG["regions"] = {name: (sh_, want, ok) for name, sh_, want, ok in rows}
+    for name, sh_, want, ok in rows:
+        n_sh = int(sh_.sum())
+        if n_sh == 0:
+            continue
+        out = float((sh_ & ~ok).sum()) / n_sh
+        chk.add("5 against the photo", f"{name}: shown outside its own region in the photo (share of it shown)", out,
+                hi=_CHK_REGION_OUT, unit=f" ({(sh_ & ~ok).sum() * mm_px * mm_px / 100:.1f} cm2)")
+        if want is not None and want.any():
+            cov = float((sh_ & want).sum()) / float(want.sum())
+            chk.add("5 against the photo", f"{name}: the photo's own region of it covered", cov, lo=_CHK_REGION_COVER,
+                    unit=f" ({want.sum() * mm_px * mm_px / 100:.1f} cm2 in the photo)")
+    whole = np.isfinite(near) & known
+    chk.add("5 against the photo", "whole figure shown outside the photo's person, where the labels were read (share)", float((whole & ~person).sum()) / max(whole.sum(), 1),
+            hi=_CHK_REGION_OUT)
 
 
 def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool] = None) -> BodyMesh:
@@ -1241,6 +1594,10 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
         chk.add("2 head", "jaw and chin outline off the photo's (median, front)", float(np.median(dj)) * 1000.0 / s,
                 hi=max(1.5 * 1000.0 / s, 2.0), unit=" mm")
         chk.add("2 head", "jaw and chin outline off the photo's (worst point, front)", float(dj.max()) * 1000.0 / s, unit=" mm")
+    # every part against the photo's own region for it
+    if inputs.parts and inputs.parts.get("labels") is not None:
+        _region_checks(px[:n_body], F[F.max(1) < n_body], body, np.asarray(inputs.parts["labels"]), inputs.photo_mask, chk, 1000.0 / s,
+                       pose=inputs.pose, box=inputs.parts.get("box"))
     # the teeth joined to the head: one solid
     from .silhouette_relief import _join_solids
 
