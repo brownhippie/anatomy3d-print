@@ -1312,7 +1312,7 @@ _EASE_MAX = 0.06  # m: no garment stands further off the skin than this
 _CUFF = (0.006, 0.018)  # m from the wrist: skin below the first, shirt cuff to the second, jacket sleeve above
 _EASE_SMOOTH = 25  # neighbour averagings of the jacket's ease (no false steps)
 _EDGE_PX = 6  # photo px: a point this near the model's outline (as the camera sees it) takes the side gap
-_LABEL_SMOOTH = 4  # neighbour-majority passes over the garments' edges
+_LABEL_SMOOTH = 10  # neighbour-majority passes over the garments' edges
 
 
 def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
@@ -1425,7 +1425,7 @@ def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
     # in proportion to how side-on the point is (the front lies near the shirt)
     # the side gap at the model's outline edge (as the camera sees it), fading inward by smoothing
     edge = ndimage.binary_dilation(model_sil & ~ndimage.binary_erosion(model_sil, iterations=2), iterations=_EDGE_PX)
-    at_edge = edge[yi, xi] & (side_w > 0)
+    at_edge = edge[yi, xi] & (side_w > 0) & vis  # (only what the camera sees there: a sleeve, not the torso behind it)
     raw = np.where(at_edge & jk, np.where(nrm_p[:, 0] < 0, gap[yi, 0], gap[yi, 1]) / s, 0.0)
     for _ in range(_EASE_SMOOTH):
         raw = np.where(jk, 0.5 * raw + 0.5 * (A @ raw), 0.0)
