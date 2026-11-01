@@ -1311,6 +1311,7 @@ _EASE = {"jacket": 0.010, "lapel": 0.013, "shirt": 0.002, "collar": 0.004, "tie"
 _EASE_MAX = 0.06  # m: no garment stands further off the skin than this
 _CUFF = (0.006, 0.018)  # m from the wrist: skin below the first, shirt cuff to the second, jacket sleeve above
 _EASE_SMOOTH = 25  # neighbour averagings of the jacket's ease (no false steps)
+_EDGE_PX = 6  # photo px: a point this near the model's outline (as the camera sees it) takes the side gap
 _LABEL_SMOOTH = 4  # neighbour-majority passes over the garments' edges
 
 
@@ -1422,11 +1423,13 @@ def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
     side_w = np.clip((np.abs(nrm_p[:, 0]) - 0.2) / 0.6, 0.0, 1.0)
     # the side gap of each point's row and side, smoothed over the jacket, then taken
     # in proportion to how side-on the point is (the front lies near the shirt)
-    raw = np.where(nrm_p[:, 0] < 0, gap[yi, 0], gap[yi, 1]) / s
-    raw[~jk] = 0.0
+    # the side gap at the model's outline edge (as the camera sees it), fading inward by smoothing
+    edge = ndimage.binary_dilation(model_sil & ~ndimage.binary_erosion(model_sil, iterations=2), iterations=_EDGE_PX)
+    at_edge = edge[yi, xi] & (side_w > 0)
+    raw = np.where(at_edge & jk, np.where(nrm_p[:, 0] < 0, gap[yi, 0], gap[yi, 1]) / s, 0.0)
     for _ in range(_EASE_SMOOTH):
         raw = np.where(jk, 0.5 * raw + 0.5 * (A @ raw), 0.0)
-    ease = np.where(jk, _EASE["jacket"] + raw * side_w + np.where(g == "lapel", _EASE["lapel"] - _EASE["jacket"], 0.0), ease)
+    ease = np.where(jk, _EASE["jacket"] + raw + np.where(g == "lapel", _EASE["lapel"] - _EASE["jacket"], 0.0), ease)
     ease = np.clip(ease, 0.0, _EASE_MAX)
     # on the resting body
     Vr = body["verts"]
@@ -1664,25 +1667,22 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
         ids, rvs = _finger_rest(body, side)
         bone_ids += ids
         rv += list(rvs)
-    # the forearms and wrists turned to put the wrists and hands where the photo has them
+    # 3. the clothes, read from the photo (on the body as the fit posed it) and put on the resting body
+    bare = body
+    Rw0, pw0 = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
+    garment = None
+    Vd, garment = _dress(body, br._skin(body, Rw0, pw0), np.asarray(body["faces"], dtype=np.int64), (s, cx, cy), inputs, chk)
+    if Vd is not None:
+        body = dict(body, verts=Vd)
+    # 4. the arms, dressed: wrists and hands where the photo has them, sleeves clear of the jacket and each other
     rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), chk, (inputs.parts or {}).get("labels")))
     Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
     V = br._skin(body, Rw, pw)
-    # 3. the clothes, read from the photo and put on the resting body; posed again with the same skeleton
-    garment = None
-    Vd, garment = _dress(body, V, np.asarray(body["faces"], dtype=np.int64), (s, cx, cy), inputs, chk)
     if Vd is not None:
-        body = dict(body, verts=Vd)
-        _clothes_collisions(body, br._skin(body, Rw, pw), s, _Prefixed(chk, "before the arms are set again: "))
-        # the arms set again with the clothes on (sleeves against the jacket and each other)
-        rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), chk, (inputs.parts or {}).get("labels"), settle=True))
-        Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
-        V = br._skin(body, Rw, pw)
-        Jp = pw
         _clothes_collisions(body, V, s, chk)
     Jp = pw  # each bone's joint, posed (m)
-    # the pose checked in numbers: the body's points on the photo's
-    K = kps(V)
+    # the pose checked in numbers: the body's points on the photo's (on the bare body: the photo's points are joints)
+    K = kps(br._skin(bare, Rw, pw))
     if sw_photo:
         if "left_shoulder" in K and "right_shoulder" in K:
             chk.add("4 posed", "shoulders apart, body over photo", float(np.linalg.norm(K["left_shoulder"] - K["right_shoulder"])) / sw_photo, *_CHK_SHOULDER)
