@@ -1566,7 +1566,48 @@ def _region_checks(px, F, body: dict, labels, mask, chk: "Checks", mm_px: float,
             hi=_CHK_REGION_OUT)
 
 
-def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool] = None) -> BodyMesh:
+def _apply_posture(body: dict, bone_ids, rv, posture: dict, cam, chk: "Checks"):
+    """A confirmed posture (each bone's turn, by name) in place of the arm fit's.
+    The neck and head keep the face step's turns, and the head keeps the way it
+    faces the camera: the body turns under it (a neck twist)."""
+    from . import body_reference as br
+    L = body["labels"]
+    bone_ids, rv = list(bone_ids), [np.asarray(r, float) for r in rv]
+    keep = {"neck01", "neck02", "neck03", "head"}
+    h = body["head_bone"]
+    Rw0, pw0 = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
+    for name, r in zip(posture["labels"], posture["rv"]):
+        name = str(name)
+        if name in keep or name not in L:
+            continue
+        j = L.index(name)
+        if j in bone_ids:
+            rv[bone_ids.index(j)] = np.asarray(r, float)
+        else:
+            bone_ids.append(j)
+            rv.append(np.asarray(r, float))
+    if h not in bone_ids:
+        bone_ids.append(h)
+        rv.append(np.zeros(3))
+    Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
+    p = body["parents"][h]
+    rv[bone_ids.index(h)] = _rotvec(Rw[p].T @ Rw0[h])
+    Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
+    s = cam[0]
+    chk.add("3 posture", "head turn kept (degrees off the face step's)",
+            float(np.degrees(np.linalg.norm(_rotvec(Rw0[h].T @ Rw[h])))), hi=1.0, unit=" deg")
+    chk.add("3 posture", "head moved by the body's turn", float(np.linalg.norm((pw[h] - pw0[h])[[0, 2]])) * 1000.0,
+            unit=" mm")
+    sp = [L.index(n) for n in ("spine05", "spine01") if n in L]
+    if len(sp) == 2:
+        fwd = Rw[sp[1]] @ np.array([0.0, -1.0, 0.0])
+        chk.add("3 posture", "chest turned (degrees, + to the photo's right)",
+                float(np.degrees(np.arctan2(fwd[0], -fwd[1]))), unit=" deg")
+    return bone_ids, rv
+
+
+def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool] = None,
+                   posture: Optional[dict] = None) -> BodyMesh:
     from . import body_reference as br
 
     chk = Checks()
@@ -1678,7 +1719,11 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
         rv += list(rvs)
     # 3. the arms, bare: wrists, hands and fingers where the photo has them
     bare = body
-    rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), _Prefixed(chk, "bare: "), (inputs.parts or {}).get("labels")))
+    if posture is not None:
+        # a confirmed posture (the pose step's): the body follows the tie, the hands their skin
+        bone_ids, rv = _apply_posture(body, bone_ids, rv, posture, (s, cx, cy), chk)
+    else:
+        rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), _Prefixed(chk, "bare: "), (inputs.parts or {}).get("labels")))
     Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))
     # 4. the clothes, read from the photo on that pose (each bit of the outline goes to the part
     # the camera sees there) and put on the resting body
@@ -1686,6 +1731,7 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
     Vd, garment = _dress(body, br._skin(body, Rw, pw), np.asarray(body["faces"], dtype=np.int64), (s, cx, cy), inputs, chk)
     if Vd is not None:
         body = dict(body, verts=Vd)
+    if Vd is not None and posture is None:
         # 5. the arms settled with the clothes on (sleeves clear of the jacket and each other)
         rv = list(_arms_to_photo(body, bone_ids, rv, P, (s, cx, cy), chk, (inputs.parts or {}).get("labels"), settle=True))
         Rw, pw = br._bone_transforms(body, np.asarray(bone_ids), np.asarray(rv))

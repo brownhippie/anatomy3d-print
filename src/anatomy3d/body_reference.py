@@ -460,8 +460,8 @@ def place_ears(V: np.ndarray, ear_w: np.ndarray, head_axes: np.ndarray, ears: di
                 wr = 1.0 / np.sqrt(len(prof))
                 for row, x in prof:
                     band = np.abs(q[:, 1] - row) <= 1.5
-                    if band.any():
-                        r.append(wr * (u_img * (q[band, 0] * u_img).max() - x))
+                    # (a row the ear doesn't reach counts nothing, but keeps its place: one length every step)
+                    r.append(wr * (u_img * (q[band, 0] * u_img).max() - x) if band.any() else 0.0)
             elif fit_turn:
                 r.append(u_img * (q[:, 0] * u_img).max() - outer_x)
             return np.array(r)
