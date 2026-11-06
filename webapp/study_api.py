@@ -26,7 +26,7 @@ from typing import List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from anatomy3d import knobs, study
+from anatomy3d import knobs, ledger, study
 
 import jobs
 
@@ -144,6 +144,9 @@ AUTO_EVALS = 120
 AUTO_GAIN = 0.5
 AUTO_WORST = 1.0
 AUTO_AREAS = knobs.AREAS  # every area of numbers in turn
+# hours between one study's end and the next one's start, so the autopilot
+# doesn't keep the machine busy around the clock
+AUTO_PAUSE_H = float(os.environ.get("ANATOMY3D_AUTO_PAUSE_H", "6"))
 
 
 def _autopilot_path() -> Path:
@@ -165,18 +168,34 @@ def _judge(st: dict) -> "tuple[bool, str]":
     worst = min(st["best_per_photo"].get(k, -1e9) - v for k, v in st["base_per_photo"].items())
     if worst < -AUTO_WORST:
         return False, f"a photo got worse by {-worst:.2f}"
-    # applying tuned values changes every build: like a push, it may leave
-    # no photo further from itself on any quantity (the ledger's readings)
+    # applying tuned values changes every build: read like a push, with the
+    # push guard's own line (ledger.GUARD_SHARE): it may leave no more than that
+    # share of quantity/photo pairs further from the photo, net of those that
+    # came closer, and never an unsealed print or one under the printer's wall
     base, best = st.get("base_readings"), st.get("best_readings")
     if not base or not best:
         return False, "no readings to check it against (studied before the ledger)"
-    from anatomy3d import ledger
 
-    worse = [f"{pid}: {q}" for pid, b in base.items() for q, v in (b or {}).items()
-             if q in ledger.QUANTITIES and (best.get(pid) or {}).get(q) is not None and ledger._worse(q, best[pid][q], v)]
-    if worse:
-        return False, f"further from the photo on {len(worse)} quantity/photo pairs (" + ", ".join(worse[:4]) + ("…" if len(worse) > 4 else "") + ")"
-    return True, f"gain {gain:.2f}, and no photo further from itself on any quantity"
+    worse, closer, broken, n = [], [], [], 0
+    for pid, b in base.items():
+        for q, was in (b or {}).items():
+            now = (best.get(pid) or {}).get(q)
+            if q not in ledger.QUANTITIES or was is None or now is None:
+                continue
+            n += 1
+            if ledger._worse(q, now, was):
+                worse.append(f"{pid}: {q}")
+                if q == "sealed" or (q == "wall" and now < ledger.WALL_MIN_MM <= was):
+                    broken.append(f"{pid}: {q}")
+            elif ledger._worse(q, was, now):
+                closer.append(f"{pid}: {q}")
+    if broken:
+        return False, "a print would break: " + ", ".join(broken[:4])
+    net = 100.0 * (len(worse) - len(closer)) / max(n, 1)
+    if net > ledger.GUARD_SHARE:
+        return False, (f"further from the photo on {len(worse)} of {n} quantity/photo pairs, closer on {len(closer)}: "
+                       f"net {net:.1f}% further, over the {ledger.GUARD_SHARE:.0f}% line (" + ", ".join(worse[:4]) + ("…" if len(worse) > 4 else "") + ")")
+    return True, f"gain {gain:.2f}; closer on {len(closer)} of {n} quantity/photo pairs, further on {len(worse)}"
 
 
 def autopilot_step(generation_lock: threading.Lock) -> bool:
@@ -208,6 +227,9 @@ def autopilot_step(generation_lock: threading.Lock) -> bool:
         return True
     if st["status"] != "done":
         return False
+    ended = (st.get("judged") or {}).get("at") or st.get("finished") or 0
+    if time.time() - ended < AUTO_PAUSE_H * 3600:
+        return False  # resting between studies
     # with this code, first measure how the areas reach each other (once);
     # then tune the areas that do, together, one group after the next
     code = study.code_version()
@@ -367,7 +389,7 @@ def list_studies():
             out.append(_summary(st))
     tuned = knobs.read_tuned()
     return {"studies": out, "areas": knobs.AREAS, "objective": study.OBJECTIVE, "autopilot": autopilot_state(),
-            "auto_rule": f"applies a finished study by itself when its mean beats its start by {AUTO_GAIN}, no photo got worse than {AUTO_WORST}, and no photo is further from itself on any of the ledger's quantities",
+            "auto_rule": f"applies a finished study by itself when its mean beats its start by {AUTO_GAIN}, no photo got worse than {AUTO_WORST}, no print breaks, and no more than {ledger.GUARD_SHARE:.0f}% of quantity/photo pairs are further from the photo, net; it rests {AUTO_PAUSE_H:g} h between studies",
             "tuned": {"source": tuned.get("source"), "at": tuned.get("at"), "values": tuned.get("values", {}),
                       "stale": _tuned_status["stale"]},
             "free_mb": round(_free() / 1e6)}

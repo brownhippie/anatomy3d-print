@@ -60,10 +60,10 @@ Kinds:
 - **The push guard** (`ledger.guard`). For each builder family, it compares each held setting with the same setting on the machine before. The machine fails when the net share of settings further from the photo exceeds 10.0% on any quantity read on at least 6 settings. It also fails when a held build is newly unsealed, or newly below the printer's 0.8 mm wall. The plugin's reading against the first spins (drift, past and short shares) is kept beside it.
 - **The production pick** (`ledger.choose`). It changes only after a passed guard, or after your rating. It moves to:
   - a setting you rated higher than the current one; or
-  - a setting at least as close to the photo on every quantity and closer on one (no averaging).
+  - a setting closer to the photo on more quantities than it is further on, each beyond its own resolution (the one with the most closer, net). Changed 2026-11-06: "at least as close on every quantity" almost never held between two real builds, so the pick never moved.
   It never moves to a setting you rated 2 or less.
 - **Gate before handing over.** If a render built with the pick is unsealed or below 0.8 mm, it is built again with the app's own setting.
 - **Compare.** Builds the same photo with the setting closest to the photo on the most quantities, net, among those not rated yet. You rate both.
-- **The Study's autopilot** applies tuned values only when no study photo is further from itself on any quantity.
+- **The Study's autopilot** applies tuned values when the study's mean gained, no photo lost more than AUTO_WORST, no print breaks (unsealed, or under the 0.8 mm wall), and no more than the push guard's 10.0% of quantity/photo pairs are further from the photo, net of those that came closer. Changed 2026-11-06: "no photo further on any quantity" rejected every finished study, so it ran study after study and kept nothing. It rests `ANATOMY3D_AUTO_PAUSE_H` hours (6) between studies.
 - **No-cost rule.** An app render is measured by the Lab's worker after the model is handed over. The wall is read from the print file's own export, not measured again.
 - **`tools/push_guard.py`** runs the same guard on a working tree before a push.

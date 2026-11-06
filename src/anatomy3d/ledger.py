@@ -582,6 +582,25 @@ def _gates(R: dict) -> bool:
     return R.get("sealed", 1.0) == 1.0 and (R.get("wall") is None or R["wall"] >= WALL_MIN_MM)
 
 
+def net_closer(a: dict, b: dict) -> "tuple[int, int, int]":
+    """(closer, further, shared): on how many quantities a is closer to the photo
+    than b, and further, each beyond the quantity's own resolution."""
+    shared = [q for q in QUANTITIES if a.get(q) is not None and b.get(q) is not None]
+    closer = sum(_worse(q, b[q], a[q]) for q in shared)
+    further = sum(_worse(q, a[q], b[q]) for q in shared)
+    return closer, further, len(shared)
+
+
+def better_overall(a: dict, b: dict) -> bool:
+    """a may replace b as the pick: closer to the photo on more quantities than
+    it is further on. (Being at least as close on every one of ~23 quantities,
+    the old rule, almost never happens between two real builds: one quantity
+    moving a pixel the wrong way blocked every change.) The printer's limits
+    are checked separately (_gates)."""
+    closer, further, n = net_closer(a, b)
+    return n > 0 and closer > further
+
+
 def dominates(a: dict, b: dict) -> bool:
     """a is at least as close to the photo as b on every quantity both have, and closer on one."""
     shared = [q for q in QUANTITIES if q in a and q in b]
@@ -613,7 +632,7 @@ def choose(for_commit: str, current: str) -> dict:
         return now
     stars = ratings_by_code()
     ok = {c: R for c, R in latest.items() if _gates(R) and stars.get(_family_key(c), 3) > 2}
-    best, why = cur, "no setting is at least as close on every quantity and closer on one"
+    best, why = cur, "no setting is closer to the photo on more quantities than it is further on"
     # your ratings first: a setting you rated higher than the current one
     cur_stars = stars.get(_family_key(cur), 0)
     rated = sorted((c for c in ok if _family_key(c) in stars and stars[_family_key(c)] > cur_stars and not production_like(c)),
@@ -621,12 +640,15 @@ def choose(for_commit: str, current: str) -> dict:
     if rated:
         best, why = rated[0], f"you rated it {stars[_family_key(rated[0])]:.1f} stars, higher than the current {cur_stars:.1f}"
     else:
-        better = [c for c, R in ok.items() if c != cur and dominates(R, latest[cur])]
+        better = [c for c, R in ok.items() if c != cur and better_overall(R, latest[cur])]
         if better:
-            # of those, the one that's itself dominated by none of the others
-            top = [c for c in better if not any(dominates(ok[o], ok[c]) for o in better if o != c)]
-            best = sorted(top)[0]
-            why = f"at least as close to the photo as {cur} on every quantity, closer on one"
+            # of those, the one with the most quantities closer, net of those further
+            def net(c):
+                cl, fu, _ = net_closer(ok[c], latest[cur])
+                return cl - fu
+            best = sorted(better, key=lambda c: (-net(c), c))[0]
+            cl, fu, n = net_closer(ok[best], latest[cur])
+            why = f"closer to the photo than {cur} on {cl} of {n} quantities, further on {fu}"
     out = {"code": best, "commit": for_commit, "why": why, "at": time.time(), "was": cur}
     _write_json(root() / "pick.json", out)
     with open(root() / "picks.jsonl", "a") as f:
