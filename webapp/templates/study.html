@@ -81,6 +81,7 @@
   <section id="auto">
     <h2>Teaching itself</h2>
     <div class="row"><label class="chk"><input type="checkbox" id="ap-on" /> On</label><span class="hint" id="ap-rule"></span></div>
+    <div class="row"><strong id="ap-now"></strong> <button type="button" class="secondary" id="ap-wake" hidden>Start next study now</button></div>
   </section>
 
   <section id="checklist">
@@ -182,6 +183,11 @@ async function loadList() {
   if (data.tuned.stale && data.tuned.stale.length) $("tuned").innerHTML += `<div class="hint">Dropped (the code changed since): ${data.tuned.stale.map(short).join(", ")}</div>`;
   $("clear-tuned").hidden = !tv.length;
   $("ap-on").checked = data.autopilot.on;
+  const now = data.autopilot_now || {};
+  $("ap-now").textContent = now.state === "resting"
+    ? `Resting until ${new Date(now.until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} (${now.rest_h} h between studies), then the next study starts by itself.${now.text ? " " + now.text : ""}`
+    : (now.text || "");
+  $("ap-wake").hidden = now.state !== "resting";
   $("ap-rule").textContent = `With new code it first measures how the areas reach each other's scores (a neighbours run), then tunes the areas that reach each other together. When a study finishes, the server ${data.auto_rule}, then starts the next on the same photos from the values in use. Each study must beat the last, so the bar rises by itself.` +
     (data.autopilot.groups ? ` Tuned together now: ${data.autopilot.groups.map((g) => g.join(" + ")).join(" · ")}.` : "");
   const sel = $("study-select");
@@ -294,6 +300,7 @@ $("apply").onclick = async () => {
   } catch (e) { $("action-hint").textContent = e.message; }
   loadList();
 };
+$("ap-wake").onclick = async () => { await api("/api/study/autopilot/now", { method: "POST" }); loadList(); };
 $("ap-on").onchange = async () => { await api(`/api/study/autopilot?on=${$("ap-on").checked}`, { method: "POST" }); loadList(); };
 $("clear-tuned").onclick = async () => { await api("/api/study/tuned/clear", { method: "POST" }); loadList(); };
 $("copy").onclick = async () => {

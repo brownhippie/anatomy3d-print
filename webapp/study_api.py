@@ -228,8 +228,8 @@ def autopilot_step(generation_lock: threading.Lock) -> bool:
     if st["status"] != "done":
         return False
     ended = (st.get("judged") or {}).get("at") or st.get("finished") or 0
-    if time.time() - ended < AUTO_PAUSE_H * 3600:
-        return False  # resting between studies
+    if time.time() - ended < AUTO_PAUSE_H * 3600 and ap.get("wake_at", 0) < ended:
+        return False  # resting between studies (the page's "Start next study now" ends the rest)
     # with this code, first measure how the areas reach each other (once);
     # then tune the areas that do, together, one group after the next
     code = study.code_version()
@@ -258,6 +258,41 @@ def autopilot_step(generation_lock: threading.Lock) -> bool:
         _write(nd / "state.json", new)
         _write(_autopilot_path(), ap_next)
     return True
+
+
+def autopilot_now() -> dict:
+    """What the autopilot is doing right now, in words, for the Study page."""
+    ap = autopilot_state()
+    if not ap["on"]:
+        return {"state": "off", "text": "Autopilot is off."}
+    sid = active()
+    if sid:
+        st = _read(STUDY_ROOT / sid / "state.json", {})
+        what = "neighbours run" if st.get("kind") == "neighbours" else " + ".join(st.get("areas") or [])
+        return {"state": "running", "text": f"Running a study: {what} ({st.get('evals', 0)}/{st.get('max_evals', 0)} tries)."}
+    studies = [s for s in (_read(d / "state.json", None) for d in STUDY_ROOT.iterdir() if d.is_dir()) if s]
+    if not studies:
+        return {"state": "idle", "text": "No study yet: start one below with your photos; the autopilot carries on from it."}
+    st = max(studies, key=lambda s: s["created"])
+    if st.get("status") == "paused":
+        return {"state": "paused", "text": "The latest study is paused by hand, so the autopilot waits. Resume it, or finish it."}
+    j = st.get("judged") or {}
+    verdict = ("" if not j else (" Last study: applied." if j.get("applied") else f" Last study: not applied ({j.get('why', '')})."))
+    ended = j.get("at") or st.get("finished") or 0
+    until = ended + AUTO_PAUSE_H * 3600
+    if st.get("status") == "done" and j and time.time() < until and ap.get("wake_at", 0) < ended:
+        return {"state": "resting", "until": until, "text": verdict.strip(), "rest_h": AUTO_PAUSE_H}
+    return {"state": "starting", "text": "Starting the next study." + verdict}
+
+
+@router.post("/autopilot/now")
+def autopilot_start_now():
+    """End the rest: the next study starts on the server's next turn."""
+    ap = autopilot_state()
+    ap["wake_at"] = time.time()
+    with _lock:
+        _write(_autopilot_path(), ap)
+    return autopilot_now()
 
 
 @router.post("/autopilot")
@@ -390,6 +425,7 @@ def list_studies():
     tuned = knobs.read_tuned()
     return {"studies": out, "areas": knobs.AREAS, "objective": study.OBJECTIVE, "autopilot": autopilot_state(),
             "auto_rule": f"applies a finished study by itself when its mean beats its start by {AUTO_GAIN}, no photo got worse than {AUTO_WORST}, no print breaks, and no more than {ledger.GUARD_SHARE:.0f}% of quantity/photo pairs are further from the photo, net; it rests {AUTO_PAUSE_H:g} h between studies",
+            "autopilot_now": autopilot_now(),
             "tuned": {"source": tuned.get("source"), "at": tuned.get("at"), "values": tuned.get("values", {}),
                       "stale": _tuned_status["stale"]},
             "free_mb": round(_free() / 1e6)}
