@@ -1319,8 +1319,6 @@ _GARMENT_OF = {"suit": "jacket", "jacket": "jacket", "coat": "jacket", "sweater"
 _EASE = {"jacket": 0.010, "lapel": 0.013, "shirt": 0.002, "collar": 0.004, "tie": 0.006}
 _EASE_MAX = 0.06  # m: no garment stands further off the skin than this
 _CUFF = (0.006, 0.018)  # m from the wrist: skin below the first, shirt cuff to the second, jacket sleeve above
-_EASE_SMOOTH = 25  # neighbour averagings of the jacket's ease (no false steps)
-_EDGE_PX = 6  # photo px: a point this near the model's outline (as the camera sees it) takes the side gap
 _LABEL_SMOOTH = 10  # neighbour-majority passes over the garments' edges
 
 
@@ -1329,13 +1327,10 @@ def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
     clothed skin point (torso, arms to the cuff, the neck up to the collar)
     takes the garment the photo shows there (seen from the front: its label
     at that spot; out of view: the garment around it, the jacket by
-    default), and stands off the skin by that garment's ease -- at the
-    sides by the gap between the body's outline and the photo's, row by
-    row. Smoothed (a jacket has no steps); its edges kept (lapels, collar,
-    cuffs, tie). Returns the dressed resting points and each point's
+    default), and stands off the skin by that garment's own thickness: a
+    layer wrapped round the body, never stretched to the photo's outline.
+    Its edges kept (lapels, collar, cuffs, tie). Returns the dressed resting points and each point's
     garment ("" for skin)."""
-    from scipy import ndimage
-
     from .silhouette_relief import _raster_depth
 
     s, cx, cy = cam
@@ -1416,29 +1411,11 @@ def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
         g = np.where(want & (votes.max(axis=1) > 0.5), maj, g)
     g[cuff == "shirt"] = "shirt"
     g[cuff == "skin"] = ""
-    # how far off the skin: the jacket by the photo's outline at the sides
+    # how far off the skin: each garment's own thickness, wrapped round the body (the photo's
+    # outline doesn't say how a cloth stands off a body: the pose and the body's size meet it)
     ease = np.zeros(nv)
     for k in kinds:
         ease[g == k] = _EASE[k]
-    person = np.asarray(inputs.photo_mask, dtype=bool)
-    model_sil = np.isfinite(near)
-    gap = np.zeros((H, 2))
-    for r in range(H):
-        pr, mr = np.flatnonzero(person[r]), np.flatnonzero(model_sil[r])
-        if len(pr) and len(mr):
-            gap[r, 0] = max(mr.min() - pr.min(), 0)  # photo's left side (the body's right)
-            gap[r, 1] = max(pr.max() - mr.max(), 0)
-    jk = np.isin(g, ("jacket", "lapel"))
-    side_w = np.clip((np.abs(nrm_p[:, 0]) - 0.2) / 0.6, 0.0, 1.0)
-    # the side gap of each point's row and side, smoothed over the jacket, then taken
-    # in proportion to how side-on the point is (the front lies near the shirt)
-    # the side gap at the model's outline edge (as the camera sees it), fading inward by smoothing
-    edge = ndimage.binary_dilation(model_sil & ~ndimage.binary_erosion(model_sil, iterations=2), iterations=_EDGE_PX)
-    at_edge = edge[yi, xi] & (side_w > 0) & vis  # (only what the camera sees there: a sleeve, not the torso behind it)
-    raw = np.where(at_edge & jk, np.where(nrm_p[:, 0] < 0, gap[yi, 0], gap[yi, 1]) / s, 0.0)
-    for _ in range(_EASE_SMOOTH):
-        raw = np.where(jk, 0.5 * raw + 0.5 * (A @ raw), 0.0)
-    ease = np.where(jk, _EASE["jacket"] + raw + np.where(g == "lapel", _EASE["lapel"] - _EASE["jacket"], 0.0), ease)
     ease = np.clip(ease, 0.0, _EASE_MAX)
     # on the resting body
     Vr = body["verts"]
@@ -1452,6 +1429,77 @@ def _dress(body: dict, V_posed, F, cam, inputs, chk: "Checks"):
     if collar_top is not None:
         chk.add("3 clothes", "collar's top, from the photo", collar_top, unit=" photo px row")
     return Vd, g
+
+
+_SKIN_GAP = 0.002  # m: what a hand rests on stands at least this far behind the hand's skin
+_SKIN_SPREAD = 12  # neighbour passes: a moved point takes its neighbours with it (no step in the cloth)
+
+
+def _skin_in_front(body: dict, V, F, cam, labels, pose, chk: "Checks", n_body: int):
+    """The skin first, kept to the end: where the photo shows a hand's own
+    skin and the model's hand is there, nothing stands in front of that
+    hand -- what is in front (a sleeve, the jacket, the other hand) is moved
+    back behind the hand, its neighbours with it. Returns the points."""
+    from scipy import ndimage
+
+    from .head_parts import BODY_SKIN
+    from .silhouette_relief import _raster_depth
+
+    s, cx, cy = cam
+    H, W = labels.shape
+    pn = body["part_names"]
+    PW = np.asarray(body["part_w"])
+    V = np.array(V, dtype=np.float64)
+    Fb = F[F.max(1) < n_body]
+    lab_sk, _ = ndimage.label(labels == BODY_SKIN)
+    A = _smoother(Fb, n_body)
+    for sd, nm in (("L", "left"), ("R", "right")):
+        ids = set()
+        for t in ("index", "thumb", "pinky", "wrist"):
+            q = (pose or {}).get(f"{nm}_{t}")
+            if q is not None:
+                xi, yi = int(np.clip(q[0], 0, W - 1)), int(np.clip(q[1], 0, H - 1))
+                if lab_sk[yi, xi] > 0:
+                    ids.add(int(lab_sk[yi, xi]))
+        if not ids:
+            continue
+        mine = np.isin(lab_sk, list(ids))
+        hand_v = PW[:n_body, pn.index(f"hand.{sd}")] > 0.5
+        hand_f = hand_v[Fb].all(axis=1)
+        moved = np.zeros(n_body)
+        rounds = 0
+        for rounds in range(1, 5):
+            px = np.column_stack([cx + s * V[:n_body, 0], cy - s * V[:n_body, 2], s * V[:n_body, 1]])
+            hn, hf = _raster_depth(px[:, 0], px[:, 1], px[:, 2], Fb[hand_f], (H, W))
+            on, _ = _raster_depth(px[:, 0], px[:, 1], px[:, 2], Fb[~hand_f], (H, W))
+            # in front of (or inside) the hand, where the photo has its skin
+            bad = mine & np.isfinite(hn) & np.isfinite(on) & (on < hf + _SKIN_GAP * s)
+            if not bad.any():
+                break
+            # the hand's back at each pixel (and next to it: a point just off the hand takes the nearest)
+            idx = ndimage.distance_transform_edt(~np.isfinite(hf), return_distances=False, return_indices=True)
+            back = hf[idx[0], idx[1]]
+            reach = ndimage.binary_dilation(bad, iterations=3)
+            xi = np.clip(np.round(px[:, 0]).astype(int), 0, W - 1)
+            yi = np.clip(np.round(px[:, 1]).astype(int), 0, H - 1)
+            want = np.where(~hand_v & reach[yi, xi], back[yi, xi] + _SKIN_GAP * s - px[:, 2], 0.0)
+            need = np.maximum(want, 0.0) / s  # m, toward the back
+            d = need.copy()
+            for _ in range(_SKIN_SPREAD):
+                d = np.where(hand_v, 0.0, np.maximum(need, A @ d))
+            V[:n_body, 1] += d
+            moved += d
+        n_mv = int((moved > 0.001).sum())
+        chk.add("4 posed", f"{nm} hand's skin kept in front: points moved behind it (count; largest move, mm)", float(n_mv),
+                unit=f" ({moved.max() * 1000:.0f} mm at most; {rounds} rounds)")
+        px = np.column_stack([cx + s * V[:n_body, 0], cy - s * V[:n_body, 2], s * V[:n_body, 1]])
+        hn, hf = _raster_depth(px[:, 0], px[:, 1], px[:, 2], Fb[hand_f], (H, W))
+        on, _ = _raster_depth(px[:, 0], px[:, 1], px[:, 2], Fb[~hand_f], (H, W))
+        drawn = mine & np.isfinite(hn)
+        left = drawn & np.isfinite(on) & (on < hn)
+        chk.add("4 posed", f"{nm} hand: its skin hidden by something in front, where the model's hand is (share)",
+                float(left.sum()) / max(float(drawn.sum()), 1.0), hi=0.02)
+    return V
 
 
 def _clothes_collisions(body: dict, V, s: float, chk: "Checks"):
@@ -1738,6 +1786,10 @@ def build_measured(inputs, target_height_mm: float = 150.0, bust: Optional[bool]
     V = br._skin(body, Rw, pw)
     if Vd is not None:
         _clothes_collisions(body, V, s, chk)
+    if inputs.parts and inputs.parts.get("labels") is not None:
+        # the skin first, kept to the end: nothing in front of a hand where the photo shows its skin
+        V = _skin_in_front(body, V, np.asarray(body["faces"], dtype=np.int64), (s, cx, cy), np.asarray(inputs.parts["labels"]),
+                           inputs.pose, chk, n_body)
     Jp = pw  # each bone's joint, posed (m)
     # the pose checked in numbers: the body's points on the photo's (on the bare body: the photo's points are joints)
     K = kps(br._skin(bare, Rw, pw))
